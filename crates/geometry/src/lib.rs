@@ -1,6 +1,13 @@
 //! Pure geometry math: Clipper2 wrapper, NFP-tracing primitives, SVG import.
 //! Zero I/O, zero threading — see RUST-REWRITE-PLAN.md Phase 1.
 
+pub mod nfp;
+pub mod point;
+pub mod polygon;
+pub mod simplify;
+
+pub use point::Point;
+
 use clipper2::{FillRule, Paths};
 
 /// Phase 0 smoke test: exercises the Clipper2 C++ FFI link, not real logic.

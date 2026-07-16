@@ -20,6 +20,22 @@ don't batch updates to the end of a phase.
 - The NaN-fitness gap in `placeParts` scoring (`fitness += minwidth/sheetarea
   + minarea` only assigned in the ≥2-parts branch) — Phase 3 must make an
   explicit, documented scoring decision here, not paper over it.
+- `geometryutil.js`'s `_onSegment` vertical-line branch calls
+  `Math.max(B.y, A.y, tolerance)`/`Math.min(B.y, A.y, tolerance)` — a real
+  3-argument max/min that includes `tolerance` (~1e-9) as a competing value,
+  unlike the horizontal-line branch's plain 2-argument
+  `Math.max(B.x, A.x)`/`Math.min(B.x, A.x)`. This asymmetry looks like a typo
+  but changes behavior (e.g. `min(5, 10, 1e-9) = 1e-9`, not `5`) and is
+  preserved exactly in `geometry::polygon::on_segment`.
+- `polygonHull`'s backward vertex scan compares
+  `_almostEqual(A[current].y, B[j].y+Boffsety)` — missing `+Aoffsety` on the
+  A side, unlike the otherwise-identical forward scan just above it. Almost
+  certainly an unintentional asymmetry in the original; preserved exactly in
+  `geometry::nfp::polygon_hull` (see the `NB:` comment at that call site).
+- `noFitPolygon`'s per-call `marked`-reset loops start at index 1, not 0
+  (`for (i=1; i<A.length; i++) A[i].marked=false`) — index 0's `marked` flag
+  is never reset by this function, only ever set. Preserved exactly in
+  `geometry::nfp::no_fit_polygon`.
 
 ## Phase 0 — Scaffolding
 
@@ -34,16 +50,17 @@ don't batch updates to the end of a phase.
 
 | Electron file/function | Rust module | Status | Notes / gotchas |
 |---|---|---|---|
-| `main/util/point.ts`, `vector.ts`, `matrix.ts` | `geometry::primitives` | not started | |
-| `main/util/clipper.js` (Clipper1, JS port) | `geometry::clipper` (via `clipper2` crate) | not started | upgrade from Clipper1 → Clipper2, not a literal port |
+| `main/util/point.ts` | `geometry::point::Point` | done | `marked: bool` added directly on `Point` (matches the JS field, used by NFP tracing) instead of a wrapper type |
+| `main/util/vector.ts`, `matrix.ts` | — | not started, deferred | not a dependency of anything ported so far (geometryutil.js uses plain `{x,y}` pairs, not the `Vector` class); `Matrix`/SVG-transform-string parsing deferred until SVG import lands, to avoid building it with no consumer yet |
+| `main/util/clipper.js` (Clipper1, JS port) | `geometry::clipper` (via `clipper2` crate) | not started | upgrade from Clipper1 → Clipper2, not a literal port; Phase 0 only proved the binding builds/links, no real offset/boolean-op wiring yet |
 | Offset/boolean ops, `SimplifyPolygon`+`CleanPolygon`, `Area` | `geometry::clipper` | not started | |
-| Custom RDP-simplify post-process (offset-shell re-merge, exterior-point reversal, axis straightening, `.exact` marking) | `geometry::simplify` | not started | source: `main/util/simplify.js` is itself possibly dead code, see "will not port" below — the *algorithm* still needs porting if any live caller is found |
+| Custom RDP-simplify post-process (offset-shell re-merge, exterior-point reversal, axis straightening, `.exact` marking) | `geometry::simplify` | partially done | ported `main/util/simplify.js`'s actual Douglas-Peucker algorithm (`geometry::simplify::simplify`, both `geometry.spec.ts` cases passing) — but the larger "offset-shell re-merge/exterior-point reversal/axis straightening/`.exact` marking" pipeline this row describes is a separate, bigger post-process (likely in `deepnest.js`/`background.js`) not yet located or ported |
 | `main/svgparser.js` (SVG import: DOM → polygon tree, parent/hole detection, `.isCircle` metadata, oversized-part bbox check) | `geometry::svg_import` | not started | |
 | `main/util/domparser.ts` | `geometry::svg_import` | not started | |
-| `main/util/geometryutil.js`: `noFitPolygon`, `noFitPolygonRectangle`, slide/projection distance, search-start-point, polygon hull | `geometry::nfp_trace` | not started | the NFP-tracing algorithm core |
-| `main/util/HullPolygon.ts` | `geometry::nfp_trace` | not started | |
+| `main/util/geometryutil.js`: `noFitPolygon`, `noFitPolygonRectangle`, slide/projection distance, search-start-point, polygon hull | `geometry::nfp` | done | ported with unit tests (`crates/geometry/src/nfp.rs`); also ported the transitive dependencies `intersect`, `segmentDistance`, `pointDistance`, `pointInPolygon`, `onSegment`, `lineIntersect`, `almostEqual`, `polygonArea`, `getPolygonBounds`, `isRectangle`, `rotatePolygon` (`crates/geometry/src/polygon.rs`). Preserved quirks: `pointInPolygon`'s bolted-on-offset semantics reproduced via explicit `Point` offset params instead of JS's mutable array properties; `onSegment`'s asymmetric `Math.max(B,A,tolerance)` (vertical branch includes tolerance as a 3rd max/min candidate) vs `Math.max(B,A)` (horizontal branch, no tolerance) preserved exactly; `polygonHull`'s backward-scan y-comparison missing `+Aoffsety` (asymmetric vs. the forward scan) preserved exactly; `noFitPolygon`'s `marked` reset loops starting at index 1 (never resetting index 0) preserved. Deliberately **not** ported yet: `pointLineDistance`, `polygonEdge` — not a dependency of anything Phase 1 requires; deferred to Phase 3 (their only callers are placement-scoring code in `background.js`) |
+| `main/util/HullPolygon.ts` | — | not started | |
 | `main/util/eval.ts` | TBD | not started | check for live call sites before porting (dynamic eval usage is a smell) |
-| `tests/geometry.spec.ts` | `geometry` unit tests | not started | port cases as each function lands, not in a batch |
+| `tests/geometry.spec.ts` | `geometry` unit tests | mostly done | ported: `polygonArea`, `getPolygonBounds`, `almostEqual`, `polygonHull` (all 3 cases), `simplify` (both cases). Not yet ported: the `verifyCircularHoleNfp.js` self-check case — that requires porting `main/util/verifyCircularHoleNfp.js` itself, deferred to Phase 2 (inner-NFP circular-hole fast path) |
 
 ## Phase 2 — NFP engine
 
