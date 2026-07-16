@@ -4,17 +4,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**Phase 0 (scaffolding) is done.** Phase 1 (geometry core) has not started.
-Always check `docs/PORT_STATUS.md` first — it's the single living tracking
-doc for what's ported and what's outstanding; don't re-derive status from
-`RUST-REWRITE-PLAN.md` or by guessing from the file tree.
+**Phase 0 (scaffolding) and Phase 1 (geometry core) are done.** Phase 2
+(NFP engine: outer NFP via Minkowski sum, unified cache-key, inner-NFP fast
+paths) has not started. Always check `docs/PORT_STATUS.md` first — it's the
+single living tracking doc for what's ported and what's outstanding; don't
+re-derive status from `RUST-REWRITE-PLAN.md` or by guessing from the file tree.
+
+**Scope change partway through Phase 1 (see `docs/PORT_STATUS.md` for
+detail): import/export is DXF only, not SVG.** The user's real files are
+DXF with meaningful layers (cut/etch/drill), and layer identity must survive
+import → nesting → export. SVG import (`svgparser.js`/`domparser.ts`) was
+dropped entirely, not deprioritized. DXF import/export is native (the `dxf`
+crate), not the old Electron app's remote-conversion-server round trip.
+Hole/interior-feature nesting (e.g. drilled holes) stays fully in scope —
+nothing about hole handling was simplified away, only the file format changed.
 
 **Read `RUST-REWRITE-PLAN.md` in full before doing any work here.** It is the
 master plan for a from-scratch Rust/Tauri rewrite of Deepnest (currently an
 Electron app), covering repo structure, phase-by-phase scope, what to
 deliberately not port, and the parity/testing strategy. Do not relitigate the
 decisions it marks as already made (Rust+Tauri, no GPU, Clipper2 Rust FFI
-bindings, rayon for concurrency, the `geometry`/`nesting` two-crate split).
+bindings, rayon for concurrency, the `geometry`/`nesting` two-crate split,
+the DXF-only scope change).
 
 ## Build/run commands
 
@@ -58,18 +69,40 @@ while porting (see the plan's "Critical files" section for the full list):
 deepnest-rust/
   Cargo.toml                     # workspace root (geometry, nesting, src-tauri)
   crates/
-    geometry/                    # pure geometry math, zero I/O, zero threading
-                                  #   - clipper2 crate wired in (Clipper2 C++ FFI), smoke-tested
+    geometry/                    # pure geometry math, zero I/O, zero threading - see below
     nesting/                     # NfpCache, GA, placement, rayon dispatch, event abstraction
-                                  #   - depends on geometry; still an empty skeleton
+                                  #   - depends on geometry; still an empty skeleton (Phase 2+)
   src-tauri/                     # Tauri v2 shell — currently zero real commands
   frontend/                      # Electron main/ui/**, index.html, style.css, vendored libs,
                                   # copied as-is (only path fix: ui bundle import, see PORT_STATUS)
   docs/
     PORT_STATUS.md               # the one living tracking doc — check this first
   tests/
-    fixtures/                    # not yet populated — SVGs/part-sets from Electron benchmark sweeps
+    fixtures/                    # real DXF fixtures (FLAT.dxf, FLAT-struck.dxf) copied from
+                                  # the Electron repo's benchmark assets
 ```
+
+`crates/geometry/src/` modules (all with unit tests, see `docs/PORT_STATUS.md`
+Phase 1 table for exactly what each ports from the Electron repo):
+- `point.rs` — `Point` primitive
+- `polygon.rs` — bounds/area/point-in-polygon/is-rectangle/rotate + the
+  `almostEqual`/`onSegment`/`lineIntersect` helpers underneath them
+- `nfp.rs` — the orbiting `noFitPolygon`/`noFitPolygonRectangle`/
+  `polygonHull`/slide-projection-distance/search-start-point algorithm
+- `circular_nfp.rs` — the circular-hole NFP fast-path disk-fit math
+- `clipper.rs` — Clipper2 wrapper (`offset`, `clean_polygon`, boolean ops);
+  see the module doc for the deliberate ×10^7 `PointScaler` precision choice
+- `simplify.rs` — Douglas-Peucker point reduction
+- `simplify_polygon.rs` — the bigger orchestration pipeline around it
+  (offset-shell re-merge, exterior-point reversal, axis straightening)
+- `hull_polygon.rs` — convex hull (Andrew's monotone chain)
+- `dxf_import.rs` — DXF entities → layer-tagged polygon tree (replaces SVG
+  import entirely, see the scope-change note above). Currently supports
+  `LWPOLYLINE` (incl. bulge/arc segments), `CIRCLE`, full-sweep `ARC`. Bare
+  `LINE`/partial-`ARC` networks that only form a closed profile once
+  endpoints are chained together, the older `POLYLINE` entity, and
+  `INSERT`/block expansion are deliberately not supported yet (would need a
+  separate edge-graph-joining algorithm, not a smaller version of this one)
 
 Only two lib crates by design: `geometry` is everything fuzzable/unit-testable
 in isolation; `nesting` is everything stateful/concurrent. Don't split further
@@ -91,6 +124,15 @@ behaviors the current app depends on (see plan for full context):
   — fixed an NFP-cache-thrashing bug found this session.
 - The NaN-fitness gap in `placeParts` scoring (0-1 parts on a sheet) needs an
   explicit decision during Phase 3, not a silent type-system patch-over.
+- `geometryutil.js`'s `_onSegment` vertical-line branch does a real 3-argument
+  `Math.max(B.y, A.y, tolerance)`/`Math.min(...)` (tolerance competes as a
+  value, not just an epsilon) while the horizontal-line branch uses a plain
+  2-argument version — asymmetric, looks like a typo, preserved exactly.
+- `polygonHull`'s backward vertex scan is missing `+Aoffsety` on one
+  comparison that the otherwise-identical forward scan includes — preserved
+  exactly in `geometry::nfp::polygon_hull`.
+- `noFitPolygon`'s `marked`-reset loops start at index 1, never resetting
+  index 0 — preserved exactly.
 
 ## Verified dead code — do not port
 
@@ -98,5 +140,8 @@ behaviors the current app depends on (see plan for full context):
 - `overlapTolerance` config field — zero references outside its own default.
 - The on-disk `./nfpcache` directory and its delete-on-quit logic — no writer
   exists; already in-memory-only in practice.
-- `main/util/simplify.js` — loaded via script tag but no static call site
-  found; do one more dynamic-usage check before dropping.
+- `HullPolygon.area`/`centroid`/`contains`/`length` — only `.hull()` has real
+  call sites anywhere in the Electron repo.
+- `main/util/eval.ts` — live, but only as `main/util/parallel.js`'s
+  child-process worker entrypoint; dropped because that whole worker model
+  is what Phase 4's rayon dispatcher replaces, not because it's unused.
