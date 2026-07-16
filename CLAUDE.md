@@ -4,11 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**Phase 0 (scaffolding) and Phase 1 (geometry core) are done.** Phase 2
-(NFP engine: outer NFP via Minkowski sum, unified cache-key, inner-NFP fast
-paths) has not started. Always check `docs/PORT_STATUS.md` first — it's the
-single living tracking doc for what's ported and what's outstanding; don't
-re-derive status from `RUST-REWRITE-PLAN.md` or by guessing from the file tree.
+**Phase 0 (scaffolding), Phase 1 (geometry core), and Phase 2 (NFP engine)
+are done**, including the general-fallback inner-NFP case the plan flagged
+as the hardest sub-problem in the project (see `docs/PORT_STATUS.md`'s
+Phase 2 table for how - no frame trick, no native addon, composed from
+already-ported Phase 1 pieces). Phase 3 (single-threaded placement + first
+end-to-end milestone) has not started. Always check `docs/PORT_STATUS.md`
+first — it's the single living tracking doc for what's ported and what's
+outstanding; don't re-derive status from `RUST-REWRITE-PLAN.md` or by
+guessing from the file tree.
 
 **Scope change partway through Phase 1 (see `docs/PORT_STATUS.md` for
 detail): import/export is DXF only, not SVG.** The user's real files are
@@ -71,7 +75,7 @@ deepnest-rust/
   crates/
     geometry/                    # pure geometry math, zero I/O, zero threading - see below
     nesting/                     # NfpCache, GA, placement, rayon dispatch, event abstraction
-                                  #   - depends on geometry; still an empty skeleton (Phase 2+)
+                                  #   - depends on geometry; only cache_key.rs so far (Phase 3+)
   src-tauri/                     # Tauri v2 shell — currently zero real commands
   frontend/                      # Electron main/ui/**, index.html, style.css, vendored libs,
                                   # copied as-is (only path fix: ui bundle import, see PORT_STATUS)
@@ -103,6 +107,17 @@ Phase 1 table for exactly what each ports from the Electron repo):
   endpoints are chained together, the older `POLYLINE` entity, and
   `INSERT`/block expansion are deliberately not supported yet (would need a
   separate edge-graph-joining algorithm, not a smaller version of this one)
+- `inner_nfp.rs` — `getInnerNfp`'s three-fast-path dispatch (circular-hole
+  disk math, rectangular-container fast path, general fallback). The
+  general fallback is the plan's flagged "hardest sub-problem" — see its
+  module doc comment and `docs/PORT_STATUS.md`'s Phase 2 table for why the
+  Electron app's own version (a buggy native addon reached via an artificial
+  "frame trick") isn't what got ported here
+- `clipper.rs` also has `outer_nfp` (Minkowski-diff-based outer/collision NFP)
+
+`crates/nesting/src/`:
+- `cache_key.rs` — the unified NFP cache-key format (was duplicated between
+  `nfpDb.ts` and `main.js`, kept in sync by hand via a code comment)
 
 Only two lib crates by design: `geometry` is everything fuzzable/unit-testable
 in isolation; `nesting` is everything stateful/concurrent. Don't split further
