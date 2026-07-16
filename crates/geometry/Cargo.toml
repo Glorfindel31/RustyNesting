@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 clipper2 = "0.6"
+dxf = "0.6"
