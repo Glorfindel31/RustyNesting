@@ -1,0 +1,211 @@
+//! Thin wrapper around the `clipper2` crate (Clipper2 C++ FFI), covering the
+//! plan's "offset, boolean ops, SimplifyPolygon+CleanPolygon" bullet. Ports
+//! two real composed functions from `main/deepnest.js` (`polygonOffset`,
+//! `cleanPolygon`) rather than just exposing raw Clipper2 primitives, since
+//! those are what the app actually calls. `Area` isn't re-wrapped here -
+//! `polygon::polygon_area` (already ported from geometryutil.js) works
+//! identically on any point list, Clipper2-sourced or not.
+//!
+//! Clipper2 stores coordinates as scaled i64s (see `PointScaler`). The
+//! `clipper2` crate's own default scaler (`Centi`, ×100 = 2 decimal places)
+//! would be a real precision regression from the Electron app, which scales
+//! by 10^7 before ever calling into Clipper1 (`ClipperLib.JS.ScaleUpPath(_,
+//! 10000000)`, chosen there specifically "to ensure integer precision...
+//! while avoiding overflow"). `DeepnestScale` matches that choice exactly.
+
+use clipper2::{difference, inflate, intersect, union, xor, ClipperError, EndType, FillRule, JoinType, Paths};
+
+use crate::point::Point;
+use crate::polygon::polygon_area;
+
+/// Matches the Electron app's `ClipperLib.JS.ScaleUpPath(_, 10000000)` - see
+/// the module doc comment for why the crate's own default (`Centi`, ×100)
+/// isn't precise enough for this application.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Hash)]
+pub struct DeepnestScale;
+
+impl clipper2::PointScaler for DeepnestScale {
+    const MULTIPLIER: f64 = 1e7;
+}
+
+type ClipperPaths = Paths<DeepnestScale>;
+
+fn to_raw_path(points: &[Point]) -> Vec<(f64, f64)> {
+    points.iter().map(|p| (p.x, p.y)).collect()
+}
+
+fn to_raw_paths(polygons: &[Vec<Point>]) -> Vec<Vec<(f64, f64)>> {
+    polygons.iter().map(|p| to_raw_path(p)).collect()
+}
+
+fn from_paths(paths: ClipperPaths) -> Vec<Vec<Point>> {
+    let raw: Vec<Vec<(f64, f64)>> = paths.into();
+    raw.into_iter()
+        .map(|path| path.into_iter().map(|(x, y)| Point::new(x, y)).collect())
+        .collect()
+}
+
+/// Port of `polygonOffset`: expands (positive `delta`) or contracts
+/// (negative `delta`) a polygon. Matches the app's exact parameters (miter
+/// join, miter limit 4, closed-polygon ends) rather than exposing every
+/// Clipper2 offsetting knob - callers that need round/bevel joins can call
+/// `clipper2::inflate` directly.
+pub fn offset(polygon: &[Point], delta: f64) -> Vec<Vec<Point>> {
+    if delta == 0.0 {
+        return vec![polygon.to_vec()];
+    }
+
+    let paths: ClipperPaths = vec![to_raw_path(polygon)].into();
+    let result = inflate(paths, delta, JoinType::Miter, EndType::Polygon, 4.0);
+    from_paths(result)
+}
+
+/// Port of `cleanPolygon`: resolves self-intersections (Clipper2's modern
+/// equivalent of Clipper1's `SimplifyPolygon` is a self-union), keeps only
+/// the largest-area resulting loop, then removes near-duplicate/collinear
+/// points (Clipper2's `simplify` is the equivalent of Clipper1's
+/// `CleanPolygon`) within `0.01 * curve_tolerance`. Returns `None` if
+/// nothing is left after simplification, same as the original.
+pub fn clean_polygon(polygon: &[Point], curve_tolerance: f64) -> Option<Vec<Point>> {
+    let paths: ClipperPaths = vec![to_raw_path(polygon)].into();
+    let empty: ClipperPaths = Vec::<Vec<(f64, f64)>>::new().into();
+
+    let simple = union(paths, empty, FillRule::NonZero).ok()?;
+    let simple = from_paths(simple);
+    if simple.is_empty() {
+        return None;
+    }
+
+    let biggest = simple
+        .into_iter()
+        .max_by(|a, b| polygon_area(a).abs().partial_cmp(&polygon_area(b).abs()).unwrap())?;
+
+    let cleaned_paths: ClipperPaths = vec![to_raw_path(&biggest)].into();
+    let cleaned = clipper2::simplify(cleaned_paths, 0.01 * curve_tolerance, false);
+    let mut cleaned = from_paths(cleaned).into_iter().next()?;
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    // remove a duplicated closing endpoint, same as the original
+    if let (Some(&first), Some(&last)) = (cleaned.first(), cleaned.last()) {
+        if cleaned.len() > 1 && first.x == last.x && first.y == last.y {
+            cleaned.pop();
+        }
+    }
+
+    Some(cleaned)
+}
+
+pub fn union_polygons(subject: &[Vec<Point>], clip: &[Vec<Point>], fill_rule: FillRule) -> Result<Vec<Vec<Point>>, ClipperError> {
+    let s: ClipperPaths = to_raw_paths(subject).into();
+    let c: ClipperPaths = to_raw_paths(clip).into();
+    Ok(from_paths(union(s, c, fill_rule)?))
+}
+
+pub fn intersection_polygons(
+    subject: &[Vec<Point>],
+    clip: &[Vec<Point>],
+    fill_rule: FillRule,
+) -> Result<Vec<Vec<Point>>, ClipperError> {
+    let s: ClipperPaths = to_raw_paths(subject).into();
+    let c: ClipperPaths = to_raw_paths(clip).into();
+    Ok(from_paths(intersect(s, c, fill_rule)?))
+}
+
+pub fn difference_polygons(
+    subject: &[Vec<Point>],
+    clip: &[Vec<Point>],
+    fill_rule: FillRule,
+) -> Result<Vec<Vec<Point>>, ClipperError> {
+    let s: ClipperPaths = to_raw_paths(subject).into();
+    let c: ClipperPaths = to_raw_paths(clip).into();
+    Ok(from_paths(difference(s, c, fill_rule)?))
+}
+
+pub fn xor_polygons(subject: &[Vec<Point>], clip: &[Vec<Point>], fill_rule: FillRule) -> Result<Vec<Vec<Point>>, ClipperError> {
+    let s: ClipperPaths = to_raw_paths(subject).into();
+    let c: ClipperPaths = to_raw_paths(clip).into();
+    Ok(from_paths(xor(s, c, fill_rule)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn square(x: f64, y: f64, size: f64) -> Vec<Point> {
+        vec![
+            Point::new(x, y),
+            Point::new(x + size, y),
+            Point::new(x + size, y + size),
+            Point::new(x, y + size),
+        ]
+    }
+
+    #[test]
+    fn offset_expands_a_square() {
+        let sq = square(0.0, 0.0, 10.0);
+        let result = offset(&sq, 1.0);
+        assert_eq!(result.len(), 1);
+        let area = polygon_area(&result[0]).abs();
+        // an offset-by-1 square (miter join) should be ~12x12 = 144
+        assert!((area - 144.0).abs() < 1.0, "area was {area}");
+    }
+
+    #[test]
+    fn offset_by_zero_returns_the_polygon_unchanged() {
+        let sq = square(0.0, 0.0, 10.0);
+        let result = offset(&sq, 0.0);
+        assert_eq!(result, vec![sq]);
+    }
+
+    #[test]
+    fn offset_contracts_with_negative_delta() {
+        let sq = square(0.0, 0.0, 10.0);
+        let result = offset(&sq, -1.0);
+        assert_eq!(result.len(), 1);
+        let area = polygon_area(&result[0]).abs();
+        assert!((area - 64.0).abs() < 1.0, "area was {area}");
+    }
+
+    #[test]
+    fn clean_polygon_resolves_a_self_intersecting_bowtie_to_its_larger_lobe() {
+        // A bowtie ("hourglass"): (0,0)->(10,10)->(10,0)->(0,10) self-intersects at
+        // its center, forming two triangles. The larger one (base 10, here both
+        // triangles happen to be equal area since the shape is symmetric) should
+        // come back as a simple, non-self-intersecting polygon.
+        let bowtie = vec![
+            Point::new(0.0, 0.0),
+            Point::new(10.0, 10.0),
+            Point::new(10.0, 0.0),
+            Point::new(0.0, 10.0),
+        ];
+        let cleaned = clean_polygon(&bowtie, 0.01).expect("bowtie should resolve to a lobe");
+        assert!(cleaned.len() >= 3);
+        // each resolved triangle lobe has area 25 (half of a 10x10 square, halved again)
+        let area = polygon_area(&cleaned).abs();
+        assert!((area - 25.0).abs() < 1.0, "area was {area}");
+    }
+
+    #[test]
+    fn union_merges_two_overlapping_squares() {
+        let a = square(0.0, 0.0, 10.0);
+        let b = square(5.0, 5.0, 10.0);
+        let result = union_polygons(&[a], &[b], FillRule::NonZero).expect("union should succeed");
+        assert_eq!(result.len(), 1);
+        let area = polygon_area(&result[0]).abs();
+        // 10x10 + 10x10 - 5x5 overlap = 175
+        assert!((area - 175.0).abs() < 1e-6, "area was {area}");
+    }
+
+    #[test]
+    fn difference_subtracts_the_overlap() {
+        let a = square(0.0, 0.0, 10.0);
+        let b = square(5.0, 5.0, 10.0);
+        let result = difference_polygons(&[a], &[b], FillRule::NonZero).expect("difference should succeed");
+        assert_eq!(result.len(), 1);
+        let area = polygon_area(&result[0]).abs();
+        // 10x10 minus the 5x5 overlap corner = 75
+        assert!((area - 75.0).abs() < 1e-6, "area was {area}");
+    }
+}
