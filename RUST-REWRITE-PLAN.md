@@ -50,14 +50,29 @@ deepnest-rust/
   docs/
     PORT_STATUS.md               # the one living tracking doc (see below)
   tests/
-    fixtures/                    # SVGs/part-sets from the Electron repo's benchmark sweeps
+    fixtures/                    # DXF part-sets from the Electron repo's benchmark sweeps
 ```
 
 Two lib crates, not four — `geometry` is everything fuzzable/unit-testable in
-isolation (Clipper2 wrapper, NFP-tracing algorithm, SVG polygonify); `nesting` is
+isolation (Clipper2 wrapper, NFP-tracing algorithm, DXF polygonify); `nesting` is
 everything stateful/concurrent (cache, GA, placement, rayon, progress events).
 Splitting further is speculative structure with no current consumer — merge
 tighter or split further only if this proves awkward in practice.
+
+**Scope change (mid-project, see PORT_STATUS.md for the date):** the input/
+output format is DXF only, not SVG. The user's actual files are DXF with
+meaningful layers (e.g. cut vs. etch vs. drill), and layer identity must
+survive import → nesting → export. SVG import (`svgparser.js`/`domparser.ts`)
+is dropped from this plan entirely — not deprioritized, not kept as a later
+phase. DXF import is native (the `dxf` crate, ixmilia/dxf-rs), not the
+old Electron app's remote-conversion-server approach (which only ever
+produced SVG and would lose layers anyway). DXF export is in scope too
+(writing the nested layout back out with layers preserved), a capability
+the Electron app never had — it only ever exported SVG/JSON, with DXF
+export going through the same remote converter for the reverse direction.
+Hole/interior-feature nesting (e.g. drilled holes) is explicitly **not**
+simplified away — full parent/hole containment NFP support stays in scope,
+same difficulty as originally planned.
 
 ## Phases
 
@@ -73,8 +88,11 @@ below, every row "not started."
 **Phase 1 — Geometry core (1.5-2 weeks).** Point/polygon primitives, the
 Clipper2 wrapper (offset, boolean ops, `SimplifyPolygon`+`CleanPolygon`, `Area`),
 the custom RDP-simplify post-process (offset-shell re-merge, exterior-point
-reversal, axis straightening, `.exact` marking), SVG import (DOM → polygon tree,
-parent/hole detection, `.isCircle` metadata, oversized-part bbox check), and
+reversal, axis straightening, `.exact` marking), DXF import (via the `dxf`
+crate: entities → polygon tree, layer tag preserved per polygon, parent/hole
+detection via containment, `.isCircle` metadata for `CIRCLE`/full-sweep `ARC`
+entities, oversized-part bbox check — same shape of work `svgparser.js` did
+for SVG, just against DXF entities instead of an SVG DOM), and
 `geometryutil.js`'s NFP-tracing primitives (`noFitPolygon`, `noFitPolygonRectangle`,
 slide/projection distance, search-start-point, polygon hull). Port
 `tests/geometry.spec.ts` cases as Rust unit tests *as each function lands*, not
@@ -148,12 +166,17 @@ services are near-mechanical (already thin IPC wrappers). Extract and re-test
 `dispatch-recovery.spec.ts`'s invariant (every dispatch always terminates)
 against the new dispatcher rather than porting the Electron-specific test code.
 
-**Phase 7 — Import/export, dialogs, DXF, crash recovery (1 week).** Tauri
-dialog/fs commands replacing `@electron/remote`. DXF conversion keeps using the
-existing remote HTTP service (`converter.deepnest.app`) via `reqwest` — no
-local DXF parsing needed, same as today. Port the crash-recovery mechanism
-(serialize/deserialize SVG elements to strings, same pattern already built and
-tested this session) and `export-recovery.spec.ts`.
+**Phase 7 — Import/export, dialogs, DXF, crash recovery (1-1.5 weeks,
+expanded from the original estimate).** Tauri dialog/fs commands replacing
+`@electron/remote`. DXF import/export is native via the `dxf` crate on both
+directions — **not** the old Electron app's remote-conversion-server
+approach (`converter.deepnest.app`), which only ever produced SVG and had no
+way to round-trip layers. Export must reproduce each part's original DXF
+layer (cut/etch/drill/etc.) for the nested output, not flatten everything to
+one layer. Port the crash-recovery mechanism (serialize/deserialize the
+imported part geometry to strings — adapted from the DXF entity tree rather
+than SVG elements, same round-trip pattern already built and tested this
+session) and `export-recovery.spec.ts`.
 
 **Phase 8 — Remaining UI wiring + benchmark logging (3-5 days).** Parts-view,
 sheet-dialog, nest-view. Port `benchmarkLogger.js` (git-tagged, dual-file,
@@ -161,8 +184,9 @@ sheet-dialog, nest-view. Port `benchmarkLogger.js` (git-tagged, dual-file,
 tuning sweeps and stays useful for tuning the Rust engine the same way.
 
 **Phase 9 — Parity verification, perf, packaging (1-2 weeks).** Differential
-runs against the still-running Electron app on the same benchmark SVGs (see
-Verification below). Confirm rayon actually saturates cores better than the
+runs against the still-running Electron app on the same benchmark fixtures
+— now DXF, not SVG, matching the DXF-only scope (see Verification below).
+Confirm rayon actually saturates cores better than the
 8-window Electron cap — verify, don't assume. Tauri packaging/icons/installer.
 
 Total: ~9-13 weeks within the 2-4 month (8-17 week) budget, leaving slack for

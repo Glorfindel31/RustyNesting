@@ -6,6 +6,15 @@ full rationale behind each decision below. Update a row's status the moment
 its corresponding Rust module lands and its ported spec (if any) passes —
 don't batch updates to the end of a phase.
 
+**Scope change, mid-Phase-1:** the user's actual files are DXF with
+meaningful layers (cut/etch/drill/etc.), not SVG. Import/export is now DXF
+only, native (the `dxf` crate), with layer identity preserved end-to-end and
+DXF export added as new scope the Electron app never had. SVG import
+(`svgparser.js`/`domparser.ts`) is dropped from this project entirely — see
+the "Dropped from scope" section below instead of "not started." Hole/
+interior-feature nesting (e.g. drilled holes) stays fully in scope — nothing
+about hole handling was simplified away, only the file format changed.
+
 ## Known gotchas to preserve (do not silently "fix" away during the port)
 
 - Rotation-angle-grid quirk: `rotations=6` produces bad angles for
@@ -51,14 +60,15 @@ don't batch updates to the end of a phase.
 | Electron file/function | Rust module | Status | Notes / gotchas |
 |---|---|---|---|
 | `main/util/point.ts` | `geometry::point::Point` | done | `marked: bool` added directly on `Point` (matches the JS field, used by NFP tracing) instead of a wrapper type |
-| `main/util/vector.ts`, `matrix.ts` | — | not started, deferred | not a dependency of anything ported so far (geometryutil.js uses plain `{x,y}` pairs, not the `Vector` class); `Matrix`/SVG-transform-string parsing deferred until SVG import lands, to avoid building it with no consumer yet |
+| `main/util/vector.ts` | — | not started, deferred | not a dependency of anything ported so far (geometryutil.js uses plain `{x,y}` pairs, not the `Vector` class) |
+| `main/util/matrix.ts` | — | dropped, see scope change | was deferred pending SVG-transform-string parsing; SVG import is now out of scope entirely, so this has no remaining consumer. DXF entities carry their own transforms (INSERT/block transforms) — revisit only if block-reference support is needed |
 | `main/util/clipper.js` (Clipper1, JS port) | `geometry::clipper` (via `clipper2` crate) | not started | upgrade from Clipper1 → Clipper2, not a literal port; Phase 0 only proved the binding builds/links, no real offset/boolean-op wiring yet |
 | Offset/boolean ops, `SimplifyPolygon`+`CleanPolygon`, `Area` | `geometry::clipper` | not started | |
 | Custom RDP-simplify post-process (offset-shell re-merge, exterior-point reversal, axis straightening, `.exact` marking) | `geometry::simplify` | partially done | ported `main/util/simplify.js`'s actual Douglas-Peucker algorithm (`geometry::simplify::simplify`, both `geometry.spec.ts` cases passing) — but the larger "offset-shell re-merge/exterior-point reversal/axis straightening/`.exact` marking" pipeline this row describes is a separate, bigger post-process (likely in `deepnest.js`/`background.js`) not yet located or ported |
-| `main/svgparser.js` (SVG import: DOM → polygon tree, parent/hole detection, `.isCircle` metadata, oversized-part bbox check) | `geometry::svg_import` | not started | |
-| `main/util/domparser.ts` | `geometry::svg_import` | not started | |
+| **DXF import** (new scope, not a port — replaces SVG import): entities → polygon tree, layer tag preserved per polygon, parent/hole detection via containment, `.isCircle` metadata for `CIRCLE`/full-sweep `ARC`, oversized-part bbox check | `geometry::dxf_import` (via the `dxf` crate) | not started | native local parsing, not the old remote-conversion-server approach; see "Dropped from scope" for what this replaces |
+| **DXF export** (new scope, Electron app never had this): write nested layout back out as DXF, reproducing each part's original layer | `geometry::dxf_export` or `nesting`/`src-tauri` (TBD when reached) | not started | Phase 7 scope, noted here since it's directly coupled to the import format decision |
 | `main/util/geometryutil.js`: `noFitPolygon`, `noFitPolygonRectangle`, slide/projection distance, search-start-point, polygon hull | `geometry::nfp` | done | ported with unit tests (`crates/geometry/src/nfp.rs`); also ported the transitive dependencies `intersect`, `segmentDistance`, `pointDistance`, `pointInPolygon`, `onSegment`, `lineIntersect`, `almostEqual`, `polygonArea`, `getPolygonBounds`, `isRectangle`, `rotatePolygon` (`crates/geometry/src/polygon.rs`). Preserved quirks: `pointInPolygon`'s bolted-on-offset semantics reproduced via explicit `Point` offset params instead of JS's mutable array properties; `onSegment`'s asymmetric `Math.max(B,A,tolerance)` (vertical branch includes tolerance as a 3rd max/min candidate) vs `Math.max(B,A)` (horizontal branch, no tolerance) preserved exactly; `polygonHull`'s backward-scan y-comparison missing `+Aoffsety` (asymmetric vs. the forward scan) preserved exactly; `noFitPolygon`'s `marked` reset loops starting at index 1 (never resetting index 0) preserved. Deliberately **not** ported yet: `pointLineDistance`, `polygonEdge` — not a dependency of anything Phase 1 requires; deferred to Phase 3 (their only callers are placement-scoring code in `background.js`) |
-| `main/util/HullPolygon.ts` | — | not started | |
+| `main/util/HullPolygon.ts` | — | not started | still needed — hole/interior nesting stays in scope regardless of DXF-vs-SVG |
 | `main/util/eval.ts` | TBD | not started | check for live call sites before porting (dynamic eval usage is a smell) |
 | `main/util/verifyCircularHoleNfp.js` (disk-fit math only) | `geometry::circular_nfp` | done | ported `fastFitDisk`/`fitsAt` and all 4 brute-force `check()` cases as Rust tests (`crates/geometry/src/circular_nfp.rs`). The *production* `getInnerNfp` circular-hole fast path this verifies (`background.js:1886-1894` — DB cache lookup, `A.isCircle`/`B.isCircle` gating, `tessellateCircle` to turn the disk into an actual NFP polygon) is Phase 2 material, not ported yet — this row is only the exact disk-fit math the self-check exists to verify |
 | `tests/geometry.spec.ts` | `geometry` unit tests | done | ported: `polygonArea`, `getPolygonBounds`, `almostEqual`, `polygonHull` (all 3 cases), `simplify` (both cases), and the `verifyCircularHoleNfp` self-check (as 4 separate Rust tests instead of one script-style run, since Rust has no direct equivalent of "require and let it throw") |
@@ -120,10 +130,11 @@ don't batch updates to the end of a phase.
 | Electron file/function | Rust module | Status | Notes / gotchas |
 |---|---|---|---|
 | `@electron/remote` dialog/fs calls | Tauri dialog/fs commands | not started | |
-| DXF conversion (`converter.deepnest.app` remote service) | `reqwest` client | not started | no local DXF parsing needed, same as today |
-| `main/ui/services/import.service.ts` | Tauri command wrapper | not started | |
+| ~~DXF conversion (`converter.deepnest.app` remote service)~~ | — | superseded | scope change: DXF import/export is native via the `dxf` crate (Phase 1/7), not a remote-conversion round-trip. No `reqwest` dependency needed for this |
+| DXF export: write nested layout back out, reproducing each part's original layer | `geometry::dxf_export` or `src-tauri` (TBD) | not started | new scope vs. the original plan — the Electron app never wrote DXF locally |
+| `main/ui/services/import.service.ts` | Tauri command wrapper | not started | needs rework beyond a mechanical port — it's built entirely around the remote-conversion-server flow (`convertAndImport`), which no longer exists |
 | `main/ui/services/export.service.ts` | Tauri command wrapper | not started | |
-| Crash recovery (serialize/deserialize SVG elements to strings) | TBD | not started | pattern already built and tested this session in the Electron repo |
+| Crash recovery (serialize/deserialize imported part geometry to strings) | TBD | not started | pattern already built and tested this session in the Electron repo, for SVG elements — needs adapting to the DXF entity/polygon tree instead |
 | `tests/export-recovery.spec.ts` | re-tested invariant, not ported | not started | "always round-trips recovery snapshot" |
 
 ## Phase 8 — Remaining UI wiring + benchmark logging
@@ -154,6 +165,17 @@ don't batch updates to the end of a phase.
 | `overlapTolerance` config field | zero references outside its own default |
 | On-disk `./nfpcache` directory + delete-on-quit logic | no writer exists anywhere; already in-memory-only in practice |
 | `main/util/simplify.js` | loaded via a `<script>` tag but no static call site found — **do one more dynamic-usage check before dropping**, since a script-tag load without an obvious call site could still be invoked reflectively |
+
+## Dropped from scope (mid-project decision — these are live/used code in the
+## Electron app, unlike "will not port" above; they're cut because the input/
+## output format changed to DXF-only, not because they're dead)
+
+| Item | Why dropped |
+|---|---|
+| `main/svgparser.js` (SVG import: DOM → polygon tree, parent/hole detection, `.isCircle`, oversized-part bbox check) | Replaced entirely by DXF import (`geometry::dxf_import`). The same *shape* of work (entities → polygon tree with hole/circle detection) is still being built, just against DXF entities instead of an SVG DOM — see the Phase 1 table above |
+| `main/util/domparser.ts` | SVG-DOM-specific helper for `svgparser.js`; no DXF equivalent needed (the `dxf` crate provides a structured entity tree directly, no DOM parsing step) |
+| `main/util/matrix.ts` (SVG transform-string parsing) | Only needed for SVG's `transform="matrix(...)"` attribute strings; DXF has no equivalent surface in scope right now |
+| DXF-via-remote-conversion-server flow (`converter.deepnest.app`, `main/ui/services/import.service.ts`'s `convertAndImport`) | Replaced by native local DXF parsing (`dxf` crate) — the whole reason for this scope change is that the remote-conversion approach only ever produced SVG output and had no way to preserve DXF layers |
 
 ## Reference-only files (Electron side, not ported, kept for lookup)
 
