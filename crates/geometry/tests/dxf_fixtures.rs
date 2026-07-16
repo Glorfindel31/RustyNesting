@@ -5,7 +5,9 @@
 //! the DXF-only, layer-retaining scope change recorded in docs/PORT_STATUS.md.
 
 use dxf::Drawing;
-use geometry::dxf_import::entities_to_polygons;
+use geometry::dxf_import::{build_polygon_tree, entities_to_polygons};
+use geometry::inner_nfp::inner_nfp;
+use geometry::point::Point;
 use geometry::polygon::polygon_area;
 use geometry::simplify_polygon::{simplify_polygon, SimplifyConfig};
 
@@ -75,4 +77,42 @@ fn simplify_polygon_runs_without_panicking_on_every_real_cut_profile() {
             "profile {i}: area changed too much ({original_area} -> {result_area}, ratio {ratio})"
         );
     }
+}
+
+#[test]
+fn inner_nfp_general_fallback_works_against_real_drilled_profiles() {
+    // FLAT.dxf's 99 cut profiles each have their drill-hole circles nested as
+    // real children (per the polygon-tree test), giving genuine
+    // container-with-holes cases for the "hardest sub-problem" general
+    // fallback - not just the synthetic square-with-one-hole test in
+    // inner_nfp.rs's own unit tests.
+    let drawing = Drawing::load_file(fixture_path("FLAT.dxf")).expect("FLAT.dxf should parse");
+    let polygons = entities_to_polygons(drawing.entities(), 0.01);
+    let tree = build_polygon_tree(polygons);
+
+    let drilled: Vec<_> = tree.iter().filter(|p| p.children.len() >= 2).collect();
+    assert!(!drilled.is_empty(), "expected at least one profile with multiple drill holes");
+
+    let mut checked = 0;
+    for profile in drilled.iter().take(10) {
+        // a tiny probe part - small enough that it should fit somewhere
+        // inside the profile without necessarily colliding with every hole
+        let probe = geometry::dxf_import::LayeredPolygon {
+            points: vec![
+                Point::new(0.0, 0.0),
+                Point::new(0.5, 0.0),
+                Point::new(0.5, 0.5),
+                Point::new(0.0, 0.5),
+            ],
+            layer: "0".into(),
+            is_circle: None,
+            children: Vec::new(),
+        };
+
+        // must not panic - the actual result (Some or None) is real data
+        // dependent, but the computation itself must complete cleanly
+        let _ = inner_nfp(profile, &probe, 0.1);
+        checked += 1;
+    }
+    assert!(checked > 0);
 }

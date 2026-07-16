@@ -129,6 +129,55 @@ pub fn xor_polygons(subject: &[Vec<Point>], clip: &[Vec<Point>], fill_rule: Fill
     Ok(from_paths(xor(s, c, fill_rule)?))
 }
 
+/// Port of `background.js`'s outer/collision-NFP worker computation
+/// (the `process` function under the "No-Fit Polygon" comment block).
+/// Computes the outer NFP of stationary `a` against moving `b` as the
+/// Minkowski difference `a ⊖ b = {p - q | p ∈ a, q ∈ b}` directly via
+/// Clipper2's `minkowski_diff` - the crate does the "negate B, then
+/// Minkowski sum" trick the old app needed to work around Clipper1 lacking
+/// a difference primitive.
+///
+/// `a` and `b` should already be rotated to their target angles (rotation
+/// is `rotate_polygon`'s job, one layer up) - this only does the Minkowski
+/// step, largest-loop selection, and the translate-back-to-`b[0]` that the
+/// original does inline. Returns `None` for degenerate input or if Clipper2
+/// produces no solution.
+pub fn outer_nfp(a: &[Point], b: &[Point]) -> Option<Vec<Point>> {
+    if a.len() < 3 || b.len() < 3 {
+        return None;
+    }
+
+    let a_paths: ClipperPaths = vec![to_raw_path(a)].into();
+    let b_pattern: clipper2::Path<DeepnestScale> = to_raw_path(b).into();
+
+    let solution = from_paths(clipper2::minkowski_diff(b_pattern, a_paths, true));
+    if solution.is_empty() {
+        return None;
+    }
+
+    // keep the most-negative-signed-area loop (the solid outer ring), same
+    // convention `simplify_polygon`'s offset-selection and offset-shell
+    // re-merge steps use
+    let mut best: Option<(Vec<Point>, f64)> = None;
+    for candidate in solution {
+        let area = polygon_area(&candidate);
+        if best.as_ref().is_none_or(|(_, best_area)| area < *best_area) {
+            best = Some((candidate, area));
+        }
+    }
+    let (mut nfp, _) = best?;
+
+    // the Minkowski difference is computed with B effectively at its own
+    // local origin; translate back to B's actual reference point (B[0])
+    let b0 = b[0];
+    for p in &mut nfp {
+        p.x += b0.x;
+        p.y += b0.y;
+    }
+
+    Some(nfp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +256,41 @@ mod tests {
         let area = polygon_area(&result[0]).abs();
         // 10x10 minus the 5x5 overlap corner = 75
         assert!((area - 75.0).abs() < 1e-6, "area was {area}");
+    }
+
+    #[test]
+    fn outer_nfp_of_two_axis_aligned_squares_is_the_sum_of_their_extents() {
+        // A: 10x10 square at the origin. B: 2x2 square, reference point B[0] at
+        // its own origin corner. The outer NFP describes valid positions for
+        // B[0] such that B just touches A from outside - for two axis-aligned
+        // rectangles that's a rectangle expanded by B's full footprint: a
+        // (10+2) x (10+2) square running from (-2,-2) to (10,10).
+        let a = square(0.0, 0.0, 10.0);
+        let b = square(0.0, 0.0, 2.0);
+
+        let nfp = outer_nfp(&a, &b).expect("outer NFP should exist for two squares");
+        let bounds = crate::polygon::get_polygon_bounds(&nfp).expect("nfp has bounds");
+
+        assert!((bounds.width - 12.0).abs() < 1e-6, "width was {}", bounds.width);
+        assert!((bounds.height - 12.0).abs() < 1e-6, "height was {}", bounds.height);
+        assert!((bounds.x - -2.0).abs() < 1e-6, "x was {}", bounds.x);
+        assert!((bounds.y - -2.0).abs() < 1e-6, "y was {}", bounds.y);
+    }
+
+    #[test]
+    fn outer_nfp_translates_by_bs_reference_point() {
+        // Same as above, but B's reference point (B[0]) is offset from its own
+        // shape's origin corner - the whole NFP should shift by that same offset.
+        let a = square(0.0, 0.0, 10.0);
+        let mut b = square(0.0, 0.0, 2.0);
+        // rotate B's vertex order so index 0 is the (2,0) corner instead of (0,0)
+        b.rotate_left(1);
+
+        let nfp = outer_nfp(&a, &b).expect("outer NFP should exist");
+        let bounds = crate::polygon::get_polygon_bounds(&nfp).expect("nfp has bounds");
+
+        // shifted by +2 in x relative to the b[0]=(0,0) case above
+        assert!((bounds.x - 0.0).abs() < 1e-6, "x was {}", bounds.x);
+        assert!((bounds.width - 12.0).abs() < 1e-6, "width was {}", bounds.width);
     }
 }

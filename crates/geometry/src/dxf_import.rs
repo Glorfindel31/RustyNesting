@@ -69,7 +69,7 @@ fn segment_count(total_angle: f64, radius: f64, tolerance: f64) -> u32 {
 /// Tessellates a full circle into a closed polygon, starting at angle 0
 /// (matching the plan's "circle tessellation always starts on the boundary"
 /// invariant that `circular_nfp`'s fast path depends on).
-fn tessellate_circle(cx: f64, cy: f64, r: f64, tolerance: f64) -> Vec<Point> {
+pub fn tessellate_circle(cx: f64, cy: f64, r: f64, tolerance: f64) -> Vec<Point> {
     let n = segment_count(2.0 * std::f64::consts::PI, r, tolerance);
     (0..n)
         .map(|i| {
