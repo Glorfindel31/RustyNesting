@@ -1,0 +1,7 @@
+[package]
+name = "geometry"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clipper2 = "0.6"

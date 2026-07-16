@@ -1,0 +1,7 @@
+[package]
+name = "nesting"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+geometry = { path = "../geometry" }
