@@ -6,6 +6,8 @@
 
 use dxf::Drawing;
 use geometry::dxf_import::entities_to_polygons;
+use geometry::polygon::polygon_area;
+use geometry::simplify_polygon::{simplify_polygon, SimplifyConfig};
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -42,4 +44,35 @@ fn loads_the_struck_flat_dxf_fixture_without_error() {
     let drawing = Drawing::load_file(fixture_path("FLAT-struck.dxf")).expect("FLAT-struck.dxf should parse");
     let polygons = entities_to_polygons(drawing.entities(), 0.01);
     assert!(!polygons.is_empty());
+}
+
+#[test]
+fn simplify_polygon_runs_without_panicking_on_every_real_cut_profile() {
+    // Regression check against real, non-synthetic geometry: the 99
+    // LWPOLYLINE-derived cut profiles in FLAT.dxf (excludes the 3079 CIRCLE
+    // drill holes, checked separately above) exercise self-intersection
+    // cleanup, offset reversal, and axis straightening against actual
+    // laser-cut part outlines, not just synthetic squares.
+    let drawing = Drawing::load_file(fixture_path("FLAT.dxf")).expect("FLAT.dxf should parse");
+    let polygons = entities_to_polygons(drawing.entities(), 0.01);
+    let profiles: Vec<_> = polygons.iter().filter(|p| p.is_circle.is_none()).collect();
+    assert!(profiles.len() > 50, "expected dozens of cut profiles, got {}", profiles.len());
+
+    let config = SimplifyConfig { curve_tolerance: 0.1, use_convex_hull: false };
+    for (i, profile) in profiles.iter().enumerate() {
+        let original_area = polygon_area(&profile.points).abs();
+        if original_area < 1e-6 {
+            continue; // degenerate/zero-area source polygon, nothing meaningful to simplify
+        }
+
+        let (result, _holes) = simplify_polygon(&profile.points, false, &config);
+        assert!(result.len() >= 3, "profile {i} simplified to fewer than 3 points");
+
+        let result_area = polygon_area(&result).abs();
+        let ratio = result_area / original_area;
+        assert!(
+            (0.5..1.5).contains(&ratio),
+            "profile {i}: area changed too much ({original_area} -> {result_area}, ratio {ratio})"
+        );
+    }
 }
