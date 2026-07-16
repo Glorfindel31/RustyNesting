@@ -1,0 +1,10 @@
+[package]
+name = "deepnest-tauri"
+version.workspace = true
+edition.workspace = true
+
+[build-dependencies]
+tauri-build = "2"
+
+[dependencies]
+tauri = "2"

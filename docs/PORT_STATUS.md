@@ -27,7 +27,7 @@ don't batch updates to the end of a phase.
 |---|---|---|
 | Cargo workspace (`Cargo.toml`, `crates/geometry`, `crates/nesting`) | done | two-crate split per plan; geometry = pure/testable, nesting = stateful/concurrent |
 | Clipper2 Rust FFI binding builds/links on Windows | done | `clipper2` crate (wraps `clipper2c-sys`, C++17 via MSVC) added to `geometry`; smoke-tested with a real boolean union |
-| Bare Tauri shell serving copied frontend | in progress | see Phase 6 note below re: `require("electron")` in `index.html` |
+| Bare Tauri shell serving copied frontend | done | Tauri v2 shell (`src-tauri/`), `frontendDist` points at `frontend/`, zero commands. Launched and screenshotted: static CSS/nav/icons render correctly; main content area is blank as expected since Ractive population depends on `window.DeepNest`, which never constructs — see Phase 6 note re: `require("electron")` in `index.html` |
 | `docs/PORT_STATUS.md` seeded | done | this file |
 
 ## Phase 1 — Geometry core
