@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-This repo is **pre-Phase-0**: it contains only `RUST-REWRITE-PLAN.md`. No
-`Cargo.toml`, no crates, no `src-tauri/`, no `frontend/`, no `docs/PORT_STATUS.md`
-exist yet. There are no build/lint/test commands to run until Phase 0
-(scaffolding) is carried out.
+**Phase 0 (scaffolding) is done.** Phase 1 (geometry core) has not started.
+Always check `docs/PORT_STATUS.md` first — it's the single living tracking
+doc for what's ported and what's outstanding; don't re-derive status from
+`RUST-REWRITE-PLAN.md` or by guessing from the file tree.
 
 **Read `RUST-REWRITE-PLAN.md` in full before doing any work here.** It is the
 master plan for a from-scratch Rust/Tauri rewrite of Deepnest (currently an
@@ -16,9 +16,26 @@ deliberately not port, and the parity/testing strategy. Do not relitigate the
 decisions it marks as already made (Rust+Tauri, no GPU, Clipper2 Rust FFI
 bindings, rayon for concurrency, the `geometry`/`nesting` two-crate split).
 
-Once Phase 0 lands, `docs/PORT_STATUS.md` becomes the single living
-tracking doc for what's ported and what's outstanding — check it first in any
-later session instead of re-deriving status from the plan file.
+## Build/run commands
+
+```
+cargo build                        # whole workspace (geometry, nesting, src-tauri)
+cargo test -p geometry             # geometry unit tests
+cargo test -p nesting               # nesting unit tests
+cargo run -p deepnest-tauri        # launch the Tauri shell (plain cargo run works;
+                                    # frontendDist is static, no dev server/build step)
+```
+
+`tauri-cli` is installed (`cargo install tauri-cli`) for later use
+(`cargo tauri build`/`cargo tauri icon`), but isn't required for `dev` —
+the frontend has no bundler, so a plain `cargo run` embeds `frontend/` as-is.
+
+Known Phase 0 limitation: `frontend/index.html`'s inline module script calls
+`require("electron")` to construct `window.DeepNest`, which throws in the
+Tauri webview (no `require` global there). The static chrome (CSS, nav
+sidebar, icons) renders fine; the Ractive-templated main content stays blank
+until Phase 6 replaces that IPC wiring with Tauri commands. Don't try to fix
+this now — it's tracked in `docs/PORT_STATUS.md` Phase 6.
 
 ## Reference implementation (read-only)
 
@@ -35,20 +52,23 @@ while porting (see the plan's "Critical files" section for the full list):
 - `main.js` — IPC handlers, window pool, single-instance-lock
 - `main/ui/**` — service/component inventory for the frontend being ported as-is
 
-## Planned architecture (per the plan; not yet built)
+## Architecture
 
 ```
 deepnest-rust/
-  Cargo.toml                     # workspace root
+  Cargo.toml                     # workspace root (geometry, nesting, src-tauri)
   crates/
     geometry/                    # pure geometry math, zero I/O, zero threading
+                                  #   - clipper2 crate wired in (Clipper2 C++ FFI), smoke-tested
     nesting/                     # NfpCache, GA, placement, rayon dispatch, event abstraction
-  src-tauri/                     # Tauri commands, event wiring, window setup — no nesting logic
-  frontend/                      # ported main/ui/**, index.html, style.css, vendored libs as-is
+                                  #   - depends on geometry; still an empty skeleton
+  src-tauri/                     # Tauri v2 shell — currently zero real commands
+  frontend/                      # Electron main/ui/**, index.html, style.css, vendored libs,
+                                  # copied as-is (only path fix: ui bundle import, see PORT_STATUS)
   docs/
-    PORT_STATUS.md               # the one living tracking doc
+    PORT_STATUS.md               # the one living tracking doc — check this first
   tests/
-    fixtures/                    # SVGs/part-sets from the Electron repo's benchmark sweeps
+    fixtures/                    # not yet populated — SVGs/part-sets from Electron benchmark sweeps
 ```
 
 Only two lib crates by design: `geometry` is everything fuzzable/unit-testable
