@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 geometry = { path = "../geometry" }
+clipper2 = "0.6"

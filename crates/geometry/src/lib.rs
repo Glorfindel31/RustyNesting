@@ -7,6 +7,7 @@ pub mod dxf_import;
 pub mod hull_polygon;
 pub mod inner_nfp;
 pub mod nfp;
+pub mod obstacle_nfp;
 pub mod point;
 pub mod polygon;
 pub mod simplify;

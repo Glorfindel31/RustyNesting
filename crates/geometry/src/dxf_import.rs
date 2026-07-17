@@ -43,6 +43,59 @@ impl LayeredPolygon {
     }
 }
 
+/// Port of `background.js`'s `rotatePolygon`, extended to a `LayeredPolygon`
+/// (points + recursive children, same as the original recursing into
+/// `polygon.children`). Carries `isCircle` metadata through rotation (center
+/// rotates, radius is invariant) - without this, a rotated circular hole/part
+/// loses its fast-path eligibility in `inner_nfp`'s circular-disk dispatch.
+pub fn rotate_layered_polygon(poly: &LayeredPolygon, degrees: f64) -> LayeredPolygon {
+    let angle = degrees * std::f64::consts::PI / 180.0;
+    let (sin, cos) = angle.sin_cos();
+    let points = poly
+        .points
+        .iter()
+        .map(|p| Point::new(p.x * cos - p.y * sin, p.x * sin + p.y * cos))
+        .collect();
+    let children = poly.children.iter().map(|c| rotate_layered_polygon(c, degrees)).collect();
+    let is_circle = poly.is_circle.map(|c| Circle {
+        cx: c.cx * cos - c.cy * sin,
+        cy: c.cx * sin + c.cy * cos,
+        r: c.r,
+    });
+
+    LayeredPolygon {
+        points,
+        layer: poly.layer.clone(),
+        is_circle,
+        children,
+    }
+}
+
+/// Port of `background.js`'s `shiftPolygon`: translates a polygon (and its
+/// holes) by `(dx, dy)`. Non-destructive, same as the original.
+pub fn shift_layered_polygon(poly: &LayeredPolygon, dx: f64, dy: f64) -> LayeredPolygon {
+    let points = poly.points.iter().map(|p| Point::new(p.x + dx, p.y + dy)).collect();
+    let children = poly.children.iter().map(|c| shift_layered_polygon(c, dx, dy)).collect();
+    let is_circle = poly.is_circle.map(|c| Circle { cx: c.cx + dx, cy: c.cy + dy, r: c.r });
+
+    LayeredPolygon {
+        points,
+        layer: poly.layer.clone(),
+        is_circle,
+        children,
+    }
+}
+
+/// Port of `background.js`'s `polygonMaterialArea`: polygon area minus the
+/// area of its holes, clamped to non-negative (matches `Math.max(0, ...)`).
+pub fn polygon_material_area(poly: &LayeredPolygon) -> f64 {
+    let mut area = polygon_area(&poly.points).abs();
+    for child in &poly.children {
+        area -= polygon_area(&child.points).abs();
+    }
+    area.max(0.0)
+}
+
 /// Minimum angular step per tessellated arc segment, regardless of how loose
 /// `curve_tolerance` is - keeps degenerate/huge-tolerance inputs from
 /// collapsing an arc to a single chord.
