@@ -25,9 +25,14 @@ done: `widenRotationsIfStalled`/`refineStalledBest` (need a caller that
 tracks stagnation across many `dispatch::run` calls — nothing wraps the
 dispatch loop that way yet) and progress/log event plumbing (deliberately
 deferred until Phase 6 gives it an actual consumer to design against; see
-the Phase 4 table's last row for why). Always check `docs/PORT_STATUS.md`
-first — it's the single living tracking doc for what's ported and what's
-outstanding; don't re-derive status from
+the Phase 4 table's last row for why). **Phase 5 (`nesting::consolidation`
+— `refine_consolidation`/`recompute_totals`) is done.** Porting it reused
+Phase 3's `try_place_part_on_sheet` as its own doc comment anticipated, and
+in doing so surfaced and fixed a real latent panic risk in that function
+(the Gravity/Box scoring branch assumed at least one already-placed part on
+the target, which a relocation target isn't guaranteed to have). Always
+check `docs/PORT_STATUS.md` first — it's the single living tracking doc for
+what's ported and what's outstanding; don't re-derive status from
 `RUST-REWRITE-PLAN.md` or by guessing from the file tree.
 
 **Scope change partway through Phase 1 (see `docs/PORT_STATUS.md` for
@@ -163,6 +168,14 @@ Phase 1 table for exactly what each ports from the Electron repo):
   `fitness` (only ever the elitism-carried-over `population[0]`), matching
   the original and avoiding a real redundant placement computation. New
   dependency: `rayon` (already decided in `RUST-REWRITE-PLAN.md`)
+- `consolidation.rs` — `refine_consolidation`/`recompute_totals`: relocates
+  already-placed parts between already-open sheets after the fact (fixes
+  the excess-sheet-usage the dominant-part-area shortcut in `place_parts`
+  can cause), sparsest-sheet-first/smallest-part-first, capped by iteration
+  count/target-sheets-tried/wall-clock deadline. Reuses
+  `placement::try_place_part_on_sheet` for the actual relocation attempt -
+  doing so surfaced and fixed a real latent panic risk in that function
+  (see its own doc comment)
 
 Only two lib crates by design: `geometry` is everything fuzzable/unit-testable
 in isolation; `nesting` is everything stateful/concurrent. Don't split further
