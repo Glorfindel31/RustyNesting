@@ -15,10 +15,19 @@ placement-type scorers, the NaN-fitness gap explicitly resolved via
 threads, matching `docs/PORT_STATUS.md`'s Phase 3 table. Not yet done:
 wiring a result into the Tauri shell for a visual render (that's Phase 6,
 once real Tauri commands exist) and `config.mergeLines`'s edge-merge fitness
-bonus (deliberately deferred, see the Phase 3 table's last row). Phase 4
-(concurrency model + GA orchestration) has not started. Always check
-`docs/PORT_STATUS.md` first — it's the single living tracking doc for what's
-ported and what's outstanding; don't re-derive status from
+bonus (deliberately deferred, see the Phase 3 table's last row). **Phase 4
+(concurrency model + GA orchestration) is mostly done**: `nesting::cache`
+(shared `NfpCache`), `nesting::ga` (`GeneticAlgorithm`/`isBetterNest`), and
+`nesting::dispatch` (rayon-based per-generation dispatch, replacing the
+Electron app's 100ms-poll + per-window IPC model by construction — see the
+Phase 4 table for what that eliminates outright rather than ports). Not yet
+done: `widenRotationsIfStalled`/`refineStalledBest` (need a caller that
+tracks stagnation across many `dispatch::run` calls — nothing wraps the
+dispatch loop that way yet) and progress/log event plumbing (deliberately
+deferred until Phase 6 gives it an actual consumer to design against; see
+the Phase 4 table's last row for why). Always check `docs/PORT_STATUS.md`
+first — it's the single living tracking doc for what's ported and what's
+outstanding; don't re-derive status from
 `RUST-REWRITE-PLAN.md` or by guessing from the file tree.
 
 **Scope change partway through Phase 1 (see `docs/PORT_STATUS.md` for
@@ -136,6 +145,24 @@ Phase 1 table for exactly what each ports from the Electron repo):
   additional opportunities for B" logic). `config.mergeLines`'s edge-merge
   fitness bonus is deliberately not ported yet (optional scoring nicety,
   needs `.exact` point-marking `geometry::Point` doesn't carry)
+- `cache.rs` — `NfpCache`: one shared `Mutex<HashMap<String, CachedNfp>>`
+  (the original ran one independent, unshared cache per background window —
+  a real change, not a 1:1 port) keyed by `cache_key::nfp_cache_key`,
+  capped at `MAX_CACHE_ENTRIES = 50000`
+- `ga.rs` — `GeneticAlgorithm`/`isBetterNest`. A gene is a part *id*
+  (`usize`), not a reference to the part object (real design change —
+  cloning full part geometry through hundreds of mutate/mate calls a
+  generation would be real, avoidable cost; real part lookup by id is the
+  caller's job). New dependency: `rand` (nothing else in the workspace
+  needed randomness before this)
+- `dispatch.rs` — `run_generation`/`run`: `rayon::par_iter()`-based
+  per-generation evaluation, replacing the original's 100ms-poll +
+  per-window-IPC dispatch loop by construction (rayon's parallel iteration
+  is synchronous, so there's no polling, no `processing` flag, no hand-
+  tracked worker-count). Skips re-placing an individual that already has a
+  `fitness` (only ever the elitism-carried-over `population[0]`), matching
+  the original and avoiding a real redundant placement computation. New
+  dependency: `rayon` (already decided in `RUST-REWRITE-PLAN.md`)
 
 Only two lib crates by design: `geometry` is everything fuzzable/unit-testable
 in isolation; `nesting` is everything stateful/concurrent. Don't split further
