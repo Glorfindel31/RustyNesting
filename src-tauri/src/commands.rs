@@ -23,7 +23,11 @@
 //! `run_nest` below) that takes no Tauri types and returns a plain
 //! `Result` - testable directly, without spinning up a Tauri runtime.
 
+use std::collections::HashMap;
+
 use dxf::Drawing;
+use geometry::clearance::{prepare_part, prepare_sheet};
+use geometry::dxf_import::LayeredPolygon;
 use nesting::dispatch;
 use nesting::ga::GeneticAlgorithm;
 
@@ -70,12 +74,41 @@ pub fn run_nest(request: RunNestRequest) -> Result<RunNestResponse, String> {
     if request.config.population_size < 2 {
         return Err("population_size must be at least 2".into());
     }
+    if request.config.margin < 0.0 {
+        return Err("margin must be >= 0".into());
+    }
+    if request.config.spacing < 0.0 {
+        return Err("spacing must be >= 0".into());
+    }
+    let margin = request.config.margin;
+    let spacing = request.config.spacing;
 
-    let sheets: Vec<_> = request.sheets.into_iter().map(Into::into).collect();
-    let (adam, parts_by_id) = expand_parts(request.parts);
+    // Padding is applied here, internally, purely to shape the placement
+    // decisions the engine makes - see geometry::clearance's module doc for
+    // the full derivation. The response only ever reports (id, x, y,
+    // rotation), computed against this padded geometry but geometrically
+    // valid for the caller's original (true, unpadded) shapes too, since
+    // padding doesn't recenter a polygon - nothing padded is ever returned.
+    let true_sheets: Vec<LayeredPolygon> = request.sheets.into_iter().map(Into::into).collect();
+    let sheets: Vec<LayeredPolygon> = true_sheets
+        .iter()
+        .map(|sheet| {
+            let points = prepare_sheet(&sheet.points, margin, spacing).ok_or("margin/spacing leaves a sheet with no usable area")?;
+            Ok(LayeredPolygon { points, layer: sheet.layer.clone(), is_circle: sheet.is_circle, children: sheet.children.clone() })
+        })
+        .collect::<Result<_, &str>>()?;
+
+    let (adam, true_parts_by_id) = expand_parts(request.parts);
     if adam.is_empty() {
         return Err("every part had quantity 0".into());
     }
+    let parts_by_id: HashMap<usize, LayeredPolygon> = true_parts_by_id
+        .iter()
+        .map(|(&id, part)| {
+            let points = prepare_part(&part.points, spacing).ok_or("spacing leaves a part with no usable outline")?;
+            Ok((id, LayeredPolygon { points, layer: part.layer.clone(), is_circle: part.is_circle, children: part.children.clone() }))
+        })
+        .collect::<Result<_, &str>>()?;
 
     let placement_config = request.config.placement_config();
     let ga_config = request.config.ga_config();
@@ -145,6 +178,8 @@ mod tests {
             dominant_part_area_threshold: nesting::placement::DEFAULT_DOMINANT_PART_AREA_THRESHOLD,
             curve_tolerance: 0.3,
             generations,
+            margin: 0.0,
+            spacing: 0.0,
         }
     }
 
@@ -162,6 +197,71 @@ mod tests {
         assert_eq!(response.placements.len(), 1);
         assert_eq!(response.placements[0].parts.len(), 3);
         assert!(response.utilisation > 0.0);
+    }
+
+    #[test]
+    fn run_nest_fits_a_full_sheet_size_part_with_zero_margin_regardless_of_spacing() {
+        // The exact scenario margin/spacing was built for: a part exactly
+        // the sheet's size must be placeable with zero waste as long as
+        // margin is 0, no matter what spacing is set to (spacing is a
+        // part-to-part concern, unrelated to a single part's fit against
+        // the sheet edge).
+        let mut cfg = config(1);
+        cfg.margin = 0.0;
+        cfg.spacing = 6.5;
+        let request = RunNestRequest { sheets: vec![square_dto(100.0)], parts: vec![PartDto { polygon: square_dto(100.0), quantity: 1 }], config: cfg };
+
+        let response = run_nest(request).expect("full-sheet-size part should nest with zero margin");
+
+        assert_eq!(response.unplaced_count, 0);
+        assert_eq!(response.placements[0].parts.len(), 1);
+    }
+
+    #[test]
+    fn run_nest_rejects_a_part_that_only_fits_without_margin() {
+        // Same part/sheet as above, but with a real margin this time - the
+        // same part must now correctly fail to place, proving margin is
+        // actually enforced and not silently ignored.
+        let mut cfg = config(1);
+        cfg.margin = 5.0;
+        cfg.spacing = 0.0;
+        let request = RunNestRequest { sheets: vec![square_dto(100.0)], parts: vec![PartDto { polygon: square_dto(100.0), quantity: 1 }], config: cfg };
+
+        let response = run_nest(request).expect("run_nest itself should still succeed, just leave the part unplaced");
+
+        assert_eq!(response.unplaced_count, 1);
+        assert!(response.placements.is_empty());
+    }
+
+    #[test]
+    fn run_nest_enforces_spacing_between_two_placed_parts() {
+        // Two parts that would just barely both fit side by side with zero
+        // gap must NOT both place once spacing requires more room than the
+        // sheet has for both.
+        let mut cfg = config(1);
+        cfg.margin = 0.0;
+        cfg.spacing = 50.0; // larger than the sheet has slack for two 40-wide parts
+        let request = RunNestRequest {
+            sheets: vec![square_dto(100.0)],
+            parts: vec![PartDto { polygon: square_dto(40.0), quantity: 2 }],
+            config: cfg,
+        };
+
+        let response = run_nest(request).expect("should still run, just not fit both");
+
+        assert_eq!(response.unplaced_count, 1, "spacing=50 between two 40-wide parts on a 100-wide sheet must leave one unplaced");
+    }
+
+    #[test]
+    fn run_nest_rejects_negative_margin_or_spacing() {
+        for (margin, spacing) in [(-1.0, 0.0), (0.0, -1.0)] {
+            let mut cfg = config(1);
+            cfg.margin = margin;
+            cfg.spacing = spacing;
+            let request =
+                RunNestRequest { sheets: vec![square_dto(100.0)], parts: vec![PartDto { polygon: square_dto(10.0), quantity: 1 }], config: cfg };
+            assert!(run_nest(request).is_err(), "margin={margin} spacing={spacing} should be rejected");
+        }
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! Zero I/O, zero threading — see RUST-REWRITE-PLAN.md Phase 1.
 
 pub mod circular_nfp;
+pub mod clearance;
 pub mod clipper;
 pub mod dxf_import;
 pub mod hull_polygon;

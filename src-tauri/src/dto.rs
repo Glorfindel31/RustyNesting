@@ -155,6 +155,18 @@ pub struct NestConfigDto {
     #[serde(default = "default_curve_tolerance")]
     pub curve_tolerance: f64,
     pub generations: usize,
+    /// Minimum clearance between a part and the sheet's true edge. Applied
+    /// via `geometry::clearance::prepare_sheet` - see that module's doc
+    /// comment for why this needs to be independent of `spacing`, not just
+    /// "half the spacing" like the original app's single-parameter model.
+    /// Defaults to 0.0 (no edge clearance requirement) - a laser job with
+    /// no margin/spacing at all must be a true no-op, not a degenerate case.
+    #[serde(default)]
+    pub margin: f64,
+    /// Minimum clearance between two parts' true outlines. Applied via
+    /// `geometry::clearance::prepare_part`. Defaults to 0.0.
+    #[serde(default)]
+    pub spacing: f64,
 }
 
 fn default_dominant_part_area_threshold() -> f64 {

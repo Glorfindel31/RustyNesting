@@ -108,6 +108,8 @@ function buildRequest() {
     dominant_part_area_threshold: Number(el("cfg-dominant").value),
     curve_tolerance: Number(el("import-tolerance").value),
     generations: Number(el("cfg-generations").value),
+    margin: Number(el("cfg-margin").value),
+    spacing: Number(el("cfg-spacing").value),
   };
 
   return { sheets, parts, config };
