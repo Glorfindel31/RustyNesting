@@ -10,9 +10,10 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "deepnest",
+        "title": "RustyNesting",
         "width": 1200,
-        "height": 800
+        "height": 800,
+        "dragDropEnabled": true
       }
     ],
     "security": {

@@ -81,36 +81,60 @@ function shapeThumbnailSvg(shape) {
   return `<svg class="thumb" viewBox="0 0 ${vbW.toFixed(2)} ${vbH.toFixed(2)}" width="56" height="56">${renderShapeSvg(shape, transform)}</svg>`;
 }
 
-async function handleImport() {
-  const path = el("dxf-path").value.trim();
+// Imports every path in `paths` (one import_dxf_command call each - the
+// command only reads a single file) and appends their shapes onto whatever
+// was already imported, so multiple files/drops accumulate into one part
+// pool instead of each import replacing the last. A failure on one file is
+// logged and skipped rather than aborting the rest of the batch.
+async function importPaths(paths) {
+  if (paths.length === 0) return;
   const tolerance = Number(el("import-tolerance").value);
-  if (!path) {
-    setStatus("import-status", "enter a file path", true);
-    return;
-  }
 
-  setStatus("import-status", "importing...", false);
-  logLine(`import: ${path} (tolerance ${tolerance})`);
+  setStatus("import-status", `importing ${paths.length} file(s)...`, false);
   el("btn-import").disabled = true;
-  try {
-    importedShapes = await invoke("import_dxf_command", { path, curve_tolerance: tolerance });
-    setStatus("import-status", `${importedShapes.length} shape(s) imported`, false);
-    logLine(`import ok: ${importedShapes.length} shape(s)`);
+  let imported = 0;
+  for (const path of paths) {
+    logLine(`import: ${path} (tolerance ${tolerance})`);
+    try {
+      const shapes = await invoke("import_dxf_command", { path, curve_tolerance: tolerance });
+      importedShapes = importedShapes.concat(shapes);
+      imported += shapes.length;
+      logLine(`import ok: ${shapes.length} shape(s) from ${path}`);
+    } catch (err) {
+      logLine(`import failed for ${path}: ${err}`);
+    }
+  }
+  el("btn-import").disabled = false;
+
+  if (imported > 0) {
+    setStatus("import-status", `${imported} shape(s) imported (${importedShapes.length} total)`, false);
     renderShapesTable();
     el("panel-shapes").hidden = false;
     el("panel-config").hidden = false;
-  } catch (err) {
-    setStatus("import-status", String(err), true);
-    logLine(`import failed: ${err}`);
-  } finally {
-    el("btn-import").disabled = false;
+  } else {
+    setStatus("import-status", "no shapes imported - see console", true);
   }
 }
 
+async function handleBrowse() {
+  const selected = await window.__TAURI__.dialog.open({
+    multiple: true,
+    filters: [{ name: "DXF", extensions: ["dxf"] }],
+  });
+  if (!selected) return; // user cancelled
+  const paths = Array.isArray(selected) ? selected : [selected];
+  await importPaths(paths);
+}
+
+// Appends rows for any shape not yet rendered, rather than clearing and
+// rebuilding the whole table - importing happens incrementally now (a
+// second file, a dropped file, a hand-added rectangle), and rebuilding
+// every row from scratch would silently discard whatever ROLE/QTY the user
+// already set on earlier rows.
 function renderShapesTable() {
   const body = el("shapes-body");
-  body.innerHTML = "";
-  importedShapes.forEach((shape, i) => {
+  for (let i = body.children.length; i < importedShapes.length; i++) {
+    const shape = importedShapes[i];
     const { w, h } = boundsOf(shape.points);
     const row = document.createElement("tr");
     row.innerHTML = `
@@ -129,7 +153,37 @@ function renderShapesTable() {
       <td><input type="number" data-qty="${i}" value="1" min="0" step="1" /></td>
     `;
     body.appendChild(row);
+  }
+}
+
+// Lets the user define a sheet or part directly by size, instead of
+// needing a DXF file for it - e.g. a stock sheet size that isn't in any
+// DXF on hand yet. Built the same shape as an imported PolygonDto so it
+// flows through buildRequest/renderShapesTable unchanged.
+function handleAddRectangle() {
+  const width = Number(el("rect-width").value);
+  const height = Number(el("rect-height").value);
+  const layer = el("rect-layer").value.trim() || "CUSTOM";
+  if (!(width > 0) || !(height > 0)) {
+    setStatus("import-status", "width and height must both be greater than 0", true);
+    return;
+  }
+
+  importedShapes.push({
+    layer,
+    points: [
+      { x: 0, y: 0 },
+      { x: width, y: 0 },
+      { x: width, y: height },
+      { x: 0, y: height },
+    ],
+    is_circle: null,
+    children: [],
   });
+  logLine(`added custom rectangle: ${width} x ${height} (layer "${layer}")`);
+  renderShapesTable();
+  el("panel-shapes").hidden = false;
+  el("panel-config").hidden = false;
 }
 
 function shapeToPolygonDto(shape) {
@@ -265,7 +319,8 @@ function renderResult(response, request) {
   }
 }
 
-el("btn-import").addEventListener("click", handleImport);
+el("btn-import").addEventListener("click", handleBrowse);
+el("btn-add-rect").addEventListener("click", handleAddRectangle);
 el("btn-run").addEventListener("click", handleRunNest);
 
 // Live per-generation stats while a nest run is in progress, emitted by
@@ -274,4 +329,19 @@ el("btn-run").addEventListener("click", handleRunNest);
 window.__TAURI__.event.listen("nest-progress", (event) => {
   const p = event.payload;
   logLine(`gen ${p.generation}/${p.generations}: fitness=${p.best_fitness.toFixed(1)} sheets=${p.sheets_used} unplaced=${p.unplaced_count} util=${p.utilisation.toFixed(1)}%`);
+});
+
+// Drag-and-drop DXF import - Tauri delivers dropped-file paths as a core
+// window event (needs `dragDropEnabled: true` in tauri.conf.json's window
+// config; not a plugin, so no extra capability beyond core:event:default).
+const dropzone = el("dropzone");
+window.__TAURI__.event.listen("tauri://drag-enter", () => dropzone.classList.add("drag-over"));
+window.__TAURI__.event.listen("tauri://drag-leave", () => dropzone.classList.remove("drag-over"));
+window.__TAURI__.event.listen("tauri://drag-drop", (event) => {
+  dropzone.classList.remove("drag-over");
+  const paths = event.payload.paths.filter((p) => p.toLowerCase().endsWith(".dxf"));
+  if (paths.length < event.payload.paths.length) {
+    logLine(`ignored ${event.payload.paths.length - paths.length} dropped file(s) that weren't .dxf`);
+  }
+  importPaths(paths);
 });

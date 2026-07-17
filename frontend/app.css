@@ -220,6 +220,21 @@ td input {
   margin-top: 6px;
 }
 
+.dropzone {
+  margin-top: 10px;
+  border: 2px dashed var(--border);
+  padding: 18px;
+  text-align: center;
+  color: var(--dim);
+  font-size: 12px;
+  letter-spacing: 0.05em;
+}
+
+.dropzone.drag-over {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .thumb {
   background: #0d0d0d;
   border: 1px solid var(--border);

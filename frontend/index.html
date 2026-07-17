@@ -2,12 +2,12 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>deepnest</title>
+    <title>RustyNesting</title>
     <link rel="stylesheet" href="app.css" />
   </head>
   <body>
     <header>
-      <h1>DEEPNEST</h1>
+      <h1>RUSTYNESTING</h1>
       <span class="sub">RUST/TAURI — PHASE 6</span>
     </header>
 
@@ -15,12 +15,23 @@
       <section class="panel" id="panel-import">
         <h2>01 / IMPORT DXF</h2>
         <div class="row">
-          <label for="dxf-path">FILE PATH</label>
-          <input id="dxf-path" type="text" spellcheck="false" placeholder="C:\path\to\file.dxf" />
-          <label for="import-tolerance">TOLERANCE</label>
-          <input id="import-tolerance" type="number" value="0.3" step="0.05" min="0.01" />
-          <button id="btn-import">IMPORT</button>
+          <label for="import-tolerance" title="How closely curves (arcs/circles) are approximated with straight line segments. Lower = more accurate but more points; higher = fewer points but a coarser shape.">TOLERANCE</label>
+          <input id="import-tolerance" type="number" value="0.3" step="0.05" min="0.01" title="How closely curves (arcs/circles) are approximated with straight line segments. Lower = more accurate but more points; higher = fewer points but a coarser shape." />
+          <button id="btn-import">BROWSE...</button>
         </div>
+        <div id="dropzone" class="dropzone">or drag one or more .dxf files here</div>
+
+        <p class="hint">or add a rectangle directly (a stock sheet size, or a simple rectangular part) without a DXF file:</p>
+        <div class="row">
+          <label for="rect-width">WIDTH (mm)</label>
+          <input id="rect-width" type="number" value="2440" min="0.1" step="1" />
+          <label for="rect-height">HEIGHT (mm)</label>
+          <input id="rect-height" type="number" value="1220" min="0.1" step="1" />
+          <label for="rect-layer">LAYER NAME</label>
+          <input id="rect-layer" type="text" value="CUSTOM" spellcheck="false" />
+          <button id="btn-add-rect">ADD RECTANGLE</button>
+        </div>
+
         <p class="status" id="import-status"></p>
       </section>
 
