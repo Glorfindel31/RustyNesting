@@ -11,13 +11,24 @@
 //!
 //! Sheet is a plain 2440x1220mm rectangle, offset inward by the 3mm margin
 //! (`geometry::clipper::offset`, negative delta). Parts are every closed
-//! profile in `tests/fixtures/FLAT.dxf` (a real cut layout - 99 profiles,
-//! sizes from ~300mm to ~2400mm, some with drilled holes), each offset
-//! *outward* by half the 6.5mm spacing - the standard offset-based spacing
-//! technique: two parts whose spacing-padded footprints don't overlap end
-//! up with at least the full spacing between their real outlines. Holes
-//! aren't re-offset - the padding is a keep-out zone around the *outside*
-//! of a part for inter-part clearance, unrelated to interior features.
+//! profile in *both* `tests/fixtures/FLAT.dxf` and
+//! `tests/fixtures/FLAT-struck.dxf` (two real cut layouts, combined into one
+//! part pool - ids continue across the second file rather than restarting
+//! at 0, so they stay unique), each offset *outward* by half the 6.5mm
+//! spacing - the standard offset-based spacing technique: two parts whose
+//! spacing-padded footprints don't overlap end up with at least the full
+//! spacing between their real outlines. Holes aren't re-offset - the
+//! padding is a keep-out zone around the *outside* of a part for inter-part
+//! clearance, unrelated to interior features.
+//!
+//! `SHEET_COPIES` is asserted at startup to have real headroom over the
+//! computed minimum (total part area / sheet area, at the ~90% packing
+//! efficiency real runs actually achieve) instead of being a bare guess - a
+//! previous pass used a guessed 40, which turned out to be below the true
+//! minimum for `FLAT.dxf` alone, leaving parts structurally unable to fit
+//! regardless of GA quality and confounding the "why doesn't more compute
+//! time help" result. Panics with the real numbers instead of silently
+//! under-providing sheets again.
 //!
 //! Each run gets a fresh `GeneticAlgorithm` and calls
 //! `dispatch::run_generation` in a loop until `run_seconds` of wall clock
@@ -44,27 +55,40 @@ const SHEET_WIDTH: f64 = 2440.0;
 const SHEET_HEIGHT: f64 = 1220.0;
 const MARGIN: f64 = 3.0;
 const SPACING: f64 = 6.5;
-const SHEET_COPIES: usize = 40;
+const SHEET_COPIES: usize = 120;
 const CURVE_TOLERANCE: f64 = 0.3;
+/// Real utilisation observed in prior runs on this fixture set was ~91%;
+/// use a slightly more conservative 90% here so the startup check has a
+/// small margin of its own rather than asserting against the exact figure.
+const ASSUMED_PACKING_EFFICIENCY: f64 = 0.9;
+const FIXTURES: &[&str] = &["FLAT.dxf", "FLAT-struck.dxf"];
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// Loads every closed profile from every file in `FIXTURES`, combined into
+/// one part pool - ids continue across files (a plain running counter)
+/// rather than restarting at 0 per file, so they stay unique.
 fn load_parts() -> HashMap<usize, LayeredPolygon> {
-    let fixture = repo_root().join("tests/fixtures/FLAT.dxf");
-    let drawing = Drawing::load_file(&fixture).unwrap_or_else(|e| panic!("couldn't parse {}: {e}", fixture.display()));
-    let flat = entities_to_polygons(drawing.entities(), CURVE_TOLERANCE);
-    let tree = build_polygon_tree(flat);
-
     let mut parts_by_id = HashMap::new();
+    let mut next_id = 0usize;
     let mut skipped = 0usize;
-    for (id, root) in tree.into_iter().enumerate() {
-        let Some(expanded_points) = offset(&root.points, SPACING / 2.0).into_iter().next() else {
-            skipped += 1;
-            continue;
-        };
-        parts_by_id.insert(id, LayeredPolygon { points: expanded_points, layer: root.layer, is_circle: None, children: root.children });
+
+    for name in FIXTURES {
+        let fixture = repo_root().join("tests/fixtures").join(name);
+        let drawing = Drawing::load_file(&fixture).unwrap_or_else(|e| panic!("couldn't parse {}: {e}", fixture.display()));
+        let flat = entities_to_polygons(drawing.entities(), CURVE_TOLERANCE);
+        let tree = build_polygon_tree(flat);
+
+        for root in tree {
+            let Some(expanded_points) = offset(&root.points, SPACING / 2.0).into_iter().next() else {
+                skipped += 1;
+                continue;
+            };
+            parts_by_id.insert(next_id, LayeredPolygon { points: expanded_points, layer: root.layer, is_circle: None, children: root.children });
+            next_id += 1;
+        }
     }
     if skipped > 0 {
         eprintln!("warning: {skipped} profile(s) failed to offset for spacing and were skipped");
@@ -99,6 +123,22 @@ fn main() {
         ids
     };
     let sheets: Vec<LayeredPolygon> = (0..SHEET_COPIES).map(|_| build_sheet()).collect();
+
+    // Fail fast with the real numbers instead of silently under-providing
+    // sheets again (see this file's module doc comment for the previous
+    // pass that got this wrong with a bare guess of 40).
+    let sheet_area = geometry::polygon::polygon_area(&sheets[0].points).abs();
+    let total_part_area: f64 = adam.iter().map(|id| geometry::polygon::polygon_area(&parts_by_id[id].points).abs()).sum();
+    let usable_capacity = SHEET_COPIES as f64 * sheet_area * ASSUMED_PACKING_EFFICIENCY;
+    assert!(
+        usable_capacity >= total_part_area,
+        "SHEET_COPIES={SHEET_COPIES} isn't enough: {total_part_area:.0}mm2 of parts vs {usable_capacity:.0}mm2 of usable capacity \
+         at {:.0}% packing efficiency ({:.1} sheets minimum at 100%, {:.1} at {:.0}%) - raise SHEET_COPIES",
+        ASSUMED_PACKING_EFFICIENCY * 100.0,
+        total_part_area / sheet_area,
+        total_part_area / (sheet_area * ASSUMED_PACKING_EFFICIENCY),
+        ASSUMED_PACKING_EFFICIENCY * 100.0,
+    );
 
     let placement_config =
         PlacementConfig { placement_type: PlacementType::Gravity, rotations: 4, dominant_part_area_threshold: DEFAULT_DOMINANT_PART_AREA_THRESHOLD, curve_tolerance: CURVE_TOLERANCE };
