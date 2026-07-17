@@ -194,9 +194,20 @@ pub fn run_nest_with_progress(request: RunNestRequest, mut on_progress: impl FnM
 // command args too keeps one casing convention across the whole wire
 // format instead of two, which is one fewer thing to get subtly wrong when
 // hand-writing the JS call site.
+// Both commands below are `async fn` and hand the actual work to
+// `spawn_blocking` rather than running it inline. A plain (non-async)
+// `#[tauri::command]` executes on whatever thread Tauri's IPC dispatch
+// happens on - on desktop that's the same thread pumping the window's
+// event loop, so a long-running synchronous command (a big DXF parse, or
+// a nest run with enough generations/parts to take seconds) freezes the
+// entire window - no repaint, no input, nothing - until it returns. Moving
+// the work to a background thread via `spawn_blocking` and `.await`-ing it
+// here keeps the event loop free the whole time.
 #[tauri::command(rename_all = "snake_case")]
-pub fn import_dxf_command(path: String, curve_tolerance: f64) -> Result<Vec<PolygonDto>, String> {
-    import_dxf(&path, curve_tolerance)
+pub async fn import_dxf_command(path: String, curve_tolerance: f64) -> Result<Vec<PolygonDto>, String> {
+    tauri::async_runtime::spawn_blocking(move || import_dxf(&path, curve_tolerance))
+        .await
+        .map_err(|e| format!("import task panicked: {e}"))?
 }
 
 // `app: tauri::AppHandle` is one of Tauri's special injected command
@@ -204,24 +215,28 @@ pub fn import_dxf_command(path: String, curve_tolerance: f64) -> Result<Vec<Poly
 // caller, so `invoke("run_nest_command", { request })` on the frontend is
 // unaffected by adding it here.
 #[tauri::command(rename_all = "snake_case")]
-pub fn run_nest_command(app: tauri::AppHandle, request: RunNestRequest) -> Result<RunNestResponse, String> {
-    run_nest_with_progress(request, |generation, generations, best_so_far| {
-        // A dropped/closing window makes `emit` return an error; there's no
-        // meaningful recovery from inside a progress callback, so ignore it
-        // rather than aborting an otherwise-successful nest run over a lost
-        // UI update.
-        let _ = app.emit(
-            "nest-progress",
-            NestProgressDto {
-                generation,
-                generations,
-                best_fitness: best_so_far.fitness,
-                sheets_used: best_so_far.placements.len(),
-                unplaced_count: best_so_far.unplaced_count,
-                utilisation: best_so_far.utilisation,
-            },
-        );
+pub async fn run_nest_command(app: tauri::AppHandle, request: RunNestRequest) -> Result<RunNestResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_nest_with_progress(request, |generation, generations, best_so_far| {
+            // A dropped/closing window makes `emit` return an error; there's
+            // no meaningful recovery from inside a progress callback, so
+            // ignore it rather than aborting an otherwise-successful nest
+            // run over a lost UI update.
+            let _ = app.emit(
+                "nest-progress",
+                NestProgressDto {
+                    generation,
+                    generations,
+                    best_fitness: best_so_far.fitness,
+                    sheets_used: best_so_far.placements.len(),
+                    unplaced_count: best_so_far.unplaced_count,
+                    utilisation: best_so_far.utilisation,
+                },
+            );
+        })
     })
+    .await
+    .map_err(|e| format!("nest task panicked: {e}"))?
 }
 
 #[cfg(test)]
