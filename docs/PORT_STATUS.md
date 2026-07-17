@@ -145,7 +145,7 @@ about hole handling was simplified away, only the file format changed.
 | `main/ui/components/nest-view.ts` | frontend (ported as-is) + Tauri wiring | not started | |
 | `main/ui/components/navigation.ts` | frontend (ported as-is) + Tauri wiring | not started | |
 | `main/ui/components/nesting-console.ts` | frontend (ported as-is) + Tauri wiring | not started | |
-| `main/benchmarkLogger.js` (git-tagged, dual-file, 5MB-rotated CSV logging) | `nesting::benchmark_log` | not started | produced this session's four empirical tuning sweeps; stays useful for tuning the Rust engine |
+| `main/benchmarkLogger.js` (git-tagged, dual-file, 5MB-rotated CSV logging) | `nesting::benchmark_log` | done | `git_revision()` (`-dirty` suffix from `git status --porcelain`, cached for the process), `append_benchmark_line` (per-generation detail, 5MB-rotated to `.old`), `append_run_summary_row` (per-run CSV, header written once) - matches the original's exact two-file split and `nest-benchmark-runs.csv` column philosophy (one row per run, meant for lining runs up side by side). Built to support `crates/nesting/examples/bench.rs`: a real timed-runs benchmark (N runs x M seconds each, real `tests/fixtures/FLAT.dxf` parts, sheet/margin/spacing as actual job parameters via `geometry::clipper::offset` pre/post-processing - see the example's own doc comment) used to look for performance bottlenecks empirically, same spirit as the original's four tuning sweeps |
 
 ## Phase 9 — Parity verification, perf, packaging
 

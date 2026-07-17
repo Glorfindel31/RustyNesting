@@ -8,3 +8,6 @@ geometry = { path = "../geometry" }
 clipper2 = "0.6"
 rand = "0.8"
 rayon = "1"
+
+[dev-dependencies]
+dxf = "0.6"

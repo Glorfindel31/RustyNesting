@@ -1911,6 +1911,7 @@ name = "nesting"
 version = "0.1.0"
 dependencies = [
  "clipper2",
+ "dxf",
  "geometry",
  "rand",
  "rayon",
