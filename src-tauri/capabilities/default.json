@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window - grants the frontend permission to listen for the \"nest-progress\" event run_nest_command emits (see commands.rs's run_nest_with_progress). Custom app commands (import_dxf_command/run_nest_command) don't need an ACL entry - only Tauri's own core/plugin commands (event, window, etc.) are gated by capabilities.",
+  "windows": ["main"],
+  "permissions": ["core:default", "core:event:default"]
+}

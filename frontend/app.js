@@ -20,6 +20,17 @@ function setStatus(id, message, isError) {
   node.classList.toggle("error", Boolean(isError));
 }
 
+// A running log of what the app is doing, like the old Electron UI's
+// console - import/run start, success, failure, and (via the
+// "nest-progress" event below) live per-generation stats while a run is in
+// progress, instead of the UI just going quiet until the whole run returns.
+function logLine(message) {
+  const node = el("console-log");
+  const time = new Date().toLocaleTimeString();
+  node.textContent += `[${time}] ${message}\n`;
+  node.scrollTop = node.scrollHeight;
+}
+
 function boundsOf(points) {
   const xs = points.map((p) => p.x);
   const ys = points.map((p) => p.y);
@@ -35,6 +46,41 @@ function toSvgPoints(points, sheetBounds) {
   return points.map((p) => ({ x: p.x - sheetBounds.minx, y: sheetBounds.h - (p.y - sheetBounds.miny) }));
 }
 
+// Real DXF layers are arbitrary user-given names (cut/etch/drill/whatever a
+// given job uses), so there's no fixed palette to draw from - hash the name
+// to a hue instead. Same layer name always gets the same color, in both the
+// shape thumbnails and the nested result, without needing a legend or any
+// per-job configuration.
+function colorForLayer(layer) {
+  let hash = 0;
+  for (let i = 0; i < layer.length; i++) hash = (hash * 31 + layer.charCodeAt(i)) >>> 0;
+  return `hsl(${hash % 360}, 85%, 65%)`;
+}
+
+// Recursively draws a shape and every nested child (holes, interior
+// features on other layers) - a DXF part is a tree, not just its outer
+// boundary, and dropping the children was silently discarding layer
+// identity the app is supposed to preserve end to end. `transformPoints`
+// does whatever coordinate mapping the caller needs (thumbnail-local bounds,
+// or rotate+translate+sheet-relative for a placed part) - every node in the
+// tree shares the same rigid transform since children are defined relative
+// to the same local origin as their parent.
+function renderShapeSvg(shape, transformPoints, isRoot = true) {
+  const pts = transformPoints(shape.points);
+  let markup = `<polygon points="${pointsToPath(pts)}" fill="none" stroke="${colorForLayer(shape.layer)}" stroke-width="${isRoot ? 1.4 : 1}" vector-effect="non-scaling-stroke" />`;
+  for (const child of shape.children ?? []) markup += renderShapeSvg(child, transformPoints, false);
+  return markup;
+}
+
+function shapeThumbnailSvg(shape) {
+  const bounds = boundsOf(shape.points);
+  const pad = Math.max(bounds.w, bounds.h, 1) * 0.08;
+  const vbW = bounds.w + pad * 2;
+  const vbH = bounds.h + pad * 2;
+  const transform = (points) => toSvgPoints(points, bounds).map((p) => ({ x: p.x + pad, y: p.y + pad }));
+  return `<svg class="thumb" viewBox="0 0 ${vbW.toFixed(2)} ${vbH.toFixed(2)}" width="56" height="56">${renderShapeSvg(shape, transform)}</svg>`;
+}
+
 async function handleImport() {
   const path = el("dxf-path").value.trim();
   const tolerance = Number(el("import-tolerance").value);
@@ -44,15 +90,18 @@ async function handleImport() {
   }
 
   setStatus("import-status", "importing...", false);
+  logLine(`import: ${path} (tolerance ${tolerance})`);
   el("btn-import").disabled = true;
   try {
     importedShapes = await invoke("import_dxf_command", { path, curve_tolerance: tolerance });
     setStatus("import-status", `${importedShapes.length} shape(s) imported`, false);
+    logLine(`import ok: ${importedShapes.length} shape(s)`);
     renderShapesTable();
     el("panel-shapes").hidden = false;
     el("panel-config").hidden = false;
   } catch (err) {
     setStatus("import-status", String(err), true);
+    logLine(`import failed: ${err}`);
   } finally {
     el("btn-import").disabled = false;
   }
@@ -69,6 +118,7 @@ function renderShapesTable() {
       <td>${shape.layer}</td>
       <td>${shape.points.length}</td>
       <td>${w.toFixed(1)} × ${h.toFixed(1)}</td>
+      <td>${shapeThumbnailSvg(shape)}</td>
       <td>
         <select data-role="${i}">
           <option value="part">PART</option>
@@ -142,15 +192,21 @@ async function handleRunNest() {
     return;
   }
 
+  const partInstances = request.parts.reduce((n, p) => n + p.quantity, 0);
   setStatus("run-status", "nesting...", false);
+  logLine(`nest: ${request.sheets.length} sheet(s), ${partInstances} part instance(s), ${request.config.generations} generation(s)`);
   el("btn-run").disabled = true;
   try {
     const response = await invoke("run_nest_command", { request });
     setStatus("run-status", "done", false);
+    logLine(
+      `nest done: fitness=${response.fitness.toFixed(1)} sheets=${response.placements.length} unplaced=${response.unplaced_count} util=${response.utilisation.toFixed(1)}%`
+    );
     renderResult(response, request);
     el("panel-result").hidden = false;
   } catch (err) {
     setStatus("run-status", String(err), true);
+    logLine(`nest failed: ${err}`);
   } finally {
     el("btn-run").disabled = false;
   }
@@ -193,8 +249,8 @@ function renderResult(response, request) {
       .map((p) => {
         const shape = partById.get(p.id);
         if (!shape) return "";
-        const pts = toSvgPoints(rotatedTranslatedPoints(shape.points, p.rotation, p.x, p.y), sheetBounds);
-        return `<polygon points="${pointsToPath(pts)}" fill="none" stroke="#d7ff3a" stroke-width="${1 / scale}" />`;
+        const transform = (points) => toSvgPoints(rotatedTranslatedPoints(points, p.rotation, p.x, p.y), sheetBounds);
+        return renderShapeSvg(shape, transform);
       })
       .join("");
 
@@ -211,3 +267,11 @@ function renderResult(response, request) {
 
 el("btn-import").addEventListener("click", handleImport);
 el("btn-run").addEventListener("click", handleRunNest);
+
+// Live per-generation stats while a nest run is in progress, emitted by
+// run_nest_command (see src-tauri/src/commands.rs's run_nest_with_progress)
+// - the Rust-side counterpart to this UI's console panel.
+window.__TAURI__.event.listen("nest-progress", (event) => {
+  const p = event.payload;
+  logLine(`gen ${p.generation}/${p.generations}: fitness=${p.best_fitness.toFixed(1)} sheets=${p.sheets_used} unplaced=${p.unplaced_count} util=${p.utilisation.toFixed(1)}%`);
+});

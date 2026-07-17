@@ -29,9 +29,11 @@ use dxf::Drawing;
 use geometry::clearance::{prepare_part, prepare_sheet};
 use geometry::dxf_import::LayeredPolygon;
 use nesting::dispatch;
-use nesting::ga::GeneticAlgorithm;
+use nesting::ga::{is_better_nest, GeneticAlgorithm};
+use nesting::placement::PlaceResult;
+use tauri::Emitter;
 
-use crate::dto::{expand_parts, PlacedPartDto, PolygonDto, RunNestRequest, RunNestResponse, SheetPlacementDto};
+use crate::dto::{expand_parts, NestProgressDto, PlacedPartDto, PolygonDto, RunNestRequest, RunNestResponse, SheetPlacementDto};
 
 /// Reads a DXF file from disk and returns its closed profiles as a
 /// parent/hole tree (`geometry::dxf_import::build_polygon_tree`) - the
@@ -53,7 +55,27 @@ pub fn import_dxf(path: &str, curve_tolerance: f64) -> Result<Vec<PolygonDto>, S
 /// expanded into individually-id'd physical copies first
 /// (`dto::expand_parts`), same as the original's `launchWorkers` building
 /// its GA seed population.
+// Only the tests below call this directly (the real `run_nest_command`
+// uses `run_nest_with_progress` to get per-generation events) - gated to
+// test builds instead of carrying an unused production entry point.
+#[cfg(test)]
 pub fn run_nest(request: RunNestRequest) -> Result<RunNestResponse, String> {
+    run_nest_with_progress(request, |_, _, _| {})
+}
+
+/// Same as `run_nest`, but calls `on_progress(generation, total_generations,
+/// best_so_far)` after every completed generation - the hook the
+/// `run_nest_command` Tauri wrapper uses to `emit` a live "nest-progress"
+/// event per generation, so the UI can show what's happening instead of
+/// blocking silently until the whole run finishes. Plain `run_nest` (used by
+/// every test below and any caller that doesn't care) is just this with a
+/// no-op hook.
+///
+/// Inlines the generation loop `nesting::dispatch::run` would otherwise do,
+/// rather than adding a callback parameter to that function - `dispatch`'s
+/// own doc comment already calls progress plumbing out as "left to whatever
+/// wraps this loop", so this is that wrapper, not a fork of engine logic.
+pub fn run_nest_with_progress(request: RunNestRequest, mut on_progress: impl FnMut(usize, usize, &PlaceResult)) -> Result<RunNestResponse, String> {
     if request.sheets.is_empty() {
         return Err("at least one sheet is required".into());
     }
@@ -114,8 +136,20 @@ pub fn run_nest(request: RunNestRequest) -> Result<RunNestResponse, String> {
     let ga_config = request.config.ga_config();
     let mut ga = GeneticAlgorithm::new(adam, ga_config, Vec::new());
 
-    let best = dispatch::run(&mut ga, &sheets, &parts_by_id, &placement_config, request.config.generations)
-        .ok_or_else(|| "ran zero generations".to_string())?;
+    let generations = request.config.generations;
+    let mut best: Option<PlaceResult> = None;
+    for generation in 1..=generations {
+        let results = dispatch::run_generation(&mut ga, &sheets, &parts_by_id, &placement_config);
+        for result in results {
+            if best.as_ref().is_none_or(|b| is_better_nest(&result, b)) {
+                best = Some(result);
+            }
+        }
+        if let Some(so_far) = &best {
+            on_progress(generation, generations, so_far);
+        }
+    }
+    let best = best.ok_or_else(|| "ran zero generations".to_string())?;
 
     Ok(RunNestResponse {
         placements: best
@@ -145,9 +179,29 @@ pub fn import_dxf_command(path: String, curve_tolerance: f64) -> Result<Vec<Poly
     import_dxf(&path, curve_tolerance)
 }
 
+// `app: tauri::AppHandle` is one of Tauri's special injected command
+// parameters - it's resolved from the running app, not sent by the JS
+// caller, so `invoke("run_nest_command", { request })` on the frontend is
+// unaffected by adding it here.
 #[tauri::command(rename_all = "snake_case")]
-pub fn run_nest_command(request: RunNestRequest) -> Result<RunNestResponse, String> {
-    run_nest(request)
+pub fn run_nest_command(app: tauri::AppHandle, request: RunNestRequest) -> Result<RunNestResponse, String> {
+    run_nest_with_progress(request, |generation, generations, best_so_far| {
+        // A dropped/closing window makes `emit` return an error; there's no
+        // meaningful recovery from inside a progress callback, so ignore it
+        // rather than aborting an otherwise-successful nest run over a lost
+        // UI update.
+        let _ = app.emit(
+            "nest-progress",
+            NestProgressDto {
+                generation,
+                generations,
+                best_fitness: best_so_far.fitness,
+                sheets_used: best_so_far.placements.len(),
+                unplaced_count: best_so_far.unplaced_count,
+                utilisation: best_so_far.utilisation,
+            },
+        );
+    })
 }
 
 #[cfg(test)]
@@ -322,6 +376,26 @@ mod tests {
                 RunNestRequest { sheets: vec![square_dto(100.0)], parts: vec![PartDto { polygon: square_dto(10.0), quantity: 1 }], config: cfg };
             assert!(run_nest(request).is_err(), "population_size {bad_size} should be rejected");
         }
+    }
+
+    #[test]
+    fn run_nest_with_progress_calls_the_hook_once_per_generation() {
+        let request = RunNestRequest {
+            sheets: vec![square_dto(100.0)],
+            parts: vec![PartDto { polygon: square_dto(10.0), quantity: 3 }],
+            config: config(4),
+        };
+
+        let mut seen_generations = Vec::new();
+        let response = run_nest_with_progress(request, |generation, generations, best_so_far| {
+            assert_eq!(generations, 4);
+            assert!(best_so_far.fitness.is_finite());
+            seen_generations.push(generation);
+        })
+        .expect("should nest successfully");
+
+        assert_eq!(seen_generations, vec![1, 2, 3, 4]);
+        assert_eq!(response.unplaced_count, 0);
     }
 
     #[test]

@@ -221,3 +221,17 @@ pub struct RunNestResponse {
     pub unplaced_count: usize,
 }
 
+/// Payload for the `"nest-progress"` event `run_nest_command` emits once per
+/// completed generation, so the frontend can show a live console instead of
+/// blocking silently until the whole run finishes - see
+/// `commands::run_nest_with_progress`.
+#[derive(Serialize, Clone, Copy, Debug)]
+pub struct NestProgressDto {
+    pub generation: usize,
+    pub generations: usize,
+    pub best_fitness: f64,
+    pub sheets_used: usize,
+    pub unplaced_count: usize,
+    pub utilisation: f64,
+}
+

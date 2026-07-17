@@ -219,3 +219,19 @@ td input {
   font-size: 11px;
   margin-top: 6px;
 }
+
+.thumb {
+  background: #0d0d0d;
+  border: 1px solid var(--border);
+  display: block;
+}
+
+#console-log {
+  margin: 0;
+  max-height: 220px;
+  overflow-y: auto;
+  font-size: 12px;
+  color: var(--dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
