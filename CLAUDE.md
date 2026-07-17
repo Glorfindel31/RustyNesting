@@ -40,14 +40,20 @@ the plan calls out: `run_nest` is one synchronous call running N GA
 generations, replacing the original's per-individual `background-start`/
 `background-response` IPC round trips to a pool of worker windows (there's
 no separate worker process to message - `nesting::dispatch` already
-parallelizes a generation in-process via rayon). **Not done yet**: adapting
-`frontend/deepnest.js`/`index.html` to call these commands instead of
-`require("electron").ipcRenderer` (still throws, same known limitation as
-before - see below), progress events, and wiring `refine_consolidation`
-into `run_nest`. Always check `docs/PORT_STATUS.md` first — it's the single
-living tracking doc for what's ported and what's outstanding; don't
-re-derive status from `RUST-REWRITE-PLAN.md` or by guessing from the file
-tree.
+parallelizes a generation in-process via rayon). **The frontend is now
+wired too, but via a new minimal UI, not an adaptation of the legacy
+one** - `frontend/index.html`/`app.js`/`app.css` were rewritten from
+scratch (dark grey/brutalist, no framework) to call
+`import_dxf_command`/`run_nest_command` directly; the legacy
+`frontend/deepnest.js`/`ui/**` (~4700 lines, all Node/Electron-integrated)
+are kept in the tree unreferenced, not deleted, not adapted - see the
+"Build/run commands" section below for why that was the right call here.
+Verified end-to-end manually against the real `FLAT.dxf` fixture (import →
+role assignment → nest → rendered result). **Not done yet**: progress
+events, and wiring `refine_consolidation` into `run_nest`. Always check
+`docs/PORT_STATUS.md` first — it's the single living tracking doc for
+what's ported and what's outstanding; don't re-derive status from
+`RUST-REWRITE-PLAN.md` or by guessing from the file tree.
 
 **Scope change partway through Phase 1 (see `docs/PORT_STATUS.md` for
 detail): import/export is DXF only, not SVG.** The user's real files are
@@ -80,16 +86,21 @@ cargo run -p deepnest-tauri        # launch the Tauri shell (plain cargo run wor
 (`cargo tauri build`/`cargo tauri icon`), but isn't required for `dev` —
 the frontend has no bundler, so a plain `cargo run` embeds `frontend/` as-is.
 
-Known limitation, still open despite Phase 6's first commands landing:
-`frontend/index.html`'s inline module script calls `require("electron")` to
-construct `window.DeepNest`, which throws in the Tauri webview (no
-`require` global there). The static chrome (CSS, nav sidebar, icons)
-renders fine; the Ractive-templated main content stays blank. Real Tauri
-commands now exist (`import_dxf`, `run_nest` - see `docs/PORT_STATUS.md`'s
-Phase 6 table) and are tested against the real engine directly, but nothing
-yet adapts the legacy `frontend/deepnest.js`/`index.html` to call them
-instead of `ipcRenderer` - that's a separate, larger pass. Don't try to fix
-this now — it's tracked in `docs/PORT_STATUS.md` Phase 6.
+**Resolved by replacement, not adaptation**: `frontend/index.html` used to
+be the Electron app's original file (inline module script calling
+`require("electron")`, which throws in the Tauri webview - no `require`
+global there). It's now a small **new** hand-written UI
+(`index.html`/`app.js`/`app.css`, dark grey/brutalist/no framework) that
+calls `import_dxf_command`/`run_nest_command` directly via
+`window.__TAURI__.core.invoke`. This was a deliberate choice, not a
+default: adapting the legacy Ractive UI (`frontend/deepnest.js`,
+`frontend/ui/**`, ~4700 lines) turned out to need far more than fixing one
+`require()` line - `ui/index.js`'s own `initialize()` does 7 more
+`require()` calls before anything else runs, several service files take an
+`ipcRenderer` directly, and part of what that UI does (SVG file loading)
+is for a feature the DXF-only scope change already dropped. Those legacy
+files are kept in the tree, unreferenced, as reference only - see
+`docs/PORT_STATUS.md`'s Phase 6 table for the full reasoning.
 
 ## Reference implementation (read-only)
 
@@ -115,10 +126,14 @@ deepnest-rust/
     geometry/                    # pure geometry math, zero I/O, zero threading - see below
     nesting/                     # NfpCache, GA, placement, rayon dispatch, consolidation
                                   #   - depends on geometry; see module list below
-  src-tauri/                     # Tauri v2 shell + first commands (import_dxf, run_nest) -
-                                  #   see module list below; frontend wiring still not started
-  frontend/                      # Electron main/ui/**, index.html, style.css, vendored libs,
-                                  # copied as-is (only path fix: ui bundle import, see PORT_STATUS)
+  src-tauri/                     # Tauri v2 shell + commands (import_dxf, run_nest) -
+                                  #   see module list below
+  frontend/                      # index.html/app.js/app.css: new minimal UI (Phase 6), the
+                                  #   only files actually served/referenced. deepnest.js,
+                                  #   svgparser.js, ui/**, util/**, style.css are the original
+                                  #   Electron app's files, kept unreferenced as reference only
+                                  #   (see PORT_STATUS's Phase 6 table for why they weren't
+                                  #   adapted instead)
   docs/
     PORT_STATUS.md               # the one living tracking doc — check this first
   tests/

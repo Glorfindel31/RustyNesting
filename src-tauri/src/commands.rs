@@ -99,12 +99,20 @@ pub fn run_nest(request: RunNestRequest) -> Result<RunNestResponse, String> {
     })
 }
 
-#[tauri::command]
+// rename_all = "snake_case": Tauri's default JS<->Rust argument binding
+// camelCases top-level command parameter names (so `curve_tolerance` here
+// would otherwise have to be called as `curveTolerance` from JS), but
+// nested struct fields (RunNestRequest and everything under it) are plain
+// serde with no rename_all, i.e. snake_case. Opting into snake_case for the
+// command args too keeps one casing convention across the whole wire
+// format instead of two, which is one fewer thing to get subtly wrong when
+// hand-writing the JS call site.
+#[tauri::command(rename_all = "snake_case")]
 pub fn import_dxf_command(path: String, curve_tolerance: f64) -> Result<Vec<PolygonDto>, String> {
     import_dxf(&path, curve_tolerance)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn run_nest_command(request: RunNestRequest) -> Result<RunNestResponse, String> {
     run_nest(request)
 }
