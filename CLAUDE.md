@@ -169,6 +169,13 @@ Phase 1 table for exactly what each ports from the Electron repo):
   Electron app's own version (a buggy native addon reached via an artificial
   "frame trick") isn't what got ported here
 - `clipper.rs` also has `outer_nfp` (Minkowski-diff-based outer/collision NFP)
+  and `offset_round` (round-join variant of `offset`, used by `clearance.rs`
+  specifically because a clearance buffer must never overshoot - `offset`'s
+  miter join spikes disproportionately at acute corners, confirmed against
+  real sliver-shaped fixture parts growing 15-44mm instead of ~6.5mm at
+  6.5mm spacing, which made an obviously-fitting part get reported as too
+  big; `offset`/`simplify_polygon.rs` keep the miter join for parity with
+  the original app's `polygonOffset`)
 - `clearance.rs` — **new scope, not a port**: independent `margin`
   (sheet-edge clearance) and `spacing` (inter-part clearance), each
   separately configurable including both `0.0`. The original app only has

@@ -60,6 +60,33 @@ pub fn offset(polygon: &[Point], delta: f64) -> Vec<Vec<Point>> {
     from_paths(result)
 }
 
+/// Expands (positive `delta`) or contracts (negative `delta`) a polygon
+/// using a **round** join instead of `offset`'s miter one - i.e. a true
+/// Minkowski sum with a disk of radius `|delta|`, which can never overshoot
+/// by more than `delta` in any direction. `offset`'s miter join is correct
+/// for parity with the original app's `polygonOffset` (used by the
+/// simplification pipeline, where matching the JS output matters), but a
+/// miter join's spike length grows without bound as a corner gets more
+/// acute (capped only by the miter limit, e.g. up to 4x `delta` at the
+/// sharpest corners `offset` allows before falling back to a bevel) - which
+/// is exactly wrong for a clearance/keep-out buffer (`geometry::clearance`):
+/// a sliver-shaped part with a sharp tip would get padded far more than the
+/// requested spacing at that tip, potentially no longer fitting a sheet it
+/// obviously should (confirmed against the real `tests/fixtures/*.dxf`
+/// parts - several sliver profiles grew by 15-44mm instead of the expected
+/// ~6.5mm at a spacing of 6.5). Round join has no such spike: every point
+/// on the result is within exactly `delta` of some point on the original
+/// boundary, corner or not.
+pub fn offset_round(polygon: &[Point], delta: f64) -> Vec<Vec<Point>> {
+    if delta == 0.0 {
+        return vec![polygon.to_vec()];
+    }
+
+    let paths: ClipperPaths = vec![to_raw_path(polygon)].into();
+    let result = inflate(paths, delta, JoinType::Round, EndType::Polygon, 4.0);
+    from_paths(result)
+}
+
 /// Port of `cleanPolygon`: resolves self-intersections (Clipper2's modern
 /// equivalent of Clipper1's `SimplifyPolygon` is a self-union), keeps only
 /// the largest-area resulting loop, then removes near-duplicate/collinear

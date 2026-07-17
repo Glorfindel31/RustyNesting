@@ -52,7 +52,7 @@
 //! downstream (rendering, export) needs the padded geometry at all; it's
 //! purely an internal detail of how placement decisions get made.
 
-use crate::clipper::offset;
+use crate::clipper::offset_round;
 use crate::point::Point;
 
 /// Prepares a sheet boundary for nesting: insets (or, when `spacing / 2 >
@@ -60,9 +60,13 @@ use crate::point::Point;
 /// exactly `margin` from the sheet's true edge, independent of `spacing`.
 /// `None` only if the resulting inset collapses the sheet to nothing
 /// (e.g. a margin larger than the sheet itself).
+///
+/// Uses `offset_round`, not the plain miter-join `offset` - see its doc
+/// comment for why a clearance buffer needs a round join specifically (no
+/// disproportionate growth at a sharp/acute corner).
 pub fn prepare_sheet(sheet: &[Point], margin: f64, spacing: f64) -> Option<Vec<Point>> {
     let delta = spacing / 2.0 - margin;
-    offset(sheet, delta).into_iter().next()
+    offset_round(sheet, delta).into_iter().next()
 }
 
 /// Prepares a part's outer boundary for nesting: grows it outward by half
@@ -72,8 +76,15 @@ pub fn prepare_sheet(sheet: &[Point], margin: f64, spacing: f64) -> Option<Vec<P
 /// clearance, unrelated to interior features. `None` only if the offset
 /// degenerates (not expected for a positive/zero outward offset on a
 /// simple closed profile).
+///
+/// Uses `offset_round`, not the plain miter-join `offset` - a sliver-shaped
+/// part with a sharp tip would otherwise grow far more than `spacing` at
+/// that tip (confirmed against real fixture parts: up to +44mm at a
+/// spacing of 6.5mm), potentially making an obviously-fitting part get
+/// reported as too big to place. Round join caps growth at exactly
+/// `spacing / 2` everywhere, corner or not.
 pub fn prepare_part(part_outer: &[Point], spacing: f64) -> Option<Vec<Point>> {
-    offset(part_outer, spacing / 2.0).into_iter().next()
+    offset_round(part_outer, spacing / 2.0).into_iter().next()
 }
 
 #[cfg(test)]
@@ -172,5 +183,33 @@ mod tests {
         let true_b_left_edge = b_x + spacing / 2.0;
 
         assert!((true_b_left_edge - true_a_right_edge - spacing).abs() < 1e-6, "true parts should end up exactly `spacing` apart, got {}", true_b_left_edge - true_a_right_edge);
+    }
+
+    #[test]
+    fn a_sharp_sliver_does_not_grow_far_beyond_spacing_at_its_tip() {
+        // Regression test: found against real DXF parts (several sliver
+        // profiles in tests/fixtures/*.dxf grew by 15-44mm instead of the
+        // expected ~6.5mm at a spacing of 6.5, before prepare_part switched
+        // from offset (miter join) to offset_round). A long, thin triangle
+        // with a very acute tip is the minimal case that reproduces it: a
+        // miter join's spike length is unbounded as the corner angle
+        // shrinks (capped only by the miter limit, e.g. 4x the offset), so
+        // the bounding box could grow by many times `spacing` right at the
+        // tip. A round join caps growth at exactly `spacing / 2`
+        // everywhere, corner or not.
+        let spacing = 6.5;
+        let sliver = vec![Point::new(0.0, 0.0), Point::new(200.0, 1.0), Point::new(0.0, 2.0)];
+
+        let true_bounds = get_polygon_bounds(&sliver).unwrap();
+        let padded = prepare_part(&sliver, spacing).expect("sliver prep should succeed");
+        let padded_bounds = get_polygon_bounds(&padded).unwrap();
+
+        let w_growth = padded_bounds.width - true_bounds.width;
+        let h_growth = padded_bounds.height - true_bounds.height;
+        // Expected growth per axis is ~spacing (offset outward by
+        // spacing/2 on each side); allow a little slack for the round
+        // join's own curvature, but nowhere near the old miter blowup.
+        assert!(w_growth < spacing * 1.5, "width grew by {w_growth}, expected roughly {spacing}");
+        assert!(h_growth < spacing * 1.5, "height grew by {h_growth}, expected roughly {spacing}");
     }
 }
