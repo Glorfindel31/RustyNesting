@@ -563,6 +563,7 @@ dependencies = [
  "dxf",
  "geometry",
  "nesting",
+ "rayon",
  "serde",
  "tauri",
  "tauri-build",

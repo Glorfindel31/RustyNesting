@@ -13,3 +13,4 @@ geometry = { path = "../crates/geometry" }
 nesting = { path = "../crates/nesting" }
 dxf = "0.6"
 serde = { version = "1", features = ["derive"] }
+rayon = "1"

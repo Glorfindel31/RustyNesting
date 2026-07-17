@@ -75,7 +75,7 @@ pub fn run_nest(request: RunNestRequest) -> Result<RunNestResponse, String> {
 /// rather than adding a callback parameter to that function - `dispatch`'s
 /// own doc comment already calls progress plumbing out as "left to whatever
 /// wraps this loop", so this is that wrapper, not a fork of engine logic.
-pub fn run_nest_with_progress(request: RunNestRequest, mut on_progress: impl FnMut(usize, usize, &PlaceResult)) -> Result<RunNestResponse, String> {
+pub fn run_nest_with_progress(request: RunNestRequest, mut on_progress: impl FnMut(usize, usize, &PlaceResult) + Send) -> Result<RunNestResponse, String> {
     if request.sheets.is_empty() {
         return Err("at least one sheet is required".into());
     }
@@ -104,6 +104,7 @@ pub fn run_nest_with_progress(request: RunNestRequest, mut on_progress: impl FnM
     }
     let margin = request.config.margin;
     let spacing = request.config.spacing;
+    let max_threads = request.config.max_threads;
 
     // Padding is applied here, internally, purely to shape the placement
     // decisions the engine makes - see geometry::clearance's module doc for
@@ -137,18 +138,36 @@ pub fn run_nest_with_progress(request: RunNestRequest, mut on_progress: impl FnM
     let mut ga = GeneticAlgorithm::new(adam, ga_config, Vec::new());
 
     let generations = request.config.generations;
-    let mut best: Option<PlaceResult> = None;
-    for generation in 1..=generations {
-        let results = dispatch::run_generation(&mut ga, &sheets, &parts_by_id, &placement_config);
-        for result in results {
-            if best.as_ref().is_none_or(|b| is_better_nest(&result, b)) {
-                best = Some(result);
+    let mut run_generations = move || {
+        let mut best: Option<PlaceResult> = None;
+        for generation in 1..=generations {
+            let results = dispatch::run_generation(&mut ga, &sheets, &parts_by_id, &placement_config);
+            for result in results {
+                if best.as_ref().is_none_or(|b| is_better_nest(&result, b)) {
+                    best = Some(result);
+                }
+            }
+            if let Some(so_far) = &best {
+                on_progress(generation, generations, so_far);
             }
         }
-        if let Some(so_far) = &best {
-            on_progress(generation, generations, so_far);
-        }
-    }
+        best
+    };
+
+    // 0 (the default) means "no cap" - just use rayon's own global pool, no
+    // need to spin up a second one. A cap builds a fresh scoped pool for
+    // this call only, since rayon's global pool can only be configured once
+    // per process (a second `build_global()` call would panic) and
+    // different calls may want different caps.
+    let best = if max_threads > 0 {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(max_threads)
+            .build()
+            .map_err(|e| format!("couldn't build a {max_threads}-thread pool: {e}"))?;
+        pool.install(run_generations)
+    } else {
+        run_generations()
+    };
     let best = best.ok_or_else(|| "ran zero generations".to_string())?;
 
     Ok(RunNestResponse {
@@ -163,6 +182,7 @@ pub fn run_nest_with_progress(request: RunNestRequest, mut on_progress: impl FnM
         fitness: best.fitness,
         utilisation: best.utilisation,
         unplaced_count: best.unplaced_count,
+        unplaced_ids: best.unplaced_ids,
     })
 }
 
@@ -234,6 +254,7 @@ mod tests {
             generations,
             margin: 0.0,
             spacing: 0.0,
+            max_threads: 0,
         }
     }
 
@@ -285,6 +306,35 @@ mod tests {
 
         assert_eq!(response.unplaced_count, 1);
         assert!(response.placements.is_empty());
+        assert_eq!(response.unplaced_ids, vec![0], "the single part (id 0, expand_parts's first id) should be reported unplaced by id, not just by count");
+    }
+
+    #[test]
+    fn run_nest_respects_a_max_threads_cap() {
+        let mut cfg = config(2);
+        cfg.max_threads = 1;
+        let request = RunNestRequest {
+            sheets: vec![square_dto(100.0)],
+            parts: vec![PartDto { polygon: square_dto(10.0), quantity: 3 }],
+            config: cfg,
+        };
+
+        let response = run_nest(request).expect("a max_threads cap should still nest successfully, just on fewer threads");
+
+        assert_eq!(response.unplaced_count, 0);
+    }
+
+    #[test]
+    fn run_nest_rejects_a_zero_thread_count_gracefully() {
+        // max_threads: 0 means "no cap" (the default), not "a pool of zero
+        // threads" - make sure that sentinel doesn't accidentally reach
+        // ThreadPoolBuilder::num_threads(0), which would build a pool that
+        // can never run anything.
+        let mut cfg = config(1);
+        cfg.max_threads = 0;
+        let request = RunNestRequest { sheets: vec![square_dto(100.0)], parts: vec![PartDto { polygon: square_dto(10.0), quantity: 1 }], config: cfg };
+        let response = run_nest(request).expect("max_threads: 0 must mean uncapped, not a zero-thread pool");
+        assert_eq!(response.unplaced_count, 0);
     }
 
     #[test]

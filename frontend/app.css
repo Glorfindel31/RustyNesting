@@ -241,6 +241,20 @@ td input {
   display: block;
 }
 
+/* Floating, semi-transparent, always on top - so you can see what the
+   program is doing without scrolling down to find it, and without it
+   fully hiding whatever's behind it. */
+#panel-console {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  width: 340px;
+  max-width: calc(100vw - 32px);
+  background: rgba(31, 31, 31, 0.72);
+  backdrop-filter: blur(3px);
+  z-index: 500;
+}
+
 #console-log {
   margin: 0;
   max-height: 220px;
@@ -249,4 +263,52 @@ td input {
   color: var(--dim);
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* Small rotating square - a plain, flat "something is happening" cue that
+   fits the brutalist look (no spinner GIFs, no rounded loaders). */
+.spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.progress {
+  margin-top: 10px;
+  height: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+}
+
+.error-hint {
+  color: var(--error);
+}
+
+.unplaced-item {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  margin: 0 12px 12px 0;
+  font-size: 11px;
+  color: var(--error);
+}
+
+.unplaced-item .thumb {
+  border-color: var(--error);
 }

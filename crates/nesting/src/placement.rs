@@ -97,6 +97,11 @@ pub struct PlaceResult {
     pub total_area: f64,
     pub utilisation: f64,
     pub unplaced_count: usize,
+    /// Which part ids never fit any sheet - same length/order as
+    /// `unplaced_count` (`parts.len()` at the end of `place_parts`, below),
+    /// just carrying the ids too so a caller can show the user *which*
+    /// parts are missing, not just how many.
+    pub unplaced_ids: Vec<usize>,
 }
 
 fn shift_points(points: &[Point], dx: f64, dy: f64) -> Vec<Point> {
@@ -635,6 +640,7 @@ pub fn place_parts(sheets: &[LayeredPolygon], parts: Vec<NestPart>, config: &Pla
         total_area: total_usable_sheet_area,
         utilisation,
         unplaced_count: parts.len(),
+        unplaced_ids: parts.iter().map(|p| p.id).collect(),
     }
 }
 

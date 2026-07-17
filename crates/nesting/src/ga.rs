@@ -389,6 +389,7 @@ mod tests {
             total_area: 0.0,
             utilisation,
             unplaced_count: unplaced,
+            unplaced_ids: Vec::new(),
         }
     }
 

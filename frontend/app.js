@@ -20,6 +20,10 @@ function setStatus(id, message, isError) {
   node.classList.toggle("error", Boolean(isError));
 }
 
+function setBusy(spinnerId, busy) {
+  el(spinnerId).hidden = !busy;
+}
+
 // A running log of what the app is doing, like the old Electron UI's
 // console - import/run start, success, failure, and (via the
 // "nest-progress" event below) live per-generation stats while a run is in
@@ -65,20 +69,27 @@ function colorForLayer(layer) {
 // or rotate+translate+sheet-relative for a placed part) - every node in the
 // tree shares the same rigid transform since children are defined relative
 // to the same local origin as their parent.
-function renderShapeSvg(shape, transformPoints, isRoot = true) {
+const UNPLACED_COLOR = "#ff5a4a"; // matches --error in app.css
+
+// `strokeOverride`, when given, replaces colorForLayer for every node in the
+// tree - used to render an unplaced part entirely in the "error" color
+// regardless of its real layer, so it reads as "this one's a problem" at a
+// glance rather than blending in with normally-colored parts.
+function renderShapeSvg(shape, transformPoints, isRoot = true, strokeOverride = null) {
   const pts = transformPoints(shape.points);
-  let markup = `<polygon points="${pointsToPath(pts)}" fill="none" stroke="${colorForLayer(shape.layer)}" stroke-width="${isRoot ? 1.4 : 1}" vector-effect="non-scaling-stroke" />`;
-  for (const child of shape.children ?? []) markup += renderShapeSvg(child, transformPoints, false);
+  const stroke = strokeOverride ?? colorForLayer(shape.layer);
+  let markup = `<polygon points="${pointsToPath(pts)}" fill="none" stroke="${stroke}" stroke-width="${isRoot ? 1.4 : 1}" vector-effect="non-scaling-stroke" />`;
+  for (const child of shape.children ?? []) markup += renderShapeSvg(child, transformPoints, false, strokeOverride);
   return markup;
 }
 
-function shapeThumbnailSvg(shape) {
+function shapeThumbnailSvg(shape, strokeOverride = null) {
   const bounds = boundsOf(shape.points);
   const pad = Math.max(bounds.w, bounds.h, 1) * 0.08;
   const vbW = bounds.w + pad * 2;
   const vbH = bounds.h + pad * 2;
   const transform = (points) => toSvgPoints(points, bounds).map((p) => ({ x: p.x + pad, y: p.y + pad }));
-  return `<svg class="thumb" viewBox="0 0 ${vbW.toFixed(2)} ${vbH.toFixed(2)}" width="56" height="56">${renderShapeSvg(shape, transform)}</svg>`;
+  return `<svg class="thumb" viewBox="0 0 ${vbW.toFixed(2)} ${vbH.toFixed(2)}" width="56" height="56">${renderShapeSvg(shape, transform, true, strokeOverride)}</svg>`;
 }
 
 // Imports every path in `paths` (one import_dxf_command call each - the
@@ -92,6 +103,7 @@ async function importPaths(paths) {
 
   setStatus("import-status", `importing ${paths.length} file(s)...`, false);
   el("btn-import").disabled = true;
+  setBusy("import-spinner", true);
   let imported = 0;
   for (const path of paths) {
     logLine(`import: ${path} (tolerance ${tolerance})`);
@@ -105,6 +117,7 @@ async function importPaths(paths) {
     }
   }
   el("btn-import").disabled = false;
+  setBusy("import-spinner", false);
 
   if (imported > 0) {
     setStatus("import-status", `${imported} shape(s) imported (${importedShapes.length} total)`, false);
@@ -214,6 +227,7 @@ function buildRequest() {
     generations: Number(el("cfg-generations").value),
     margin: Number(el("cfg-margin").value),
     spacing: Number(el("cfg-spacing").value),
+    max_threads: Number(el("cfg-max-threads").value),
   };
 
   return { sheets, parts, config };
@@ -250,12 +264,16 @@ async function handleRunNest() {
   setStatus("run-status", "nesting...", false);
   logLine(`nest: ${request.sheets.length} sheet(s), ${partInstances} part instance(s), ${request.config.generations} generation(s)`);
   el("btn-run").disabled = true;
+  setBusy("run-spinner", true);
+  el("run-progress").hidden = false;
+  el("run-progress-fill").style.width = "0%";
   try {
     const response = await invoke("run_nest_command", { request });
     setStatus("run-status", "done", false);
     logLine(
       `nest done: fitness=${response.fitness.toFixed(1)} sheets=${response.placements.length} unplaced=${response.unplaced_count} util=${response.utilisation.toFixed(1)}%`
     );
+    el("run-progress-fill").style.width = "100%";
     renderResult(response, request);
     el("panel-result").hidden = false;
   } catch (err) {
@@ -263,6 +281,8 @@ async function handleRunNest() {
     logLine(`nest failed: ${err}`);
   } finally {
     el("btn-run").disabled = false;
+    setBusy("run-spinner", false);
+    el("run-progress").hidden = true;
   }
 }
 
@@ -277,6 +297,23 @@ function pointsToPath(points) {
   return points.map((p) => `${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(" ");
 }
 
+// A rough, honest guess at *why* a part didn't place - the engine itself
+// doesn't produce a structured reason, just "didn't fit in the best attempt
+// found". The one thing we CAN check independently is whether the part's
+// own bounding box could ever fit any available sheet's bounding box at
+// all (in either orientation) - if not, it's not a "try more generations"
+// problem, it's genuinely too big.
+function unplacedReason(shape, request) {
+  const { w, h } = boundsOf(shape.points);
+  const fitsSomeSheet = request.sheets.some((sheetDto) => {
+    const sb = boundsOf(sheetDto.points);
+    return (w <= sb.w && h <= sb.h) || (w <= sb.h && h <= sb.w);
+  });
+  return fitsSomeSheet
+    ? "Didn't find room in this run - try more generations, a smaller margin/spacing, or fewer competing parts."
+    : "Too large to fit on any available sheet at all (checked its own width/height against every sheet's), even by itself.";
+}
+
 function renderResult(response, request) {
   const stats = el("result-stats");
   stats.innerHTML = `
@@ -287,6 +324,22 @@ function renderResult(response, request) {
   `;
 
   const partById = idToShape(request);
+
+  const unplacedSection = el("unplaced-section");
+  const unplacedList = el("unplaced-list");
+  unplacedList.innerHTML = "";
+  const unplacedIds = response.unplaced_ids ?? [];
+  unplacedSection.hidden = unplacedIds.length === 0;
+  for (const id of unplacedIds) {
+    const shape = partById.get(id);
+    if (!shape) continue;
+    const item = document.createElement("div");
+    item.className = "unplaced-item";
+    item.title = unplacedReason(shape, request);
+    item.innerHTML = `${shapeThumbnailSvg(shape, UNPLACED_COLOR)}<span>#${id} ${shape.layer}</span>`;
+    unplacedList.appendChild(item);
+  }
+
   const sheetsEl = el("sheets");
   sheetsEl.innerHTML = "";
 
@@ -329,6 +382,7 @@ el("btn-run").addEventListener("click", handleRunNest);
 window.__TAURI__.event.listen("nest-progress", (event) => {
   const p = event.payload;
   logLine(`gen ${p.generation}/${p.generations}: fitness=${p.best_fitness.toFixed(1)} sheets=${p.sheets_used} unplaced=${p.unplaced_count} util=${p.utilisation.toFixed(1)}%`);
+  el("run-progress-fill").style.width = `${((100 * p.generation) / p.generations).toFixed(1)}%`;
 });
 
 // Drag-and-drop DXF import - Tauri delivers dropped-file paths as a core

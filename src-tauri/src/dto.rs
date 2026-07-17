@@ -167,6 +167,14 @@ pub struct NestConfigDto {
     /// `geometry::clearance::prepare_part`. Defaults to 0.0.
     #[serde(default)]
     pub spacing: f64,
+    /// Caps how many CPU threads a single `run_nest` call's rayon-parallel
+    /// generation evaluation may use (`dispatch::run_generation`'s
+    /// `par_iter()`). `0` (the default) means "no cap" - rayon's own global
+    /// pool, sized to all available cores. Scoped to this one call via a
+    /// fresh `rayon::ThreadPoolBuilder` rather than touching rayon's global
+    /// pool, which can only ever be configured once per process.
+    #[serde(default)]
+    pub max_threads: usize,
 }
 
 fn default_dominant_part_area_threshold() -> f64 {
@@ -219,6 +227,10 @@ pub struct RunNestResponse {
     pub fitness: f64,
     pub utilisation: f64,
     pub unplaced_count: usize,
+    /// Ids of the parts that never fit any sheet, so the frontend can show
+    /// *which* parts are missing (highlighted distinctly) instead of just
+    /// the count.
+    pub unplaced_ids: Vec<usize>,
 }
 
 /// Payload for the `"nest-progress"` event `run_nest_command` emits once per
