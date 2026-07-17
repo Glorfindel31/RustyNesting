@@ -233,11 +233,12 @@ pub struct PlaceOnSheetResult {
     pub minwidth: Option<f64>,
 }
 
-/// Port of `tryPlacePartOnSheet`. Assumes `placed.len() >= 1` - the
-/// first-part-on-a-sheet fast path (top-left corner, no obstacles to
-/// subtract) stays inline in `place_parts` itself, same as the original.
-/// Shared by `place_parts`'s per-sheet fill pass and (once ported)
-/// `refineConsolidation`'s cross-sheet backfill.
+/// Port of `tryPlacePartOnSheet`. `place_parts` never calls this for a
+/// sheet's first part (that stays the inline top-left-corner fast path,
+/// same as the original) but `placed`/`placements` being empty is otherwise
+/// handled correctly here - `nesting::consolidation`'s cross-sheet relocation
+/// needs that, since a relocation target isn't guaranteed to already have a
+/// part on it.
 pub fn try_place_part_on_sheet(
     part: &LayeredPolygon,
     sheet_nfp: &[Vec<Point>],
@@ -326,13 +327,8 @@ pub fn try_place_part_on_sheet(
 
             let score = match config.placement_type {
                 PlacementType::Gravity | PlacementType::Box => {
-                    let all_bounds = all_bounds.expect("placed.len() >= 1 guarantees points");
                     let part_bounds = part_bounds.expect("part always has points");
-                    let rect_corners = [
-                        Point::new(all_bounds.x, all_bounds.y),
-                        Point::new(all_bounds.x + all_bounds.width, all_bounds.y),
-                        Point::new(all_bounds.x + all_bounds.width, all_bounds.y + all_bounds.height),
-                        Point::new(all_bounds.x, all_bounds.y + all_bounds.height),
+                    let candidate_part_corners = [
                         Point::new(part_bounds.x + shiftvector.x, part_bounds.y + shiftvector.y),
                         Point::new(part_bounds.x + part_bounds.width + shiftvector.x, part_bounds.y + shiftvector.y),
                         Point::new(
@@ -341,7 +337,34 @@ pub fn try_place_part_on_sheet(
                         ),
                         Point::new(part_bounds.x + shiftvector.x, part_bounds.y + part_bounds.height + shiftvector.y),
                     ];
-                    let rect_bounds = get_polygon_bounds(&rect_corners).expect("rect_corners always has exactly 8 points");
+                    // `all_bounds` is `None` when nothing is placed yet (e.g.
+                    // refineConsolidation relocating a part onto a sheet that
+                    // - unlike place_parts's own first-part fast path, which
+                    // never calls this function - could in principle be
+                    // empty): there's no existing footprint to union with,
+                    // so the candidate's own bounds are the whole answer.
+                    // The original doesn't guard this at all (`allbounds.x`
+                    // on a `null` `getPolygonBounds([])` would throw) - it
+                    // just happens to never hit this path in practice, since
+                    // every real caller keeps a target's placed list
+                    // non-empty. Handling it here instead of relying on that
+                    // same fragile guarantee is a deliberate improvement.
+                    let rect_bounds = match all_bounds {
+                        Some(all_bounds) => {
+                            let rect_corners = [
+                                Point::new(all_bounds.x, all_bounds.y),
+                                Point::new(all_bounds.x + all_bounds.width, all_bounds.y),
+                                Point::new(all_bounds.x + all_bounds.width, all_bounds.y + all_bounds.height),
+                                Point::new(all_bounds.x, all_bounds.y + all_bounds.height),
+                                candidate_part_corners[0],
+                                candidate_part_corners[1],
+                                candidate_part_corners[2],
+                                candidate_part_corners[3],
+                            ];
+                            get_polygon_bounds(&rect_corners).expect("rect_corners always has exactly 8 points")
+                        }
+                        None => get_polygon_bounds(&candidate_part_corners).expect("candidate_part_corners always has exactly 4 points"),
+                    };
                     if config.placement_type == PlacementType::Gravity {
                         CandidateScore::Gravity {
                             area: rect_bounds.width * 5.0 + rect_bounds.height,
@@ -751,6 +774,24 @@ mod tests {
             let result = place_parts(&[sheet], parts, &config(placement_type));
             assert_eq!(result.unplaced_count, 0, "placement_type {:?}", placement_type);
             assert_eq!(result.placements[0].parts.len(), 2, "placement_type {:?}", placement_type);
+        }
+    }
+
+    /// Regression test: `try_place_part_on_sheet` must not panic when
+    /// `placed`/`placements` are empty, under every placement type - a
+    /// scenario `place_parts` itself never produces (the first part on a
+    /// sheet always takes the inline top-left-corner path instead) but that
+    /// `nesting::consolidation`'s cross-sheet relocation can (a relocation
+    /// target isn't guaranteed to already have a part on it).
+    #[test]
+    fn try_place_part_on_sheet_handles_an_empty_target_sheet() {
+        let sheet = square(0.0, 0.0, 100.0);
+        let part = square(0.0, 0.0, 10.0);
+        let sheet_nfp = inner_nfp(&sheet, &part, 0.3).expect("part fits the empty sheet");
+
+        for placement_type in [PlacementType::Gravity, PlacementType::Box, PlacementType::ConvexHull] {
+            let result = try_place_part_on_sheet(&part, &sheet_nfp, &sheet, &[], &[], &config(placement_type));
+            assert!(result.is_some(), "placement_type {:?}", placement_type);
         }
     }
 
