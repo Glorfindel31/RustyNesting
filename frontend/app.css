@@ -68,6 +68,24 @@ main {
   padding-bottom: 8px;
 }
 
+.panel-heading-row {
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+}
+
+.panel-heading-row h2 {
+  margin: 0;
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+button.small {
+  padding: 4px 10px;
+  font-size: 11px;
+}
+
 .hint {
   color: var(--dim);
   margin: 0 0 12px;
@@ -111,6 +129,14 @@ input[type="text"] {
 
 input[type="number"] {
   width: 90px;
+}
+
+input[type="checkbox"] {
+  width: auto;
+  padding: 0;
+  border: none;
+  background: none;
+  vertical-align: middle;
 }
 
 button {

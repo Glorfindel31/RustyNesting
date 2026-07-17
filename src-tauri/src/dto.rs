@@ -207,7 +207,12 @@ pub struct RunNestRequest {
     pub config: NestConfigDto,
 }
 
-#[derive(Serialize, Clone, Copy, Debug)]
+// Deserialize too (not just Serialize): run_nest_command returns these to
+// the frontend, but export_dxf_command needs to accept the very same
+// placements back - the frontend already has them from the run_nest
+// response and shouldn't need the engine to recompute anything just to
+// export what it already showed on screen.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct PlacedPartDto {
     pub id: usize,
     pub x: f64,
@@ -215,7 +220,7 @@ pub struct PlacedPartDto {
     pub rotation: f64,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SheetPlacementDto {
     pub sheet_index: usize,
     pub parts: Vec<PlacedPartDto>,
@@ -231,6 +236,48 @@ pub struct RunNestResponse {
     /// *which* parts are missing (highlighted distinctly) instead of just
     /// the count.
     pub unplaced_ids: Vec<usize>,
+    /// Every genuinely-better nest found during the run, in the order
+    /// found (chronological, not sorted by fitness) - the top-level
+    /// `placements`/`fitness`/etc. above are just `history`'s last entry,
+    /// duplicated for callers that only want the winner and don't care
+    /// about the rest. Lets the frontend show "the other nests it tried",
+    /// not just the one that ended up best.
+    pub history: Vec<NestSnapshotDto>,
+}
+
+/// One candidate nest result kept in `RunNestResponse::history` - the same
+/// shape as `RunNestResponse`'s own placement/fitness fields, plus which
+/// generation produced it.
+#[derive(Serialize, Clone, Debug)]
+pub struct NestSnapshotDto {
+    pub generation: usize,
+    pub placements: Vec<SheetPlacementDto>,
+    pub fitness: f64,
+    pub utilisation: f64,
+    pub unplaced_count: usize,
+    pub unplaced_ids: Vec<usize>,
+}
+
+/// What `export_dxf_command` needs to write a nest result back out to DXF -
+/// exactly what the frontend already has after a `run_nest_command` call:
+/// the original request's `sheets`/`parts` (true, unpadded geometry - the
+/// same ones `run_nest` was given, not the padded shapes it built
+/// internally) and that call's own `placements` response.
+#[derive(Deserialize, Clone, Debug)]
+pub struct ExportDxfRequest {
+    pub sheets: Vec<PolygonDto>,
+    pub parts: Vec<PartDto>,
+    pub placements: Vec<SheetPlacementDto>,
+    /// Gap, in the same units as the geometry (mm), kept between
+    /// consecutive sheets when laying them out left-to-right in one DXF
+    /// drawing space - a DXF file has no notion of separate "sheets", so
+    /// without this every sheet's parts would land in the same place and
+    /// overlap.
+    pub sheet_spacing: f64,
+    /// Whether to also write each used sheet's own outline as its own
+    /// `LWPOLYLINE` (on the sheet's original layer), or omit it and write
+    /// only the parts.
+    pub include_sheet_outline: bool,
 }
 
 /// Payload for the `"nest-progress"` event `run_nest_command` emits once per

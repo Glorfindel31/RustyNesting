@@ -8,7 +8,7 @@ mod dto;
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![commands::import_dxf_command, commands::run_nest_command])
+        .invoke_handler(tauri::generate_handler![commands::import_dxf_command, commands::run_nest_command, commands::export_dxf_command])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

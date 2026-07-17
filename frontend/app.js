@@ -12,6 +12,12 @@ const invoke = window.__TAURI__.core.invoke;
 /** @type {{layer: string, points: {x:number,y:number}[], is_circle: unknown, children: unknown[]}[]} */
 let importedShapes = [];
 
+// Remembered across a run so a later action (picking a different history
+// entry, exporting) doesn't need to re-invoke the engine - it's all
+// already in the last response.
+let lastNestRequest = null;
+let currentSnapshot = null;
+
 const el = (id) => document.getElementById(id);
 
 function setStatus(id, message, isError) {
@@ -127,6 +133,14 @@ async function importPaths(paths) {
   } else {
     setStatus("import-status", "no shapes imported - see console", true);
   }
+}
+
+function handleToggleShapes() {
+  const body = el("shapes-collapsible");
+  const button = el("btn-toggle-shapes");
+  const collapsed = !body.hidden;
+  body.hidden = collapsed;
+  button.textContent = collapsed ? "EXPAND" : "COLLAPSE";
 }
 
 async function handleBrowse() {
@@ -314,13 +328,19 @@ function unplacedReason(shape, request) {
     : "Too large to fit on any available sheet at all (checked its own width/height against every sheet's), even by itself.";
 }
 
-function renderResult(response, request) {
+// Renders one candidate nest (either the final response's own top-level
+// fields, or one entry from its `history`) - both have the exact same
+// shape (placements/fitness/utilisation/unplaced_count/unplaced_ids), so
+// one renderer covers whichever the user picks in the VIEW ATTEMPT select.
+function renderSnapshot(snapshot, request) {
+  currentSnapshot = snapshot;
+
   const stats = el("result-stats");
   stats.innerHTML = `
-    <div><dt>FITNESS</dt><dd>${response.fitness.toFixed(1)}</dd></div>
-    <div><dt>UTILISATION</dt><dd>${response.utilisation.toFixed(1)}%</dd></div>
-    <div><dt>UNPLACED</dt><dd>${response.unplaced_count}</dd></div>
-    <div><dt>SHEETS USED</dt><dd>${response.placements.length}</dd></div>
+    <div><dt>FITNESS</dt><dd>${snapshot.fitness.toFixed(1)}</dd></div>
+    <div><dt>UTILISATION</dt><dd>${snapshot.utilisation.toFixed(1)}%</dd></div>
+    <div><dt>UNPLACED</dt><dd>${snapshot.unplaced_count}</dd></div>
+    <div><dt>SHEETS USED</dt><dd>${snapshot.placements.length}</dd></div>
   `;
 
   const partById = idToShape(request);
@@ -328,7 +348,7 @@ function renderResult(response, request) {
   const unplacedSection = el("unplaced-section");
   const unplacedList = el("unplaced-list");
   unplacedList.innerHTML = "";
-  const unplacedIds = response.unplaced_ids ?? [];
+  const unplacedIds = snapshot.unplaced_ids ?? [];
   unplacedSection.hidden = unplacedIds.length === 0;
   for (const id of unplacedIds) {
     const shape = partById.get(id);
@@ -343,7 +363,7 @@ function renderResult(response, request) {
   const sheetsEl = el("sheets");
   sheetsEl.innerHTML = "";
 
-  for (const placement of response.placements) {
+  for (const placement of snapshot.placements) {
     const sheetDto = request.sheets[placement.sheet_index];
     const sheetBounds = boundsOf(sheetDto.points);
     const { w, h } = sheetBounds;
@@ -372,9 +392,75 @@ function renderResult(response, request) {
   }
 }
 
+// Populates the VIEW ATTEMPT select from response.history (every nest that
+// beat the previous best, not just the final winner) and renders whichever
+// one is selected - defaulting to the last (the same one the top-level
+// response fields describe).
+function renderResult(response, request) {
+  lastNestRequest = request;
+
+  const historyRow = el("history-row");
+  const select = el("history-select");
+  const history = response.history?.length ? response.history : [response];
+  historyRow.hidden = history.length <= 1;
+
+  select.innerHTML = history
+    .map((h, i) => {
+      const isLast = i === history.length - 1;
+      const label = `#${i + 1} gen ${h.generation ?? "-"}${isLast ? " (best)" : ""} - fitness ${h.fitness.toFixed(0)}, ${h.unplaced_count} unplaced`;
+      return `<option value="${i}">${label}</option>`;
+    })
+    .join("");
+  select.value = String(history.length - 1);
+  select.onchange = () => renderSnapshot(history[Number(select.value)], request);
+
+  renderSnapshot(history[history.length - 1], request);
+}
+
+async function handleExport() {
+  if (!currentSnapshot || !lastNestRequest) return;
+
+  const sheetSpacing = Number(el("export-spacing").value);
+  if (!(sheetSpacing >= 0)) {
+    setStatus("export-status", "sheet spacing must be 0 or more", true);
+    return;
+  }
+  const includeSheetOutline = el("export-outline").checked;
+
+  const path = await window.__TAURI__.dialog.save({
+    defaultPath: "nest.dxf",
+    filters: [{ name: "DXF", extensions: ["dxf"] }],
+  });
+  if (!path) return; // user cancelled
+
+  const request = {
+    sheets: lastNestRequest.sheets,
+    parts: lastNestRequest.parts,
+    placements: currentSnapshot.placements,
+    sheet_spacing: sheetSpacing,
+    include_sheet_outline: includeSheetOutline,
+  };
+
+  setStatus("export-status", "exporting...", false);
+  logLine(`export: ${path} (sheet spacing ${sheetSpacing}mm, sheet outline ${includeSheetOutline ? "on" : "off"})`);
+  el("btn-export").disabled = true;
+  try {
+    await invoke("export_dxf_command", { path, request });
+    setStatus("export-status", "exported", false);
+    logLine(`export ok: ${path}`);
+  } catch (err) {
+    setStatus("export-status", String(err), true);
+    logLine(`export failed: ${err}`);
+  } finally {
+    el("btn-export").disabled = false;
+  }
+}
+
 el("btn-import").addEventListener("click", handleBrowse);
 el("btn-add-rect").addEventListener("click", handleAddRectangle);
 el("btn-run").addEventListener("click", handleRunNest);
+el("btn-toggle-shapes").addEventListener("click", handleToggleShapes);
+el("btn-export").addEventListener("click", handleExport);
 
 // Live per-generation stats while a nest run is in progress, emitted by
 // run_nest_command (see src-tauri/src/commands.rs's run_nest_with_progress)

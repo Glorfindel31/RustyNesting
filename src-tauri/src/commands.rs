@@ -27,13 +27,14 @@ use std::collections::HashMap;
 
 use dxf::Drawing;
 use geometry::clearance::{prepare_part, prepare_sheet};
+use geometry::dxf_export::{PlacedShape, SheetLayout};
 use geometry::dxf_import::LayeredPolygon;
 use nesting::dispatch;
 use nesting::ga::{is_better_nest, GeneticAlgorithm};
 use nesting::placement::PlaceResult;
 use tauri::Emitter;
 
-use crate::dto::{expand_parts, NestProgressDto, PlacedPartDto, PolygonDto, RunNestRequest, RunNestResponse, SheetPlacementDto};
+use crate::dto::{expand_parts, ExportDxfRequest, NestProgressDto, NestSnapshotDto, PlacedPartDto, PolygonDto, RunNestRequest, RunNestResponse, SheetPlacementDto};
 
 /// Reads a DXF file from disk and returns its closed profiles as a
 /// parent/hole tree (`geometry::dxf_import::build_polygon_tree`) - the
@@ -46,6 +47,42 @@ pub fn import_dxf(path: &str, curve_tolerance: f64) -> Result<Vec<PolygonDto>, S
     let tree = geometry::dxf_import::build_polygon_tree(flat);
 
     Ok(tree.iter().map(PolygonDto::from).collect())
+}
+
+/// Writes the given nest result back out to a DXF file at `path` - new
+/// scope, not a port (the original app never wrote DXF locally at all, see
+/// `docs/PORT_STATUS.md`'s Phase 7 table). Takes exactly what the frontend
+/// already has after a `run_nest_command` call (`request.sheets`/`parts`
+/// for the *true*, unpadded geometry - export never uses the internally
+/// padded shapes `run_nest` builds - plus `response.placements` from that
+/// same call) rather than re-deriving anything server-side.
+pub fn export_dxf(path: &str, request: ExportDxfRequest) -> Result<(), String> {
+    if request.sheet_spacing < 0.0 {
+        return Err("sheet spacing must be >= 0".into());
+    }
+
+    let true_sheets: Vec<LayeredPolygon> = request.sheets.into_iter().map(Into::into).collect();
+    let (_, parts_by_id) = expand_parts(request.parts);
+
+    let layouts: Vec<SheetLayout> = request
+        .placements
+        .into_iter()
+        .map(|sp| {
+            let sheet = true_sheets.get(sp.sheet_index).cloned().ok_or_else(|| format!("placement references sheet_index {} out of range", sp.sheet_index))?;
+            let parts = sp
+                .parts
+                .into_iter()
+                .map(|p| {
+                    let shape = parts_by_id.get(&p.id).cloned().ok_or_else(|| format!("placement references unknown part id {}", p.id))?;
+                    Ok(PlacedShape { shape, x: p.x, y: p.y, rotation: p.rotation })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(SheetLayout { sheet, parts })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let drawing = geometry::dxf_export::export_dxf(&layouts, request.sheet_spacing, request.include_sheet_outline);
+    drawing.save_file(path).map_err(|e| format!("couldn't write {path}: {e}"))
 }
 
 /// Runs `request.config.generations` GA generations against
@@ -140,18 +177,26 @@ pub fn run_nest_with_progress(request: RunNestRequest, mut on_progress: impl FnM
     let generations = request.config.generations;
     let mut run_generations = move || {
         let mut best: Option<PlaceResult> = None;
+        // Every time `best` actually improves, keep a copy - not just the
+        // final one - so the frontend can show "the other nests it tried"
+        // (`RunNestResponse::history`), not only the winner. Bounded by how
+        // often a genuinely better individual turns up, which in practice
+        // is far less than once per generation once the GA converges - not
+        // one full snapshot per generation regardless of `generations`.
+        let mut history: Vec<(usize, PlaceResult)> = Vec::new();
         for generation in 1..=generations {
             let results = dispatch::run_generation(&mut ga, &sheets, &parts_by_id, &placement_config);
             for result in results {
                 if best.as_ref().is_none_or(|b| is_better_nest(&result, b)) {
-                    best = Some(result);
+                    best = Some(result.clone());
+                    history.push((generation, result));
                 }
             }
             if let Some(so_far) = &best {
                 on_progress(generation, generations, so_far);
             }
         }
-        best
+        best.map(|b| (b, history))
     };
 
     // 0 (the default) means "no cap" - just use rayon's own global pool, no
@@ -159,7 +204,7 @@ pub fn run_nest_with_progress(request: RunNestRequest, mut on_progress: impl FnM
     // this call only, since rayon's global pool can only be configured once
     // per process (a second `build_global()` call would panic) and
     // different calls may want different caps.
-    let best = if max_threads > 0 {
+    let outcome = if max_threads > 0 {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(max_threads)
             .build()
@@ -168,17 +213,31 @@ pub fn run_nest_with_progress(request: RunNestRequest, mut on_progress: impl FnM
     } else {
         run_generations()
     };
-    let best = best.ok_or_else(|| "ran zero generations".to_string())?;
+    let (best, history) = outcome.ok_or_else(|| "ran zero generations".to_string())?;
 
-    Ok(RunNestResponse {
-        placements: best
-            .placements
+    fn to_placements_dto(placements: Vec<nesting::placement::SheetPlacement>) -> Vec<SheetPlacementDto> {
+        placements
             .into_iter()
             .map(|sp| SheetPlacementDto {
                 sheet_index: sp.sheet_index,
                 parts: sp.parts.into_iter().map(|p| PlacedPartDto { id: p.id, x: p.placement.x, y: p.placement.y, rotation: p.rotation }).collect(),
             })
+            .collect()
+    }
+
+    Ok(RunNestResponse {
+        history: history
+            .into_iter()
+            .map(|(generation, r)| NestSnapshotDto {
+                generation,
+                placements: to_placements_dto(r.placements),
+                fitness: r.fitness,
+                utilisation: r.utilisation,
+                unplaced_count: r.unplaced_count,
+                unplaced_ids: r.unplaced_ids,
+            })
             .collect(),
+        placements: to_placements_dto(best.placements),
         fitness: best.fitness,
         utilisation: best.utilisation,
         unplaced_count: best.unplaced_count,
@@ -208,6 +267,13 @@ pub async fn import_dxf_command(path: String, curve_tolerance: f64) -> Result<Ve
     tauri::async_runtime::spawn_blocking(move || import_dxf(&path, curve_tolerance))
         .await
         .map_err(|e| format!("import task panicked: {e}"))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn export_dxf_command(path: String, request: ExportDxfRequest) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || export_dxf(&path, request))
+        .await
+        .map_err(|e| format!("export task panicked: {e}"))?
 }
 
 // `app: tauri::AppHandle` is one of Tauri's special injected command
@@ -287,6 +353,28 @@ mod tests {
         assert_eq!(response.placements.len(), 1);
         assert_eq!(response.placements[0].parts.len(), 3);
         assert!(response.utilisation > 0.0);
+    }
+
+    #[test]
+    fn run_nest_history_ends_with_the_same_result_as_the_top_level_fields() {
+        let request = RunNestRequest {
+            sheets: vec![square_dto(100.0)],
+            parts: vec![PartDto { polygon: square_dto(10.0), quantity: 3 }],
+            config: config(5),
+        };
+
+        let response = run_nest(request).expect("should nest successfully");
+
+        assert!(!response.history.is_empty(), "at least the first placed individual should count as an improvement");
+        let last = response.history.last().unwrap();
+        assert_eq!(last.fitness, response.fitness, "history's last entry should be the same result reported at the top level");
+        assert_eq!(last.unplaced_count, response.unplaced_count);
+        assert_eq!(last.placements.len(), response.placements.len());
+        // generations should be non-decreasing across history (each entry
+        // found no earlier than the one before it)
+        for pair in response.history.windows(2) {
+            assert!(pair[0].generation <= pair[1].generation);
+        }
     }
 
     #[test]
@@ -461,6 +549,62 @@ mod tests {
 
         assert_eq!(seen_generations, vec![1, 2, 3, 4]);
         assert_eq!(response.unplaced_count, 0);
+    }
+
+    #[test]
+    fn export_dxf_round_trips_a_real_nest_result() {
+        let sheets = vec![square_dto(100.0)];
+        let parts = vec![PartDto { polygon: square_dto(10.0), quantity: 3 }];
+        let request = RunNestRequest { sheets: sheets.clone(), parts: parts.clone(), config: config(2) };
+        let response = run_nest(request).expect("should nest successfully");
+
+        let out_path = std::env::temp_dir().join("rustynesting_export_dxf_test.dxf");
+        let export_request = ExportDxfRequest {
+            sheets,
+            parts,
+            placements: response.placements,
+            sheet_spacing: 20.0,
+            include_sheet_outline: true,
+        };
+        export_dxf(out_path.to_str().unwrap(), export_request).expect("export should succeed");
+
+        let drawing = Drawing::load_file(&out_path).expect("exported file should be a readable DXF");
+        let polyline_count = drawing.entities().filter(|e| matches!(e.specific, dxf::entities::EntityType::LwPolyline(_))).count();
+        // 1 sheet outline + 3 placed parts
+        assert_eq!(polyline_count, 4);
+
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    #[test]
+    fn export_dxf_omits_the_sheet_outline_when_not_requested() {
+        let sheets = vec![square_dto(100.0)];
+        let parts = vec![PartDto { polygon: square_dto(10.0), quantity: 2 }];
+        let request = RunNestRequest { sheets: sheets.clone(), parts: parts.clone(), config: config(2) };
+        let response = run_nest(request).expect("should nest successfully");
+
+        let out_path = std::env::temp_dir().join("rustynesting_export_dxf_no_outline_test.dxf");
+        let export_request =
+            ExportDxfRequest { sheets, parts, placements: response.placements, sheet_spacing: 10.0, include_sheet_outline: false };
+        export_dxf(out_path.to_str().unwrap(), export_request).expect("export should succeed");
+
+        let drawing = Drawing::load_file(&out_path).expect("exported file should be a readable DXF");
+        let polyline_count = drawing.entities().filter(|e| matches!(e.specific, dxf::entities::EntityType::LwPolyline(_))).count();
+        assert_eq!(polyline_count, 2, "only the 2 placed parts, no sheet outline");
+
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    #[test]
+    fn export_dxf_rejects_negative_sheet_spacing() {
+        let sheets = vec![square_dto(100.0)];
+        let parts = vec![PartDto { polygon: square_dto(10.0), quantity: 1 }];
+        let request = RunNestRequest { sheets: sheets.clone(), parts: parts.clone(), config: config(1) };
+        let response = run_nest(request).expect("should nest successfully");
+
+        let export_request =
+            ExportDxfRequest { sheets, parts, placements: response.placements, sheet_spacing: -5.0, include_sheet_outline: false };
+        assert!(export_dxf("unused.dxf", export_request).is_err());
     }
 
     #[test]

@@ -37,22 +37,27 @@
       </section>
 
       <section class="panel" id="panel-shapes" hidden>
-        <h2>02 / ASSIGN ROLES</h2>
+        <div class="row panel-heading-row">
+          <h2>02 / ASSIGN ROLES</h2>
+          <button id="btn-toggle-shapes" class="small">COLLAPSE</button>
+        </div>
         <p class="hint">Mark each imported shape as a SHEET (stock to nest onto) or a PART (thing to nest), and set a quantity.</p>
-        <table id="shapes-table">
-          <thead>
-            <tr>
-              <th>#</th>
-              <th>LAYER</th>
-              <th>POINTS</th>
-              <th>BBOX (W×H)</th>
-              <th>PREVIEW</th>
-              <th>ROLE</th>
-              <th>QTY</th>
-            </tr>
-          </thead>
-          <tbody id="shapes-body"></tbody>
-        </table>
+        <div id="shapes-collapsible">
+          <table id="shapes-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>LAYER</th>
+                <th>POINTS</th>
+                <th>BBOX (W×H)</th>
+                <th>PREVIEW</th>
+                <th>ROLE</th>
+                <th>QTY</th>
+              </tr>
+            </thead>
+            <tbody id="shapes-body"></tbody>
+          </table>
+        </div>
       </section>
 
       <section class="panel" id="panel-config" hidden>
@@ -99,12 +104,28 @@
 
       <section class="panel" id="panel-result" hidden>
         <h2>04 / RESULT</h2>
+        <div class="row" id="history-row" hidden>
+          <label for="history-select" title="Every attempt that beat the previous best while the GA ran, in the order it found them - not just the one it ended up keeping. Pick one to see that arrangement instead of the final winner.">VIEW ATTEMPT</label>
+          <select id="history-select"></select>
+        </div>
         <dl class="stats" id="result-stats"></dl>
         <div id="unplaced-section" hidden>
           <p class="hint error-hint">These parts could not be placed on any sheet (outlined in red below and in the list they came from):</p>
           <div id="unplaced-list"></div>
         </div>
         <div id="sheets"></div>
+
+        <p class="hint" style="margin-top: 16px;">Export the attempt currently shown above to a DXF file:</p>
+        <div class="row">
+          <label for="export-spacing" title="A DXF file has no separate concept of 'sheets' - every sheet used gets written into the same drawing, laid out left to right. This is the gap kept between each one so they don't overlap.">SHEET SPACING (mm)</label>
+          <input id="export-spacing" type="number" value="20" min="0" step="1" title="A DXF file has no separate concept of 'sheets' - every sheet used gets written into the same drawing, laid out left to right. This is the gap kept between each one so they don't overlap." />
+          <label for="export-outline" title="Also write each sheet's own rectangle as a shape in the export, not just the parts placed on it.">
+            <input id="export-outline" type="checkbox" checked />
+            INCLUDE SHEET OUTLINE
+          </label>
+          <button id="btn-export">EXPORT DXF</button>
+        </div>
+        <p class="status" id="export-status"></p>
       </section>
 
       <section class="panel" id="panel-console">

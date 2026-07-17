@@ -4,6 +4,7 @@
 pub mod circular_nfp;
 pub mod clearance;
 pub mod clipper;
+pub mod dxf_export;
 pub mod dxf_import;
 pub mod hull_polygon;
 pub mod inner_nfp;
