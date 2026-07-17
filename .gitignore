@@ -9,3 +9,4 @@ node_modules/
 /nest-benchmark.log.old
 /nest-benchmark-runs.csv
 /nest-benchmark-runs.csv.old
+/bench_stdout.log
