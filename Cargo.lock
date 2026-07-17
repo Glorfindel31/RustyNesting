@@ -560,6 +560,10 @@ dependencies = [
 name = "deepnest-tauri"
 version = "0.1.0"
 dependencies = [
+ "dxf",
+ "geometry",
+ "nesting",
+ "serde",
  "tauri",
  "tauri-build",
 ]
