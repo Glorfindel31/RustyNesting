@@ -3,5 +3,6 @@
 
 pub mod cache;
 pub mod cache_key;
+pub mod dispatch;
 pub mod ga;
 pub mod placement;
