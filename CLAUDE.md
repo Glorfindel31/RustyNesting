@@ -169,6 +169,14 @@ Phase 1 table for exactly what each ports from the Electron repo):
   Electron app's own version (a buggy native addon reached via an artificial
   "frame trick") isn't what got ported here
 - `clipper.rs` also has `outer_nfp` (Minkowski-diff-based outer/collision NFP)
+- `clearance.rs` — **new scope, not a port**: independent `margin`
+  (sheet-edge clearance) and `spacing` (inter-part clearance), each
+  separately configurable including both `0.0`. The original app only has
+  one clearance value (`config.spacing`, applied symmetrically to sheet and
+  parts) - see the module doc for the derivation of why supporting two
+  needs the sheet's own inset to be `spacing/2 - margin` rather than a bare
+  `-margin`, and why that can go negative (the sheet grows slightly) when
+  `spacing/2 > margin`. Consumed by `src-tauri`'s `run_nest` command
 
 `crates/nesting/src/`:
 - `cache_key.rs` — the unified NFP cache-key format (was duplicated between

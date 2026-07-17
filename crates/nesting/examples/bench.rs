@@ -9,17 +9,15 @@
 //! (defaults: 40 runs, 60s each - pass small values to smoke-test first,
 //! release mode matters a lot here, this is a perf measurement).
 //!
-//! Sheet is a plain 2440x1220mm rectangle, offset inward by the 3mm margin
-//! (`geometry::clipper::offset`, negative delta). Parts are every closed
-//! profile in *both* `tests/fixtures/FLAT.dxf` and
+//! Sheet is a plain 2440x1220mm rectangle with a 3mm margin and 6.5mm
+//! spacing applied via `geometry::clearance::prepare_sheet`/`prepare_part`
+//! (see that module's doc comment for the margin-vs-spacing derivation).
+//! Parts are every closed profile in *both* `tests/fixtures/FLAT.dxf` and
 //! `tests/fixtures/FLAT-struck.dxf` (two real cut layouts, combined into one
 //! part pool - ids continue across the second file rather than restarting
-//! at 0, so they stay unique), each offset *outward* by half the 6.5mm
-//! spacing - the standard offset-based spacing technique: two parts whose
-//! spacing-padded footprints don't overlap end up with at least the full
-//! spacing between their real outlines. Holes aren't re-offset - the
-//! padding is a keep-out zone around the *outside* of a part for inter-part
-//! clearance, unrelated to interior features.
+//! at 0, so they stay unique). Holes aren't re-offset - the padding is a
+//! keep-out zone around the *outside* of a part for inter-part clearance,
+//! unrelated to interior features.
 //!
 //! `SHEET_COPIES` is asserted at startup to have real headroom over the
 //! computed minimum (total part area / sheet area, at the ~90% packing
@@ -44,7 +42,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use dxf::Drawing;
-use geometry::clipper::offset;
+use geometry::clearance::{prepare_part, prepare_sheet};
 use geometry::dxf_import::{build_polygon_tree, entities_to_polygons, LayeredPolygon};
 use nesting::benchmark_log::{append_benchmark_line, append_run_summary_row, git_revision};
 use nesting::dispatch;
@@ -82,7 +80,7 @@ fn load_parts() -> HashMap<usize, LayeredPolygon> {
         let tree = build_polygon_tree(flat);
 
         for root in tree {
-            let Some(expanded_points) = offset(&root.points, SPACING / 2.0).into_iter().next() else {
+            let Some(expanded_points) = prepare_part(&root.points, SPACING) else {
                 skipped += 1;
                 continue;
             };
@@ -103,27 +101,11 @@ fn build_sheet() -> LayeredPolygon {
         geometry::point::Point::new(SHEET_WIDTH, SHEET_HEIGHT),
         geometry::point::Point::new(0.0, SHEET_HEIGHT),
     ];
-    // Every part is independently padded outward by `SPACING / 2` (see
-    // `load_parts`) so two placed parts end up `SPACING` apart - but that
-    // same padding also applies whenever a part is checked against the
-    // *sheet* boundary, since the engine has no way to know which check is
-    // which. Left uncorrected, that silently requires `SPACING / 2`
-    // clearance from the true sheet edge in addition to whatever the sheet
-    // itself is inset by - the original app (which has no separate margin
-    // concept at all, only `config.spacing`, applied exactly this way -
-    // `-0.5 * spacing` to the sheet, `+0.5 * spacing` to parts, see
-    // `main/deepnest.js:1188-1205`) never has this problem because it only
-    // ever wants that one combined clearance. We want two independently
-    // configurable clearances (a `MARGIN` from the edge, a `SPACING` between
-    // parts), so the sheet's own inset has to be net of the padding that's
-    // coming from the part side: inset by `SPACING / 2 - MARGIN` less than
-    // a naive `MARGIN` shrink would - which can go negative (grow the
-    // sheet) when `SPACING / 2 > MARGIN`, as it does here (3.25mm > 3mm):
-    // the part's own padding already provides more than the requested
-    // margin, so the sheet needs no additional shrink for edge clearance at
-    // all, only more than we correctively grow it back by the difference.
-    let sheet_delta = SPACING / 2.0 - MARGIN;
-    let points = offset(&raw, sheet_delta).into_iter().next().expect("sheet inset by margin should still be a valid polygon");
+    // See `geometry::clearance`'s module doc for the margin/spacing
+    // derivation (parts are padded by `prepare_part` in `load_parts` above;
+    // the sheet's own inset here has to be net of that padding, which is
+    // exactly what `prepare_sheet` computes).
+    let points = prepare_sheet(&raw, MARGIN, SPACING).expect("margin/spacing should leave a usable sheet at these dimensions");
     LayeredPolygon { points, layer: "SHEET".into(), is_circle: None, children: Vec::new() }
 }
 
