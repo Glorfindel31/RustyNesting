@@ -536,8 +536,20 @@ fn mark_vertex(a: &mut [Point], b: &mut [Point], vref: VertexRef) {
     }
 }
 
+/// The three ways an A-edge and a B-edge can be touching, matching
+/// `noFitPolygon`'s three detection branches.
+#[derive(Clone, Copy)]
+enum TouchKind {
+    /// `a[i]` and `b[j]` are (almost) the same point.
+    VertexVertex,
+    /// `b[j]` lies on the segment `a[i]` to `a[nexti]`.
+    BVertexOnAEdge,
+    /// `a[i]` lies on the segment `b[j]` to `b[nextj]`.
+    AVertexOnBEdge,
+}
+
 struct Touch {
-    kind: u8,
+    kind: TouchKind,
     a_idx: usize,
     b_idx: usize,
 }
@@ -611,13 +623,13 @@ pub fn no_fit_polygon(
                     let nextj = if j == b.len() - 1 { 0 } else { j + 1 };
                     let bj = Point::new(b[j].x + b_offset.x, b[j].y + b_offset.y);
                     if almost_equal(a[i].x, bj.x, None) && almost_equal(a[i].y, bj.y, None) {
-                        touching.push(Touch { kind: 0, a_idx: i, b_idx: j });
+                        touching.push(Touch { kind: TouchKind::VertexVertex, a_idx: i, b_idx: j });
                     } else if on_segment(a[i], a[nexti], bj, None) {
-                        touching.push(Touch { kind: 1, a_idx: nexti, b_idx: j });
+                        touching.push(Touch { kind: TouchKind::BVertexOnAEdge, a_idx: nexti, b_idx: j });
                     } else {
                         let bnextj = Point::new(b[nextj].x + b_offset.x, b[nextj].y + b_offset.y);
                         if on_segment(bj, bnextj, a[i], None) {
-                            touching.push(Touch { kind: 2, a_idx: i, b_idx: nextj });
+                            touching.push(Touch { kind: TouchKind::AVertexOnBEdge, a_idx: i, b_idx: nextj });
                         }
                     }
                 }
@@ -640,7 +652,7 @@ pub fn no_fit_polygon(
                 let prev_b = b[prev_b_index];
 
                 match t.kind {
-                    0 => {
+                    TouchKind::VertexVertex => {
                         vectors.push(NfpVector {
                             x: prev_a.x - vertex_a.x,
                             y: prev_a.y - vertex_a.y,
@@ -667,7 +679,7 @@ pub fn no_fit_polygon(
                             end: VertexRef::B(t.b_idx),
                         });
                     }
-                    1 => {
+                    TouchKind::BVertexOnAEdge => {
                         vectors.push(NfpVector {
                             x: vertex_a.x - (vertex_b.x + b_offset.x),
                             y: vertex_a.y - (vertex_b.y + b_offset.y),
@@ -681,7 +693,7 @@ pub fn no_fit_polygon(
                             end: VertexRef::A(prev_a_index),
                         });
                     }
-                    _ => {
+                    TouchKind::AVertexOnBEdge => {
                         vectors.push(NfpVector {
                             x: vertex_a.x - (vertex_b.x + b_offset.x),
                             y: vertex_a.y - (vertex_b.y + b_offset.y),

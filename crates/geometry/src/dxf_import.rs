@@ -72,7 +72,14 @@ pub fn rotate_layered_polygon(poly: &LayeredPolygon, degrees: f64) -> LayeredPol
 }
 
 /// Port of `background.js`'s `shiftPolygon`: translates a polygon (and its
-/// holes) by `(dx, dy)`. Non-destructive, same as the original.
+/// holes) by `(dx, dy)`. Non-destructive, same as the original. **Disclosed
+/// non-bit-for-bit divergence**: the original has no `.isCircle` handling at
+/// all and its shifted output silently loses circle metadata; this version
+/// translates `is_circle`'s center along with the points instead (a real
+/// circle's center really should move with it). Harmless today - nothing
+/// downstream of this function reads `is_circle` on its result - but if a
+/// future caller ever re-feeds a shifted polygon back into the circular-hole
+/// NFP fast path, it'll see live metadata where the original would not have.
 pub fn shift_layered_polygon(poly: &LayeredPolygon, dx: f64, dy: f64) -> LayeredPolygon {
     let points = poly.points.iter().map(|p| Point::new(p.x + dx, p.y + dy)).collect();
     let children = poly.children.iter().map(|c| shift_layered_polygon(c, dx, dy)).collect();
@@ -300,7 +307,7 @@ fn get_mut_by_path<'a>(nodes: &'a mut [LayeredPolygon], path: &[usize]) -> &'a m
 /// becomes that island's parent, same as nested SVG paths.
 pub fn build_polygon_tree(mut flat: Vec<LayeredPolygon>) -> Vec<LayeredPolygon> {
     // largest-area first, so every already-placed node is a valid (non-too-small) candidate parent
-    flat.sort_by(|a, b| area_of(&b.points).partial_cmp(&area_of(&a.points)).unwrap());
+    flat.sort_by(|a, b| area_of(&b.points).total_cmp(&area_of(&a.points)));
 
     let mut roots: Vec<LayeredPolygon> = Vec::new();
     for poly in flat {

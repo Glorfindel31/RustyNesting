@@ -93,7 +93,7 @@ fn get_target(o: Point, simple: &[Point], simple_exact: &[bool], tol: f64) -> Po
         if !exact_only.is_empty() {
             in_range = exact_only;
         }
-        in_range.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        in_range.sort_by(|a, b| a.1.total_cmp(&b.1));
         simple[in_range[0].0]
     } else {
         simple
@@ -101,7 +101,7 @@ fn get_target(o: Point, simple: &[Point], simple_exact: &[bool], tol: f64) -> Po
             .min_by(|a, b| {
                 let da = (o.x - a.x).powi(2) + (o.y - a.y).powi(2);
                 let db = (o.x - b.x).powi(2) + (o.y - b.y).powi(2);
-                da.partial_cmp(&db).unwrap()
+                da.total_cmp(&db)
             })
             .copied()
             .expect("simple must be non-empty")

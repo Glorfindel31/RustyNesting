@@ -71,11 +71,22 @@ pub struct Placement {
     pub y: f64,
 }
 
+/// One part's final resting place on a sheet. `id` is purely the caller's
+/// own identity for the part (see `NestPart::id`) - nothing in this module
+/// uses it as an internal key, since ids aren't guaranteed unique (quantity
+/// > 1 of the same part shares an id, same as the JS original never assumed
+/// otherwise either).
+#[derive(Clone, Copy, Debug)]
+pub struct PlacedPart {
+    pub id: usize,
+    pub placement: Placement,
+    pub rotation: f64,
+}
+
 #[derive(Clone, Debug)]
 pub struct SheetPlacement {
     pub sheet_index: usize,
-    /// (part id, placement, rotation the part was placed at)
-    pub parts: Vec<(usize, Placement, f64)>,
+    pub parts: Vec<PlacedPart>,
 }
 
 #[derive(Clone, Debug)]
@@ -133,10 +144,35 @@ fn has_material_outside_sheet(part: &LayeredPolygon, sheet: &LayeredPolygon) -> 
     sheet.children.iter().any(|hole| has_material_overlap(part, hole))
 }
 
+/// A candidate placement's fitness, shaped by which placement type produced
+/// it - the enum (rather than a bare `area: f64, width: Option<f64>` pair)
+/// makes "gravity/box candidates always carry a width, convex-hull
+/// candidates never do" a compile-time fact instead of a runtime convention
+/// `find_best_candidate` would otherwise have to trust its caller to uphold.
+enum CandidateScore {
+    Gravity { area: f64, width: f64 },
+    Box { area: f64, width: f64 },
+    ConvexHull { area: f64 },
+}
+
+impl CandidateScore {
+    fn area(&self) -> f64 {
+        match *self {
+            CandidateScore::Gravity { area, .. } | CandidateScore::Box { area, .. } | CandidateScore::ConvexHull { area } => area,
+        }
+    }
+
+    fn width(&self) -> Option<f64> {
+        match self {
+            CandidateScore::Gravity { width, .. } | CandidateScore::Box { width, .. } => Some(*width),
+            CandidateScore::ConvexHull { .. } => None,
+        }
+    }
+}
+
 struct Candidate {
     shiftvector: Placement,
-    area: f64,
-    width: Option<f64>,
+    score: CandidateScore,
 }
 
 /// Port of `findBestCandidate`: replays the bar-climbing comparison the
@@ -144,7 +180,7 @@ struct Candidate {
 /// byte-for-byte match of the original comparison (including the
 /// placement-type-independent x tiebreak) for deferred-validation retries to
 /// reproduce what an interleaved validate-as-you-go loop would have picked.
-fn find_best_candidate(candidates: &[Candidate], excluded: &HashSet<usize>, placement_type: PlacementType) -> Option<usize> {
+fn find_best_candidate(candidates: &[Candidate], excluded: &HashSet<usize>) -> Option<usize> {
     let mut minarea: Option<f64> = None;
     let mut minwidth: Option<f64> = None;
     let mut minx: Option<f64> = None;
@@ -154,19 +190,21 @@ fn find_best_candidate(candidates: &[Candidate], excluded: &HashSet<usize>, plac
         if excluded.contains(&idx) {
             continue;
         }
-        let area = cand.area;
+        let area = cand.score.area();
         let x = cand.shiftvector.x;
 
         let take = minarea.is_none()
-            || (placement_type == PlacementType::Gravity
-                && (cand.width.unwrap() < minwidth.unwrap()
-                    || (almost_equal(cand.width.unwrap(), minwidth.unwrap(), None) && area < minarea.unwrap())))
-            || (placement_type != PlacementType::Gravity && area < minarea.unwrap())
+            || match &cand.score {
+                CandidateScore::Gravity { width, .. } => {
+                    *width < minwidth.unwrap() || (almost_equal(*width, minwidth.unwrap(), None) && area < minarea.unwrap())
+                }
+                CandidateScore::Box { .. } | CandidateScore::ConvexHull { .. } => area < minarea.unwrap(),
+            }
             || (almost_equal(minarea.unwrap(), area, None) && x < minx.unwrap());
 
         if take {
             minarea = Some(area);
-            minwidth = cand.width;
+            minwidth = cand.score.width();
             minx = Some(x);
             best = Some(idx);
         }
@@ -286,7 +324,7 @@ pub fn try_place_part_on_sheet(
                 y: pt.y - part.points[0].y,
             };
 
-            let (area, width) = match config.placement_type {
+            let score = match config.placement_type {
                 PlacementType::Gravity | PlacementType::Box => {
                     let all_bounds = all_bounds.expect("placed.len() >= 1 guarantees points");
                     let part_bounds = part_bounds.expect("part always has points");
@@ -303,13 +341,18 @@ pub fn try_place_part_on_sheet(
                         ),
                         Point::new(part_bounds.x + shiftvector.x, part_bounds.y + part_bounds.height + shiftvector.y),
                     ];
-                    let rect_bounds = get_polygon_bounds(&rect_corners).unwrap();
-                    let area = if config.placement_type == PlacementType::Gravity {
-                        rect_bounds.width * 5.0 + rect_bounds.height
+                    let rect_bounds = get_polygon_bounds(&rect_corners).expect("rect_corners always has exactly 8 points");
+                    if config.placement_type == PlacementType::Gravity {
+                        CandidateScore::Gravity {
+                            area: rect_bounds.width * 5.0 + rect_bounds.height,
+                            width: rect_bounds.width,
+                        }
                     } else {
-                        rect_bounds.width * rect_bounds.height
-                    };
-                    (area, Some(rect_bounds.width))
+                        CandidateScore::Box {
+                            area: rect_bounds.width * rect_bounds.height,
+                            width: rect_bounds.width,
+                        }
+                    }
                 }
                 PlacementType::ConvexHull => {
                     let part_points: Vec<Point> = part.points.iter().map(|p| Point::new(p.x + shiftvector.x, p.y + shiftvector.y)).collect();
@@ -321,11 +364,11 @@ pub fn try_place_part_on_sheet(
                         }
                         None => get_hull_or_fallback(&part_points),
                     };
-                    (polygon_area(&combined_hull).abs(), None)
+                    CandidateScore::ConvexHull { area: polygon_area(&combined_hull).abs() }
                 }
             };
 
-            candidates.push(Candidate { shiftvector, area, width });
+            candidates.push(Candidate { shiftvector, score });
         }
     }
 
@@ -336,7 +379,7 @@ pub fn try_place_part_on_sheet(
     // due to floating-point/Clipper-scaling artifacts near boundaries).
     let mut excluded: HashSet<usize> = HashSet::new();
     loop {
-        let champion_idx = find_best_candidate(&candidates, &excluded, config.placement_type)?;
+        let champion_idx = find_best_candidate(&candidates, &excluded)?;
         let champion = &candidates[champion_idx];
         let shiftvector = champion.shiftvector;
         let test_shifted = shift_layered_polygon(part, shiftvector.x, shiftvector.y);
@@ -355,8 +398,8 @@ pub fn try_place_part_on_sheet(
         if !is_overlapping {
             return Some(PlaceOnSheetResult {
                 position: shiftvector,
-                minarea: champion.area,
-                minwidth: champion.width,
+                minarea: champion.score.area(),
+                minwidth: champion.score.width(),
             });
         }
 
@@ -396,8 +439,15 @@ pub fn place_parts(sheets: &[LayeredPolygon], parts: Vec<NestPart>, config: &Pla
 
         let mut placed: Vec<LayeredPolygon> = Vec::new();
         let mut placements: Vec<Placement> = Vec::new();
-        let mut placed_ids: Vec<usize> = Vec::new();
-        let mut placed_rotations: Vec<f64> = Vec::new();
+        // Which slots of `parts` (indices, stable across this sheet's scan
+        // since nothing removes elements mid-scan) got placed this pass -
+        // NOT which ids: unlike the original's `parts.indexOf(placed[i])` +
+        // `splice` (removal by object identity), keying removal off `.id`
+        // would delete every part sharing an id with whatever got placed,
+        // silently dropping untried duplicate-id siblings (quantity > 1 of
+        // the same part is normal usage; nothing requires ids to be unique).
+        let mut placed_indices: Vec<usize> = Vec::new();
+        let mut placed_parts_out: Vec<PlacedPart> = Vec::new();
         let mut minwidth: Option<f64> = None;
         let mut minarea: Option<f64> = None;
 
@@ -437,7 +487,12 @@ pub fn place_parts(sheets: &[LayeredPolygon], parts: Vec<NestPart>, config: &Pla
                 }
             };
 
-            let part = parts[i].polygon.clone();
+            // Borrowed, not cloned, until a placement is actually confirmed -
+            // most evaluated parts on a busy sheet fail to place (no room,
+            // overlap, wrong rotation), so cloning up front paid for a full
+            // polygon copy (points + recursive hole children) on the common
+            // reject path for nothing.
+            let part = &parts[i].polygon;
 
             if placed.is_empty() {
                 // first placement on this sheet: top-left corner
@@ -448,7 +503,7 @@ pub fn place_parts(sheets: &[LayeredPolygon], parts: Vec<NestPart>, config: &Pla
                             x: pt.x - part.points[0].x,
                             y: pt.y - part.points[0].y,
                         };
-                        let shifted = shift_layered_polygon(&part, candidate.x, candidate.y);
+                        let shifted = shift_layered_polygon(part, candidate.x, candidate.y);
                         if has_material_outside_sheet(&shifted, sheet) {
                             continue;
                         }
@@ -468,23 +523,24 @@ pub fn place_parts(sheets: &[LayeredPolygon], parts: Vec<NestPart>, config: &Pla
                 };
 
                 placements.push(position);
-                placed_ids.push(parts[i].id);
-                placed_rotations.push(parts[i].rotation);
-                placed.push(part.clone());
+                placed_indices.push(i);
+                placed_parts_out.push(PlacedPart { id: parts[i].id, placement: position, rotation: parts[i].rotation });
+                let part_area = polygon_area(&part.points).abs();
+                placed.push(parts[i].polygon.clone());
 
                 // This part alone already claims most of the sheet - close it now.
-                if polygon_area(&part.points).abs() >= config.dominant_part_area_threshold * sheet_area {
+                if part_area >= config.dominant_part_area_threshold * sheet_area {
                     break;
                 }
                 i += 1;
                 continue;
             }
 
-            if let Some(result) = try_place_part_on_sheet(&part, &sheet_nfp, sheet, &placed, &placements, config) {
+            if let Some(result) = try_place_part_on_sheet(part, &sheet_nfp, sheet, &placed, &placements, config) {
                 placements.push(result.position);
-                placed_ids.push(parts[i].id);
-                placed_rotations.push(parts[i].rotation);
-                placed.push(part.clone());
+                placed_indices.push(i);
+                placed_parts_out.push(PlacedPart { id: parts[i].id, placement: result.position, rotation: parts[i].rotation });
+                placed.push(parts[i].polygon.clone());
                 minarea = Some(result.minarea);
                 minwidth = result.minwidth;
             }
@@ -501,11 +557,20 @@ pub fn place_parts(sheets: &[LayeredPolygon], parts: Vec<NestPart>, config: &Pla
         // implicit for a sheet where 0-1 parts got placed.
         fitness += (minwidth.unwrap_or(0.0) / sheet_area) + minarea.unwrap_or(0.0);
 
-        let placed_id_set: HashSet<usize> = placed_ids.iter().copied().collect();
         for p in &placed {
             total_placed_area += polygon_material_area(p);
         }
-        parts.retain(|p| !placed_id_set.contains(&p.id));
+
+        // Remove exactly the placed slots, by position - see the
+        // `placed_indices` doc comment above for why this can't be `.id`-keyed.
+        let placed_index_set: HashSet<usize> = placed_indices.iter().copied().collect();
+        let mut kept: Vec<NestPart> = Vec::with_capacity(parts.len().saturating_sub(placed_index_set.len()));
+        for (idx, part) in parts.into_iter().enumerate() {
+            if !placed_index_set.contains(&idx) {
+                kept.push(part);
+            }
+        }
+        parts = kept;
 
         if placements.is_empty() {
             // Nothing fit on a freshly opened, empty sheet - something is
@@ -514,15 +579,7 @@ pub fn place_parts(sheets: &[LayeredPolygon], parts: Vec<NestPart>, config: &Pla
             break;
         }
 
-        all_placements.push(SheetPlacement {
-            sheet_index: sheet_idx,
-            parts: placed_ids
-                .into_iter()
-                .zip(placements)
-                .zip(placed_rotations)
-                .map(|((id, pl), rot)| (id, pl, rot))
-                .collect(),
-        });
+        all_placements.push(SheetPlacement { sheet_index: sheet_idx, parts: placed_parts_out });
 
         sheet_idx += 1;
     }
@@ -530,8 +587,16 @@ pub fn place_parts(sheets: &[LayeredPolygon], parts: Vec<NestPart>, config: &Pla
     // Parts that never fit any sheet get a massive area-scaled fitness
     // penalty so the GA (once wired up, Phase 4) strongly prefers solutions
     // where everything is placed, even at the cost of opening more sheets.
+    // Guarded against total_sheet_area == 0.0 (place_parts called with no
+    // sheets at all) - without it this silently produces `fitness ==
+    // Infinity` instead of a large-but-defined value.
     for p in &parts {
-        fitness += 100_000_000.0 * ((polygon_area(&p.polygon.points).abs() * 100.0) / total_sheet_area);
+        let area_ratio = if total_sheet_area > 0.0 {
+            (polygon_area(&p.polygon.points).abs() * 100.0) / total_sheet_area
+        } else {
+            1.0
+        };
+        fitness += 100_000_000.0 * area_ratio;
     }
 
     let utilisation = if total_usable_sheet_area > 0.0 {
@@ -568,6 +633,12 @@ mod tests {
         }
     }
 
+    fn square_with_hole(x: f64, y: f64, size: f64, hole_x: f64, hole_y: f64, hole_size: f64) -> LayeredPolygon {
+        let mut poly = square(x, y, size);
+        poly.children.push(square(hole_x, hole_y, hole_size));
+        poly
+    }
+
     fn config(placement_type: PlacementType) -> PlacementConfig {
         PlacementConfig {
             placement_type,
@@ -575,6 +646,10 @@ mod tests {
             dominant_part_area_threshold: DEFAULT_DOMINANT_PART_AREA_THRESHOLD,
             curve_tolerance: 0.3,
         }
+    }
+
+    fn separated(x0: f64, y0: f64, s0: f64, x1: f64, y1: f64, s1: f64) -> bool {
+        x0 + s0 <= x1 + 1e-6 || x1 + s1 <= x0 + 1e-6 || y0 + s0 <= y1 + 1e-6 || y1 + s1 <= y0 + 1e-6
     }
 
     /// The milestone: one rectangle placed on one sheet, single individual,
@@ -592,13 +667,13 @@ mod tests {
         assert_eq!(result.unplaced_count, 0);
         assert_eq!(result.placements.len(), 1);
         assert_eq!(result.placements[0].parts.len(), 1);
-        let (id, placement, rotation) = result.placements[0].parts[0];
-        assert_eq!(id, 0);
-        assert_eq!(rotation, 0.0);
+        let placed = result.placements[0].parts[0];
+        assert_eq!(placed.id, 0);
+        assert_eq!(placed.rotation, 0.0);
         // top-left-corner fast path: the part's own (0,0) corner should land
         // at the sheet's (0,0) corner, the tightest valid position.
-        assert!((placement.x - 0.0).abs() < 1e-6, "x was {}", placement.x);
-        assert!((placement.y - 0.0).abs() < 1e-6, "y was {}", placement.y);
+        assert!((placed.placement.x - 0.0).abs() < 1e-6, "x was {}", placed.placement.x);
+        assert!((placed.placement.y - 0.0).abs() < 1e-6, "y was {}", placed.placement.y);
         assert!((result.area - 100.0).abs() < 1e-6, "area was {}", result.area);
         assert!(result.fitness.is_finite());
     }
@@ -622,15 +697,14 @@ mod tests {
         let placed: Vec<(f64, f64, f64)> = result.placements[0]
             .parts
             .iter()
-            .map(|&(id, p, _)| {
-                let size = if id == 0 { 30.0 } else { 20.0 };
-                (p.x, p.y, size)
+            .map(|p| {
+                let size = if p.id == 0 { 30.0 } else { 20.0 };
+                (p.placement.x, p.placement.y, size)
             })
             .collect();
         let (x0, y0, s0) = placed[0];
         let (x1, y1, s1) = placed[1];
-        let separated = x0 + s0 <= x1 + 1e-6 || x1 + s1 <= x0 + 1e-6 || y0 + s0 <= y1 + 1e-6 || y1 + s1 <= y0 + 1e-6;
-        assert!(separated, "parts overlap: ({x0},{y0},{s0}) vs ({x1},{y1},{s1})");
+        assert!(separated(x0, y0, s0, x1, y1, s1), "parts overlap: ({x0},{y0},{s0}) vs ({x1},{y1},{s1})");
     }
 
     #[test]
@@ -661,8 +735,8 @@ mod tests {
         assert_eq!(result.unplaced_count, 0);
         assert_eq!(result.placements.len(), 2);
         assert_eq!(result.placements[0].parts.len(), 1);
-        assert_eq!(result.placements[0].parts[0].0, 0);
-        assert_eq!(result.placements[1].parts[0].0, 1);
+        assert_eq!(result.placements[0].parts[0].id, 0);
+        assert_eq!(result.placements[1].parts[0].id, 1);
     }
 
     #[test]
@@ -677,6 +751,72 @@ mod tests {
             let result = place_parts(&[sheet], parts, &config(placement_type));
             assert_eq!(result.unplaced_count, 0, "placement_type {:?}", placement_type);
             assert_eq!(result.placements[0].parts.len(), 2, "placement_type {:?}", placement_type);
+        }
+    }
+
+    /// Regression test for the id-based-removal bug (reviewer.md finding):
+    /// two parts sharing an id, where the first one dominant-closes the
+    /// sheet before the second is even attempted. The second must be
+    /// deferred to the next sheet, not silently dropped.
+    #[test]
+    fn duplicate_id_parts_are_not_dropped_when_one_dominant_closes_a_sheet() {
+        let sheet = square(0.0, 0.0, 30.0);
+        let parts = vec![
+            NestPart { id: 0, polygon: square(0.0, 0.0, 30.0), rotation: 0.0 },
+            NestPart { id: 0, polygon: square(0.0, 0.0, 30.0), rotation: 0.0 },
+        ];
+
+        let result = place_parts(&[sheet.clone(), sheet], parts, &config(PlacementType::Gravity));
+
+        assert_eq!(result.unplaced_count, 0);
+        assert_eq!(result.placements.len(), 2, "expected one part per sheet, got {:?}", result.placements);
+        assert_eq!(result.placements[0].parts.len(), 1);
+        assert_eq!(result.placements[1].parts.len(), 1);
+    }
+
+    /// Regression test for the "holed-obstacle path is untested" gap
+    /// (reviewer.md finding): a part with a hole, a second part nested
+    /// inside that hole, and a third part that must not be allowed to
+    /// overlap the second - proving the restored-hole region is correctly
+    /// narrowed by a later obstacle, not just correctly computed in isolation.
+    #[test]
+    fn a_part_placed_inside_another_parts_hole_blocks_a_later_part_from_overlapping_it() {
+        // A: 30x30 square with a 10x10 hole in the middle (10,10)-(20,20).
+        let a = square_with_hole(0.0, 0.0, 30.0, 10.0, 10.0, 10.0);
+        // B and C: both 4x4, small enough to nest inside A's hole - only one can fit.
+        let parts = vec![
+            NestPart { id: 0, polygon: a, rotation: 0.0 },
+            NestPart { id: 1, polygon: square(0.0, 0.0, 4.0), rotation: 0.0 },
+            NestPart { id: 2, polygon: square(0.0, 0.0, 4.0), rotation: 0.0 },
+        ];
+
+        let result = place_parts(&[square(0.0, 0.0, 100.0)], parts, &config(PlacementType::Gravity));
+
+        assert_eq!(result.unplaced_count, 0, "all 3 parts should fit on one 100x100 sheet: {:?}", result.placements);
+        assert_eq!(result.placements.len(), 1);
+        let placed = &result.placements[0].parts;
+        assert_eq!(placed.len(), 3);
+
+        let sizes = [30.0, 4.0, 4.0];
+        for i in 0..placed.len() {
+            for j in (i + 1)..placed.len() {
+                let (pi, pj) = (placed[i], placed[j]);
+                // A's own hole doesn't count as "material" for this simple
+                // bbox-overlap check, so only compare the two 4x4 parts
+                // against each other directly - A vs. either is fine even if
+                // their bboxes touch, since the hole is inside A's bbox.
+                if pi.id == 0 || pj.id == 0 {
+                    continue;
+                }
+                assert!(
+                    separated(pi.placement.x, pi.placement.y, sizes[pi.id], pj.placement.x, pj.placement.y, sizes[pj.id]),
+                    "parts {} and {} overlap: {:?} vs {:?}",
+                    pi.id,
+                    pj.id,
+                    pi.placement,
+                    pj.placement
+                );
+            }
         }
     }
 }

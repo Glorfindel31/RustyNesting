@@ -78,7 +78,7 @@ pub fn clean_polygon(polygon: &[Point], curve_tolerance: f64) -> Option<Vec<Poin
 
     let biggest = simple
         .into_iter()
-        .max_by(|a, b| polygon_area(a).abs().partial_cmp(&polygon_area(b).abs()).unwrap())?;
+        .max_by(|a, b| polygon_area(a).abs().total_cmp(&polygon_area(b).abs()))?;
 
     let cleaned_paths: ClipperPaths = vec![to_raw_path(&biggest)].into();
     let cleaned = clipper2::simplify(cleaned_paths, 0.01 * curve_tolerance, false);

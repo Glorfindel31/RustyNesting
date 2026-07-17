@@ -43,13 +43,7 @@ pub fn hull(points: &[Point]) -> Option<Vec<Point>> {
     }
 
     let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| {
-        points[a]
-            .x
-            .partial_cmp(&points[b].x)
-            .unwrap()
-            .then(points[a].y.partial_cmp(&points[b].y).unwrap())
-    });
+    order.sort_by(|&a, &b| points[a].x.total_cmp(&points[b].x).then(points[a].y.total_cmp(&points[b].y)));
 
     let sorted_points: Vec<Point> = order.iter().map(|&i| points[i]).collect();
     let flipped_points: Vec<Point> = sorted_points.iter().map(|p| Point::new(p.x, -p.y)).collect();
