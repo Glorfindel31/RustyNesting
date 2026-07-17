@@ -30,10 +30,24 @@ the Phase 4 table's last row for why). **Phase 5 (`nesting::consolidation`
 Phase 3's `try_place_part_on_sheet` as its own doc comment anticipated, and
 in doing so surfaced and fixed a real latent panic risk in that function
 (the Gravity/Box scoring branch assumed at least one already-placed part on
-the target, which a relocation target isn't guaranteed to have). Always
-check `docs/PORT_STATUS.md` first — it's the single living tracking doc for
-what's ported and what's outstanding; don't re-derive status from
-`RUST-REWRITE-PLAN.md` or by guessing from the file tree.
+the target, which a relocation target isn't guaranteed to have). **Phase 6
+has a first slice landed**: real `#[tauri::command]`s (`import_dxf`,
+`run_nest` in `src-tauri/src/commands.rs`) wired to the actual engine
+end-to-end, backed by an explicit DTO/serialization layer
+(`src-tauri/src/dto.rs`) rather than putting `Serialize`/`Deserialize` on
+`geometry`/`nesting` types directly. This is the "redesign, not port" point
+the plan calls out: `run_nest` is one synchronous call running N GA
+generations, replacing the original's per-individual `background-start`/
+`background-response` IPC round trips to a pool of worker windows (there's
+no separate worker process to message - `nesting::dispatch` already
+parallelizes a generation in-process via rayon). **Not done yet**: adapting
+`frontend/deepnest.js`/`index.html` to call these commands instead of
+`require("electron").ipcRenderer` (still throws, same known limitation as
+before - see below), progress events, and wiring `refine_consolidation`
+into `run_nest`. Always check `docs/PORT_STATUS.md` first — it's the single
+living tracking doc for what's ported and what's outstanding; don't
+re-derive status from `RUST-REWRITE-PLAN.md` or by guessing from the file
+tree.
 
 **Scope change partway through Phase 1 (see `docs/PORT_STATUS.md` for
 detail): import/export is DXF only, not SVG.** The user's real files are
@@ -66,11 +80,15 @@ cargo run -p deepnest-tauri        # launch the Tauri shell (plain cargo run wor
 (`cargo tauri build`/`cargo tauri icon`), but isn't required for `dev` —
 the frontend has no bundler, so a plain `cargo run` embeds `frontend/` as-is.
 
-Known Phase 0 limitation: `frontend/index.html`'s inline module script calls
-`require("electron")` to construct `window.DeepNest`, which throws in the
-Tauri webview (no `require` global there). The static chrome (CSS, nav
-sidebar, icons) renders fine; the Ractive-templated main content stays blank
-until Phase 6 replaces that IPC wiring with Tauri commands. Don't try to fix
+Known limitation, still open despite Phase 6's first commands landing:
+`frontend/index.html`'s inline module script calls `require("electron")` to
+construct `window.DeepNest`, which throws in the Tauri webview (no
+`require` global there). The static chrome (CSS, nav sidebar, icons)
+renders fine; the Ractive-templated main content stays blank. Real Tauri
+commands now exist (`import_dxf`, `run_nest` - see `docs/PORT_STATUS.md`'s
+Phase 6 table) and are tested against the real engine directly, but nothing
+yet adapts the legacy `frontend/deepnest.js`/`index.html` to call them
+instead of `ipcRenderer` - that's a separate, larger pass. Don't try to fix
 this now — it's tracked in `docs/PORT_STATUS.md` Phase 6.
 
 ## Reference implementation (read-only)
@@ -95,9 +113,10 @@ deepnest-rust/
   Cargo.toml                     # workspace root (geometry, nesting, src-tauri)
   crates/
     geometry/                    # pure geometry math, zero I/O, zero threading - see below
-    nesting/                     # NfpCache, GA, placement, rayon dispatch, event abstraction
-                                  #   - depends on geometry; only cache_key.rs so far (Phase 3+)
-  src-tauri/                     # Tauri v2 shell — currently zero real commands
+    nesting/                     # NfpCache, GA, placement, rayon dispatch, consolidation
+                                  #   - depends on geometry; see module list below
+  src-tauri/                     # Tauri v2 shell + first commands (import_dxf, run_nest) -
+                                  #   see module list below; frontend wiring still not started
   frontend/                      # Electron main/ui/**, index.html, style.css, vendored libs,
                                   # copied as-is (only path fix: ui bundle import, see PORT_STATUS)
   docs/
@@ -176,6 +195,21 @@ Phase 1 table for exactly what each ports from the Electron repo):
   `placement::try_place_part_on_sheet` for the actual relocation attempt -
   doing so surfaced and fixed a real latent panic risk in that function
   (see its own doc comment)
+
+`src-tauri/src/`:
+- `dto.rs` — the serialization boundary (`PointDto`/`PolygonDto`/`PartDto`/
+  `NestConfigDto`/...) between Tauri's IPC surface and `geometry`/`nesting`'s
+  internal types. Deliberately a separate conversion layer instead of
+  deriving `Serialize`/`Deserialize` on the internal types directly - those
+  crates are I/O-free by design. `expand_parts` mirrors `launchWorkers`'s
+  per-quantity id assignment + decreasing-area seed sort
+- `commands.rs` — `import_dxf`/`run_nest`: plain, Tauri-runtime-free
+  functions (unit-tested directly, no Tauri harness needed), each wrapped by
+  a thin `#[tauri::command]`. `run_nest` is one synchronous call running N
+  GA generations - the "redesign, not port" collapse of the original's
+  per-individual `background-start`/`background-response` IPC round trips
+  to worker windows, since `nesting::dispatch` already parallelizes a
+  generation in-process via rayon
 
 Only two lib crates by design: `geometry` is everything fuzzable/unit-testable
 in isolation; `nesting` is everything stateful/concurrent. Don't split further
