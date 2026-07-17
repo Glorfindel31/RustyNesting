@@ -103,7 +103,27 @@ fn build_sheet() -> LayeredPolygon {
         geometry::point::Point::new(SHEET_WIDTH, SHEET_HEIGHT),
         geometry::point::Point::new(0.0, SHEET_HEIGHT),
     ];
-    let points = offset(&raw, -MARGIN).into_iter().next().expect("sheet inset by margin should still be a valid polygon");
+    // Every part is independently padded outward by `SPACING / 2` (see
+    // `load_parts`) so two placed parts end up `SPACING` apart - but that
+    // same padding also applies whenever a part is checked against the
+    // *sheet* boundary, since the engine has no way to know which check is
+    // which. Left uncorrected, that silently requires `SPACING / 2`
+    // clearance from the true sheet edge in addition to whatever the sheet
+    // itself is inset by - the original app (which has no separate margin
+    // concept at all, only `config.spacing`, applied exactly this way -
+    // `-0.5 * spacing` to the sheet, `+0.5 * spacing` to parts, see
+    // `main/deepnest.js:1188-1205`) never has this problem because it only
+    // ever wants that one combined clearance. We want two independently
+    // configurable clearances (a `MARGIN` from the edge, a `SPACING` between
+    // parts), so the sheet's own inset has to be net of the padding that's
+    // coming from the part side: inset by `SPACING / 2 - MARGIN` less than
+    // a naive `MARGIN` shrink would - which can go negative (grow the
+    // sheet) when `SPACING / 2 > MARGIN`, as it does here (3.25mm > 3mm):
+    // the part's own padding already provides more than the requested
+    // margin, so the sheet needs no additional shrink for edge clearance at
+    // all, only more than we correctively grow it back by the difference.
+    let sheet_delta = SPACING / 2.0 - MARGIN;
+    let points = offset(&raw, sheet_delta).into_iter().next().expect("sheet inset by margin should still be a valid polygon");
     LayeredPolygon { points, layer: "SHEET".into(), is_circle: None, children: Vec::new() }
 }
 
