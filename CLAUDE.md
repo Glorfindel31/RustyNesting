@@ -8,11 +8,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 are done**, including the general-fallback inner-NFP case the plan flagged
 as the hardest sub-problem in the project (see `docs/PORT_STATUS.md`'s
 Phase 2 table for how - no frame trick, no native addon, composed from
-already-ported Phase 1 pieces). Phase 3 (single-threaded placement + first
-end-to-end milestone) has not started. Always check `docs/PORT_STATUS.md`
-first — it's the single living tracking doc for what's ported and what's
-outstanding; don't re-derive status from `RUST-REWRITE-PLAN.md` or by
-guessing from the file tree.
+already-ported Phase 1 pieces). **Phase 3's placement engine
+(`nesting::placement::place_parts`/`try_place_part_on_sheet`, all three
+placement-type scorers, the NaN-fitness gap explicitly resolved via
+`Option<f64>`) is done and unit-tested** — single individual, no GA, no
+threads, matching `docs/PORT_STATUS.md`'s Phase 3 table. Not yet done:
+wiring a result into the Tauri shell for a visual render (that's Phase 6,
+once real Tauri commands exist) and `config.mergeLines`'s edge-merge fitness
+bonus (deliberately deferred, see the Phase 3 table's last row). Phase 4
+(concurrency model + GA orchestration) has not started. Always check
+`docs/PORT_STATUS.md` first — it's the single living tracking doc for what's
+ported and what's outstanding; don't re-derive status from
+`RUST-REWRITE-PLAN.md` or by guessing from the file tree.
 
 **Scope change partway through Phase 1 (see `docs/PORT_STATUS.md` for
 detail): import/export is DXF only, not SVG.** The user's real files are
@@ -118,6 +125,17 @@ Phase 1 table for exactly what each ports from the Electron repo):
 `crates/nesting/src/`:
 - `cache_key.rs` — the unified NFP cache-key format (was duplicated between
   `nfpDb.ts` and `main.js`, kept in sync by hand via a code comment)
+- `placement.rs` — `placeParts`/`tryPlacePartOnSheet`: the single-threaded
+  greedy per-sheet placement loop, all three placement-type scorers
+  (gravity/box/convexhull), the NaN-fitness gap resolved via `Option<f64>`.
+  Works directly in plain `Point` coordinates throughout (a real
+  simplification vs. the original's manual Clipper-coordinate conversion —
+  `geometry::clipper`'s boolean-op wrappers already scale internally and
+  don't need caller-managed path winding). New composed geometry helper this
+  needed: `geometry::obstacle_nfp` (ports `getOuterNfp`'s "A's holes are
+  additional opportunities for B" logic). `config.mergeLines`'s edge-merge
+  fitness bonus is deliberately not ported yet (optional scoring nicety,
+  needs `.exact` point-marking `geometry::Point` doesn't carry)
 
 Only two lib crates by design: `geometry` is everything fuzzable/unit-testable
 in isolation; `nesting` is everything stateful/concurrent. Don't split further
