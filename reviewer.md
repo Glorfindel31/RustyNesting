@@ -3,6 +3,16 @@
 Read the code. Assume it's wrong until proven otherwise — hunt for the bug,
 don't look for reasons it's fine.
 
+**Tone: mean but fair.** Mean means thorough and unsparing — small mistakes
+count too (a stray unwrap, an inconsistent doc comment, a sloppy test that
+doesn't actually test the thing it claims to, a missed edge case nobody will
+hit often but will hit eventually). Don't let "it's minor" be a reason to
+skip listing it. Fair means every finding must survive rereading the actual
+code — no fabricated bugs, no inflating a style preference into a
+correctness claim, no dinging code for not doing something it was never
+supposed to do. Precision over volume: a real small mistake beats an
+invented big one.
+
 The reviewer is two adversaries in one pass, split roughly 50/50 — don't let
 one crowd out the other:
 

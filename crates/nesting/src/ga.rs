@@ -139,6 +139,13 @@ impl GeneticAlgorithm {
         for i in 0..clone.placement.len() {
             if rng.gen::<f64>() < swap_chance {
                 let j = i + 1;
+                // Deliberately swaps only `placement`, not `rotation` -
+                // preserved exactly from the original, which has the same
+                // asymmetry. A part's rotation is tied to its *slot*
+                // through a swap, not carried along with the part into its
+                // new slot; each slot still gets its own independent
+                // rotation-reroll chance right below regardless of what
+                // just moved into it.
                 if j < clone.placement.len() {
                     clone.placement.swap(i, j);
                 }
@@ -174,7 +181,16 @@ impl GeneticAlgorithm {
     /// `Vec::contains` on part ids for the "does this child already have
     /// this part" check - the original's local `contains(gene, id)` helper,
     /// now just what `Vec<usize>::contains` already does.
+    ///
+    /// Requires `male`/`female` to have the same gene length - always true
+    /// for the only real caller (`generation()`, which draws both parents
+    /// from the same `population`, where every individual is guaranteed the
+    /// same length by construction), but not enforced by the type system
+    /// since this is a `pub` method. A mismatched pair panics via
+    /// out-of-bounds slicing below rather than a clean error.
     pub fn mate(&self, male: &Individual, female: &Individual) -> (Individual, Individual) {
+        debug_assert_eq!(male.placement.len(), female.placement.len(), "mate() requires male/female to have the same gene length");
+
         let mut rng = rand::thread_rng();
         let r: f64 = rng.gen::<f64>().clamp(0.1, 0.9);
         let cutpoint = (r * (male.placement.len() as f64 - 1.0)).round() as usize;
@@ -378,11 +394,11 @@ mod tests {
 
     #[test]
     fn is_better_nest_prefers_fewer_unplaced_parts_above_all_else() {
+        // fewer_unplaced has more sheets and worse utilisation than its
+        // rival, but 0 unplaced parts still wins outright.
         let fewer_unplaced = result(0, 5, 10.0);
-        let more_sheets_but_all_placed = result(0, 1, 99.0);
         assert!(is_better_nest(&fewer_unplaced, &result(1, 1, 99.0)));
         assert!(!is_better_nest(&result(1, 1, 99.0), &fewer_unplaced));
-        let _ = more_sheets_but_all_placed;
     }
 
     #[test]

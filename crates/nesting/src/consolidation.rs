@@ -298,6 +298,7 @@ mod tests {
             NestPart { id: 1, polygon: square(48.0), rotation: 0.0 },
         ];
         let result = place_parts(&sheets, parts, &config());
+        assert_eq!(result.placements.len(), 2, "sanity: 48+48 > 50, both parts can't share one sheet");
         let parts_by_id: HashMap<usize, LayeredPolygon> = HashMap::from([(0, square(48.0)), (1, square(48.0))]);
 
         let refined = refine_consolidation(result.placements, &parts_by_id, &sheets, &config(), far_future());

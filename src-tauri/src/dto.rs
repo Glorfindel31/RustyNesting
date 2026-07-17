@@ -95,7 +95,13 @@ fn one() -> usize {
 /// Expands `parts` (shape + quantity) into `(adam, parts_by_id)`: `adam` is
 /// every physical copy's id, area-sorted decreasing (same seed order
 /// `launchWorkers` uses for the GA's `population[0]`); `parts_by_id` maps
-/// each id to its geometry.
+/// each id to its geometry. A part with `quantity: 0` contributes zero
+/// copies - matches the original's plain `for (j=0; j<quantity; j++)` loop
+/// for parts (`launchWorkers`'s non-sheet branch). There's no
+/// fallback-to-1 here: that convention exists only for *sheet* quantity
+/// (`Number(quantity) || totalPartInstances || 1`, "0 means unlimited"), a
+/// different code path with different semantics that doesn't apply to
+/// parts.
 pub fn expand_parts(parts: Vec<PartDto>) -> (Vec<usize>, HashMap<usize, LayeredPolygon>) {
     let mut parts_by_id = HashMap::new();
     let mut adam = Vec::new();
@@ -103,7 +109,7 @@ pub fn expand_parts(parts: Vec<PartDto>) -> (Vec<usize>, HashMap<usize, LayeredP
 
     for part in parts {
         let polygon: LayeredPolygon = part.polygon.into();
-        for _ in 0..part.quantity.max(1) {
+        for _ in 0..part.quantity {
             parts_by_id.insert(next_id, polygon.clone());
             adam.push(next_id);
             next_id += 1;

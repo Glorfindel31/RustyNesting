@@ -64,9 +64,21 @@ impl NfpCache {
         Self::default()
     }
 
+    /// A poisoned `Mutex` (some thread panicked while holding the lock)
+    /// would otherwise make every future access from every other thread
+    /// panic too, permanently, for the rest of the run - a single bad NFP
+    /// computation shouldn't take down a shared cache every other rayon
+    /// worker thread depends on. Recovering the guard (a stale-but-still
+    /// internally-consistent map, since a `HashMap` can't be left in a
+    /// half-mutated state by a panic between operations) is a far smaller
+    /// problem than that.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, CachedNfp>> {
+        self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub fn has(&self, a: &str, b: &str, a_rotation: f64, b_rotation: f64, a_flipped: bool, b_flipped: bool) -> bool {
         let key = nfp_cache_key(a, b, a_rotation, b_rotation, a_flipped, b_flipped);
-        self.db.lock().unwrap().contains_key(&key)
+        self.lock().contains_key(&key)
     }
 
     /// Returns an owned, independent copy of the cached entry (if any) - see
@@ -74,7 +86,7 @@ impl NfpCache {
     /// hand back once callers start mutating `Point.marked` again.
     pub fn find(&self, a: &str, b: &str, a_rotation: f64, b_rotation: f64, a_flipped: bool, b_flipped: bool) -> Option<CachedNfp> {
         let key = nfp_cache_key(a, b, a_rotation, b_rotation, a_flipped, b_flipped);
-        self.db.lock().unwrap().get(&key).cloned()
+        self.lock().get(&key).cloned()
     }
 
     /// No-op past `MAX_CACHE_ENTRIES` for a genuinely new key; overwriting an
@@ -82,7 +94,7 @@ impl NfpCache {
     /// only gates *growth*, not updates).
     pub fn insert(&self, a: &str, b: &str, a_rotation: f64, b_rotation: f64, a_flipped: bool, b_flipped: bool, value: CachedNfp) {
         let key = nfp_cache_key(a, b, a_rotation, b_rotation, a_flipped, b_flipped);
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.lock();
         if !db.contains_key(&key) && db.len() >= MAX_CACHE_ENTRIES {
             return;
         }
@@ -90,7 +102,7 @@ impl NfpCache {
     }
 
     pub fn stats(&self) -> usize {
-        self.db.lock().unwrap().len()
+        self.lock().len()
     }
 }
 

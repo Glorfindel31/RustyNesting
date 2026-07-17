@@ -1,150 +1,207 @@
-**Status: all 10 items fixed.** Whole workspace (61 tests) passes. See git
-history for the commit that applied these.
+# Fix plan: reviewer.md findings
 
-# Fix plan: reviewer.md findings, whole-project pass
+**Round 1 (Phase 0-3): resolved.** All 10 items fixed, see git log
+(`total_cmp` swaps, index-based part removal, `CandidateScore` enum, etc.).
+This file now tracks Round 2.
 
-`reviewer.md` now runs as two adversaries (50/50): port-fidelity vs. the JS
-reference, and a senior-Rust-dev critique of the Rust itself, independent of
-the port. Applied to every module in `crates/geometry` and `crates/nesting`
-(Phases 0-3), not just the last diff. Worst first, tagged `[port]`/`[rust]`.
+**Round 2: mostly resolved.** #1, #2, #3, #5, #6, #7 fixed. #4 is split:
+the cheap, mechanical part (`.lock().unwrap()` poisoning risk) is fixed;
+actually wiring `NfpCache` into the placement pipeline is a real feature
+addition (needs id/rotation threaded through `try_place_part_on_sheet`'s
+signature, plus a decision about shape- vs. instance-identity caching -
+see `docs/PORT_STATUS.md`'s `NfpCache` row) and is deliberately not rushed
+into this pass. Findings kept below for the record.
 
-## 1. [HIGH] [port][rust] `place_parts` drops duplicate-id parts silently
+## 1. [HIGH] [rust] Unvalidated `rotations`/`population_size` panic deep inside the engine, reachable from the Tauri IPC boundary
 
-Carried over from the previous pass, still open. `nesting::placement::place_parts`
-(`placement.rs:504-508`) removes placed parts via
-`parts.retain(|p| !placed_id_set.contains(&p.id))`. The JS original removes
-by **object identity** (`parts.indexOf(placed[i])` + `splice`) — nothing
-requires part ids to be unique, and quantity > 1 of the same part is normal
-usage. When one same-id instance places but a sibling instance never gets
-attempted in the same sheet-pass (confirmed repro: the dominant-part-area
-break skips the rest of the sheet's part list), retain removes *every* part
-with that id, including the untried sibling — it vanishes with no fitness
-penalty and no record in any `SheetPlacement`.
+**Status: fixed.** `run_nest` now validates both up front and returns a
+descriptive `Err`; 3 new tests cover it.
 
-It's also an API-design problem, not just a translation slip: `id` is a
-caller-assigned field being reused as an internal bookkeeping key, and
-nothing in the type signature says ids must be unique.
+`src-tauri/src/dto.rs`'s `NestConfigDto.rotations: u32` and
+`.population_size: usize` flow straight into `GaConfig` with zero
+validation, then straight into `GeneticAlgorithm::new()`
+(`crates/nesting/src/ga.rs`):
 
-**Fix:** track *which vector slot* got placed this sheet-pass (index at scan
-time, stable within one sheet's `while i < parts.len()` scan, same as the
-original), not which id. Remove by index after the scan. `id` stays purely
-caller-facing identity for the output.
+- `rotations: 0` → `random_angles`'s `rng.gen_range(0..rotations)` panics
+  (`rand` panics on an empty range) the moment any part exists - and
+  `run_nest` already guarantees at least one part exists before this runs.
+- `population_size: 0` **or** `1` → `GeneticAlgorithm::new()` always seeds
+  exactly one individual before checking `population_size` at all, so both
+  values leave the population at size 1. The first `dispatch::run_generation`
+  call then calls `GeneticAlgorithm::generation()`, which calls
+  `random_weighted_individual(Some(male_idx))` to pick a second, distinct
+  parent - with only one individual, excluding it leaves `indices` empty,
+  and `indices[0]` panics on an empty `Vec`.
 
-**Verify:** permanent regression test — 2 identical-id 30x30 parts on 2
-available 30x30 sheets, assert `unplaced_count == 0` and
-`placements.len() == 2`.
+Both are one bad request away (a UI bug, a malformed request, a future
+caller that doesn't know to guard these) from crashing the command handler,
+on a Tauri command that's the actual documented trust boundary here (see
+this project's own "only validate at system boundaries" guidance). Neither
+field has a doc comment, a `Result`-returning check, or a clamp anywhere -
+`run_nest` (`commands.rs`) already validates "sheets non-empty"/"parts
+non-empty"/"adam non-empty" but not these two.
 
-## 2. [MEDIUM] [rust] `.partial_cmp(...).unwrap()` panics on non-finite coordinates, and it's a *pattern*, not one call site
+**Fix:** validate `rotations >= 1` and `population_size >= 2` in `run_nest`
+(or in `NestConfigDto`/`GaConfig` construction) and return a descriptive
+`Err` instead of letting the panic happen three call frames later where it's
+much harder to diagnose.
 
-Five separate sites sort/compare polygon-derived `f64`s this way, all of
-which panic on `NaN`:
+## 2. [HIGH] [port] `expand_parts` forces quantity 0 to mean 1 copy - the original excludes the part entirely, and the port's own comment misattributes the justification
 
-- `dxf_import.rs:303` — `build_polygon_tree`'s largest-area-first sort
-- `clipper.rs:81` — `clean_polygon`'s `max_by` over resulting loop areas
-- `hull_polygon.rs:50-51` — `hull`'s lexicographic point sort
-- `simplify_polygon.rs:96,104` — nearest-target-point selection
+**Status: fixed.** Dropped the `.max(1)`; the misleadingly-named test is
+renamed (`run_nest_excludes_zero_quantity_parts`) and its assertion flipped
+to match reality, plus a new mixed-quantity test.
 
-DXF import is a trust boundary (arbitrary user-supplied files) and nothing
-validates coordinate finiteness on the way in. Two concrete paths to a
-non-finite value: (a) a DXF literal outside `f64` range (e.g. `1e400`)
-parses straight to `Infinity`; (b) `tessellate_bulge` (`dxf_import.rs:139`)
-can produce a `NaN` arc center when a near-horizontal or near-vertical
-segment has a bulge small enough to underflow `sagitta` to exactly `0.0`
-while `nx`/`ny` is also `0.0` (`0.0 * Infinity == NaN` from
-`radius = ... / (2.0 * sagitta)` blowing up). Either way, one malformed
-entity among possibly thousands currently panics the *whole* import instead
-of being skipped or reported.
+`src-tauri/src/dto.rs::expand_parts`: `for _ in 0..part.quantity.max(1)`.
+The `.max(1)` means a part explicitly given `quantity: 0` still gets nested
+once.
 
-**Fix:** replace `.partial_cmp(...).unwrap()` with `.total_cmp(...)` (stable
-since Rust 1.62, never panics, defines a total order including NaN/Infinity)
-at all five sites — a true drop-in, no behavior change for the finite case
-that's exercised today. Separately (bigger, not required to fix this
-specific panic): decide whether `dxf_import` should reject/skip entities
-with non-finite coordinates at the parse boundary rather than only stop the
-panic downstream.
+The JS reference for **part** quantity (`launchWorkers`, non-sheet branch):
+`for (var j = 0; j < parts[i].quantity; j++) { ... }` - a literal
+`quantity: 0` is zero loop iterations, zero copies, the part is excluded
+from the nest entirely. There is no fallback-to-1 anywhere in this branch.
 
-## 3. [MEDIUM] [port] Holed-obstacle path in `try_place_part_on_sheet` is untested
+The `.max(1)` here was justified (in both a doc comment and a test comment)
+as matching *"background.js's own 'quantity 0 means unlimited on a sheet,
+but 1 on a part'"* - but re-checking the reference, that convention
+(`Number(parts[i].quantity) || totalPartInstances || 1`) exists **only** in
+`launchWorkers`'s *sheet* branch, a completely different code path with
+different semantics (0 sheets of a given size means "supply enough copies
+to cover the worst case", not "1"). It doesn't apply to parts at all. The
+justification is confidently worded and cites the original, but is simply
+wrong about which branch it's describing.
 
-Carried over, still open. None of the 5 placement tests give a placed
-obstacle a hole, so the batched-pending-clips-then-flush-then-restore logic
-(`placement.rs:221-259`) — specifically whether a *later* obstacle correctly
-cuts into an *earlier* one's restored hole-interior region — has zero direct
-coverage.
+Real-world impact: a UI that lets a user zero out a part's quantity without
+deleting the row (a completely standard pattern - "uncheck to skip") would
+silently get 1 copy nested anyway.
 
-**Fix:** add a test with a part that has a hole big enough for a second part
-to nest inside once placed, plus a third part positioned to clip into that
-hole-interior region if the restore/subtract ordering were wrong.
+Compounding this: `commands.rs`'s test for this exact scenario is named
+`run_nest_rejects_all_zero_quantities` but its body asserts
+`run_nest(request).is_ok()` - the **opposite** of what the name says. The
+test enshrines the bug as expected behavior, so a future correct fix will
+look like it broke a passing test instead of fixing one.
 
-## 4. [MEDIUM] [rust] `find_best_candidate`'s panic safety is a convention, not a guarantee
+**Fix:** drop the `.max(1)` in `expand_parts` - a part with `quantity: 0`
+contributes zero entries to `adam`/`parts_by_id`, matching the original.
+`run_nest`'s existing `if adam.is_empty() { return Err(...) }` already
+correctly handles "every part was quantity 0" once this is fixed. Rename
+the test to reflect what it should assert once fixed (something like
+`run_nest_excludes_zero_quantity_parts`), and fix its assertion.
 
-`placement.rs:160-165` unwraps `cand.width`/`minwidth`/`minarea`/`minx`
-inside branches that are only safe because *every* candidate in the slice
-was built under the same `config.placement_type`, and
-`try_place_part_on_sheet`'s candidate-building code happens to set
-`width: Some(..)` for every candidate exactly when `placement_type` is
-`Gravity`/`Box`. Nothing in the types enforces that pairing — a future
-change to the candidate-building branch (e.g. an early `continue` that skips
-setting `width`) would panic here, and no test would catch it unless it
-specifically exercised the broken path.
+## 3. [MEDIUM] [rust] `GeneticAlgorithm::mate` is a public method with an undocumented, unenforced same-length precondition
 
-**Fix:** fold `area`/`width` into a placement-type-shaped enum
-(`CandidateScore::Gravity { area: f64, width: f64 } | Box { .. } |
-ConvexHull { area: f64 }`) so "gravity/box candidates always have a width"
-is a compile-time fact instead of a runtime assumption. Lower priority than
-1-3; worth doing if `try_place_part_on_sheet` gets touched again for
-`mergeLines` or Phase 5's `refineConsolidation` reuse.
+**Status: fixed.** Doc comment + `debug_assert_eq!` added.
 
-## 5. [LOW] [rust] Unnecessary clone on the common "evaluate but skip" path
+`crates/nesting/src/ga.rs::mate`: `cutpoint` is derived from
+`male.placement.len()`, then used to slice **both** `male.placement[..cutpoint]`
+*and* `female.placement[..cutpoint]`. If a caller ever passes a `female`
+individual shorter than `male`, this panics via out-of-bounds slicing.
 
-`placement.rs`'s per-part loop does `let part = parts[i].polygon.clone();`
-unconditionally, before knowing whether the part will actually place. Every
-rejected candidate (no room, overlaps, wrong rotation) still pays for a full
-`LayeredPolygon` clone (points + recursive hole children) that's immediately
-discarded. Could borrow `&parts[i].polygon` for the NFP/scoring calls and
-only clone once a placement is confirmed.
+Currently safe in practice - the only real caller, `generation()`, always
+draws both parents from the same `population`, where every individual is
+guaranteed the same gene length by construction. But `mate` is `pub fn`, has
+no doc comment stating the precondition, and no `debug_assert!` enforcing
+it - a future caller (or a refactor of `generation()`) could violate it
+silently.
 
-## 6. [LOW] [rust] `SheetPlacement.parts: Vec<(usize, Placement, f64)>` should be a named struct
+**Fix:** add a one-line doc comment stating the precondition, and/or a
+`debug_assert_eq!(male.placement.len(), female.placement.len())` at the top
+of the function - cheap insurance for a public API.
 
-A positional tuple on a `pub` type meant for later phases (export, UI) to
-consume. Own test code already had to destructure as
-`result.placements[0].parts[0].0` — a `PlacedPart { id, placement, rotation
-}` struct would read at call sites instead of requiring readers to remember
-field order.
+## 4. [MEDIUM] [port] `NfpCache` (Phase 4) is built and tested but never actually called - every real run recomputes every NFP from scratch
 
-## 7. [LOW] [rust] Inconsistent `.unwrap()`/`.expect()` messages
+**Status: partially fixed.** The poisoning risk is fixed (`NfpCache::lock`
+now recovers via `PoisonError::into_inner` instead of `.unwrap()`ing
+straight into a permanent panic cascade). Actually wiring the cache into
+`try_place_part_on_sheet`/`place_parts` is deliberately deferred - see
+`docs/PORT_STATUS.md`'s `NfpCache` row for why (real signature change,
+plus an open shape- vs. instance-identity design question, not a
+mechanical bug fix).
 
-`placement.rs:306`, `get_polygon_bounds(&rect_corners).unwrap()`, has no
-message; the two `.expect("...")` calls immediately above it do. Free to fix
-while in the area.
+Grepping `dispatch.rs`/`placement.rs`/`consolidation.rs`/`commands.rs` for
+`NfpCache` turns up nothing - the cache from `nesting::cache` is never
+constructed or consulted anywhere in the actual placement pipeline. Every
+`inner_nfp`/`obstacle_nfp` call inside `try_place_part_on_sheet`/`place_parts`
+recomputes from scratch, including for identical (part, rotation) pairs
+that repeat constantly across a GA population and across generations - the
+exact redundant work the original's `NfpCache` (and the plan's Phase 4 row)
+exists to avoid. `docs/PORT_STATUS.md` marks the `NfpCache` row "done",
+which is true for the data structure itself, but the caching *behavior*
+Phase 4 was meant to deliver isn't actually happening in any real run yet.
 
-## 8. [LOW] [rust] Empty-`sheets` call produces `fitness == Infinity`, silently
+Related, currently-latent concern for when it **does** get wired in:
+`cache.rs` calls `.lock().unwrap()` at all four access points. `Mutex`
+poisons on any panic while the lock is held; once this cache sits in the
+hot path of a `rayon::par_iter()` generation evaluation (exactly what the
+module's own doc comment says it's for), a single panic in any one worker
+thread while holding the lock would poison the cache for every other
+thread, permanently, for the rest of the run - not "that thread's work is
+lost", but "every subsequent cache access from any thread panics too".
 
-`place_parts(&[], parts, ..)` with non-empty `parts` leaves
-`total_sheet_area == 0.0`; the unplaced-part penalty loop
-(`placement.rs:533-535`) then divides by that zero. Not a crash (IEEE754
-gives `+Infinity`, not a panic or NaN), but undocumented and easy to
-mistake for "it worked" if a caller doesn't check for it. Worth a doc note
-or an explicit `unplaced_count == parts.len() && placements.is_empty()`
-early return.
+**Fix:** wire `NfpCache` into `try_place_part_on_sheet`'s (or a caller's)
+`inner_nfp`/`obstacle_nfp` calls before claiming Phase 4's performance goal
+is met - not required for correctness, but worth flagging clearly rather
+than let "done" quietly mean "built but disconnected". Separately, once it
+is wired in: replace `.lock().unwrap()` with something that survives
+poisoning (`.lock().unwrap_or_else(PoisonError::into_inner)` is the
+simplest - a stale-but-still-valid cache entry from a half-finished insert
+is a far smaller problem than poisoning the whole cache for the rest of the
+run).
 
-## 9. [LOW] [rust] `Touch.kind: u8` in `nfp.rs` should be an enum
+## 5. [LOW] [port] Undocumented preserved quirk: the adjacent-swap mutation operator swaps part order but not rotation
 
-`nfp.rs:539-543`, matched via `match t.kind { 0 => .., 1 => .., _ => .. }`.
-Nothing stops constructing an invalid discriminant, and the match arms read
-as magic numbers rather than named cases (`VertexRef` right above it already
-shows the idiomatic version of this same pattern).
+**Status: fixed.** One-line comment added at the swap site.
 
-## 10. [LOW] [rust] `shift_layered_polygon` carries `is_circle`, JS's `shiftPolygon` doesn't
+`ga.rs::mutate`'s adjacent-swap block does
+`clone.placement.swap(i, j)` but never touches `clone.rotation[i]`/`[j]`.
+Verified against the JS original - it has the exact same asymmetry (`var
+temp = clone.placement[i]; ...` only ever touches `.placement`, never
+`.rotation`). So this is a faithful port, not a bug introduced here. But
+unlike similar surprising-on-first-read-but-intentional behaviors elsewhere
+in this codebase (the `on_segment` tolerance asymmetry, `polygonHull`'s
+backward-scan bug, etc.), which all get an explicit "preserved exactly,
+matches the original" comment right at the code, this one doesn't - a
+future reader might "fix" it by adding a rotation swap, silently changing
+behavior.
 
-Carried over, still open, still harmless (nothing downstream reads
-`is_circle` post-shift today) — just needs the one-line doc-comment
-disclosure other intentional deviations in this codebase get.
+**Fix:** one-line comment at the swap noting rotation is deliberately left
+in place (it gets its own independent per-index reroll chance right below),
+matching this codebase's own convention for this class of quirk.
+
+## 6. [LOW] [rust] Dead test code masked by `let _ = ...`
+
+**Status: fixed.** Deleted the unused variable.
+
+`ga.rs::tests::is_better_nest_prefers_fewer_unplaced_parts_above_all_else`
+constructs `more_sheets_but_all_placed` and never uses it in any assertion -
+the actual assertions compare two entirely different `result(...)` values.
+The unused variable is silenced with `let _ = more_sheets_but_all_placed;`
+instead of being deleted, so it reads as intentional when it's very likely
+a leftover from an earlier draft of the test.
+
+**Fix:** delete the unused variable and its `let _ = ...` line - the test
+still verifies what its name claims without it.
+
+## 7. [VERY LOW] [rust] Inconsistent sanity-check coverage between two similar tests
+
+**Status: fixed.** Sanity assertion added.
+
+`consolidation.rs::tests::does_nothing_when_no_relocation_is_possible`
+doesn't assert `result.placements.len() == 2` before running
+`refine_consolidation`, unlike its sibling
+`drains_a_sparse_sheet_into_another_when_relocation_fits`, which does.
+Harmless today (48+48 > 50 makes two starting sheets geometrically
+inevitable), purely a consistency nit.
+
+**Fix:** add the same sanity assertion, or don't - lowest priority item on
+this list, mentioned for completeness per `reviewer.md`'s "small mistakes
+count too."
 
 ## Order of work
 
-Fix #1 and #2 before Phase 4 (GA) wiring touches `place_parts`/DXF import
-with real data — #1 is a silent-data-loss bug the moment a real part list
-has duplicate ids (which a GA will produce constantly), #2 is a
-one-line-per-site fix (`total_cmp`) that closes a crash-on-malformed-file
-gap essentially for free. #3-4 before `try_place_part_on_sheet` gets reused
-by Phase 5. #5-10 are cheap, do them in the same pass.
+Fix #1 and #2 before `run_nest` is ever exposed to a real frontend - both
+are silent-failure-or-crash bugs reachable from ordinary (not even
+adversarial) input. #3 and #4 are worth doing in the same pass since
+they're cheap and #4 in particular undermines a chunk of Phase 4's actual
+point. #5-7 are cosmetic, bundle them in whenever these files are next
+touched.

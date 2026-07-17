@@ -56,6 +56,20 @@ pub fn run_nest(request: RunNestRequest) -> Result<RunNestResponse, String> {
     if request.parts.is_empty() {
         return Err("at least one part is required".into());
     }
+    // Both feed straight into GeneticAlgorithm::new(), which panics rather
+    // than erroring on either: rotations=0 makes random_angles's
+    // rng.gen_range(0..0) panic (empty range), and population_size 0 or 1
+    // leaves the population at size 1 (GeneticAlgorithm::new() always seeds
+    // one individual before checking population_size), which panics on the
+    // first generation() call when it tries to pick a second, distinct
+    // parent. Catch both here, at the actual trust boundary, instead of
+    // three call frames deep in the engine.
+    if request.config.rotations == 0 {
+        return Err("rotations must be at least 1".into());
+    }
+    if request.config.population_size < 2 {
+        return Err("population_size must be at least 2".into());
+    }
 
     let sheets: Vec<_> = request.sheets.into_iter().map(Into::into).collect();
     let (adam, parts_by_id) = expand_parts(request.parts);
@@ -155,14 +169,51 @@ mod tests {
     }
 
     #[test]
-    fn run_nest_rejects_all_zero_quantities() {
+    fn run_nest_excludes_zero_quantity_parts() {
+        // A part explicitly given quantity 0 contributes zero copies -
+        // matches the original's plain `for (j=0; j<quantity; j++)` loop
+        // for parts (no fallback-to-1; that convention only exists for
+        // *sheet* quantity, a different code path with different
+        // semantics). If every part is quantity 0, nothing to nest at all.
         let request =
             RunNestRequest { sheets: vec![square_dto(100.0)], parts: vec![PartDto { polygon: square_dto(10.0), quantity: 0 }], config: config(1) };
-        // quantity 0 falls back to 1 copy (matches expand_parts's `.max(1)`,
-        // same convention background.js's own "quantity 0 means unlimited on
-        // a sheet, but 1 on a part" - a plain part with quantity 0 is
-        // treated as 1, not "nest nothing")
-        assert!(run_nest(request).is_ok());
+        assert!(run_nest(request).is_err());
+    }
+
+    #[test]
+    fn run_nest_nests_only_the_non_zero_quantity_parts_in_a_mix() {
+        let request = RunNestRequest {
+            sheets: vec![square_dto(100.0)],
+            parts: vec![
+                PartDto { polygon: square_dto(10.0), quantity: 2 },
+                PartDto { polygon: square_dto(20.0), quantity: 0 },
+            ],
+            config: config(2),
+        };
+
+        let response = run_nest(request).expect("should nest the non-zero-quantity part");
+
+        assert_eq!(response.unplaced_count, 0);
+        assert_eq!(response.placements[0].parts.len(), 2, "only the 2 copies of the quantity=2 part should be nested");
+    }
+
+    #[test]
+    fn run_nest_rejects_zero_rotations() {
+        let mut cfg = config(1);
+        cfg.rotations = 0;
+        let request = RunNestRequest { sheets: vec![square_dto(100.0)], parts: vec![PartDto { polygon: square_dto(10.0), quantity: 1 }], config: cfg };
+        assert!(run_nest(request).is_err());
+    }
+
+    #[test]
+    fn run_nest_rejects_population_size_under_two() {
+        for bad_size in [0, 1] {
+            let mut cfg = config(1);
+            cfg.population_size = bad_size;
+            let request =
+                RunNestRequest { sheets: vec![square_dto(100.0)], parts: vec![PartDto { polygon: square_dto(10.0), quantity: 1 }], config: cfg };
+            assert!(run_nest(request).is_err(), "population_size {bad_size} should be rejected");
+        }
     }
 
     #[test]
