@@ -17,6 +17,31 @@ let importedShapes = [];
 // already in the last response.
 let lastNestRequest = null;
 let currentSnapshot = null;
+// The authoritative id -> shape mapping from the last run_nest_command
+// response (RunNestResponse::parts_by_id) - used for both rendering and
+// export, instead of each independently re-deriving its own id->shape
+// mapping from request.parts/quantities (fragile: has to exactly mirror
+// dto::expand_parts's sequential id assignment, and export_dxf used to do
+// exactly this server-side too - see that command's own doc comment for
+// the silent-corruption risk this replaces).
+let lastPartsById = null;
+// Set at the start of each run so the "nest-tick" listener below can turn
+// (generation, individuals_done/individuals_total) into an overall
+// percentage - the tick event itself doesn't carry the total generation
+// count, only run_nest_command's own request did.
+let currentGenerations = 0;
+
+// Live preview - commented out (2026), never worked reliably; not deleted
+// so it's easy to pick back up later. See index.html's matching commented-
+// out #cfg-live-viz/#live-preview-section and src-tauri's
+// NestConfigDto::live_visualization/run_nest_with_progress.
+/*
+let liveViewActive = false;
+let liveShapesById = {};
+let liveSheetEls = {};
+let liveQueue = [];
+let liveTicking = false;
+*/
 
 const el = (id) => document.getElementById(id);
 
@@ -37,8 +62,27 @@ function setBusy(spinnerId, busy) {
 function logLine(message) {
   const node = el("console-log");
   const time = new Date().toLocaleTimeString();
-  node.textContent += `[${time}] ${message}\n`;
+  const line = `[${time}] ${message}`;
+  node.textContent += line + "\n";
   node.scrollTop = node.scrollHeight;
+  // Fire-and-forget: also append to the on-disk log
+  // (<app_log_dir>/rustynesting.log) so this history survives past the
+  // window closing - the console panel above is DOM-only and empties every
+  // restart, which made a bad run impossible to look at after the fact.
+  invoke("append_log_command", { line }).catch(() => {});
+}
+
+// Locks/unlocks every import/role/config control while a nest is running,
+// so a config change mid-run can't silently apply to a request that's
+// already in flight (buildRequest() already snapshotted its own copy, but
+// letting the user edit fields that look "live" while ignored was
+// confusing on its own).
+function setControlsLocked(locked) {
+  const selector =
+    "#panel-import input, #panel-import select, #panel-import button, #panel-shapes input, #panel-shapes select, #panel-shapes button, #panel-config input, #panel-config select, #panel-config button:not(#btn-run):not(#btn-stop)";
+  document.querySelectorAll(selector).forEach((node) => {
+    node.disabled = locked;
+  });
 }
 
 function boundsOf(points) {
@@ -178,9 +222,54 @@ function renderShapesTable() {
         </select>
       </td>
       <td><input type="number" data-qty="${i}" value="1" min="0" step="1" /></td>
+      <td><span class="dominant-flag" data-dominant="${i}"></span></td>
     `;
     body.appendChild(row);
   }
+  updateDominantIndicators();
+}
+
+// Shoelace formula - matches geometry::polygon::polygon_area exactly (only
+// the magnitude matters here, not winding direction).
+function polygonArea(points) {
+  let area = 0;
+  const n = points.length;
+  for (let i = 0; i < n; i++) {
+    const j = (i + n - 1) % n;
+    area += (points[j].x + points[i].x) * (points[j].y - points[i].y);
+  }
+  return Math.abs(0.5 * area);
+}
+
+// Live preview of nesting::placement::place_parts's own "part_area >=
+// dominant_part_area_threshold * sheet_area" check - a part that trips this
+// isn't excluded from nesting, it still gets placed, it just closes
+// whichever sheet it lands on immediately afterward instead of sharing it.
+// Reference sheet is the LARGEST shape currently marked SHEET: a part that
+// clears the bar against the biggest available sheet clears it against
+// every smaller one too, so this only flags parts that are *always*
+// dominant regardless of which sheet they end up on - a deliberate
+// under-flag for mixed sheet sizes rather than a per-sheet-size breakdown.
+function updateDominantIndicators() {
+  const dominantInput = el("cfg-dominant");
+  if (!dominantInput) return;
+  const threshold = Number(dominantInput.value);
+
+  let maxSheetArea = 0;
+  importedShapes.forEach((shape, i) => {
+    const roleEl = document.querySelector(`[data-role="${i}"]`);
+    if (roleEl?.value === "sheet") {
+      maxSheetArea = Math.max(maxSheetArea, polygonArea(shape.points));
+    }
+  });
+
+  importedShapes.forEach((shape, i) => {
+    const cell = document.querySelector(`[data-dominant="${i}"]`);
+    if (!cell) return;
+    const roleEl = document.querySelector(`[data-role="${i}"]`);
+    const isDominant = roleEl?.value === "part" && maxSheetArea > 0 && polygonArea(shape.points) >= threshold * maxSheetArea;
+    cell.textContent = isDominant ? "CLOSES SHEET" : "";
+  });
 }
 
 // Lets the user define a sheet or part directly by size, instead of
@@ -214,7 +303,7 @@ function handleAddRectangle() {
 }
 
 function shapeToPolygonDto(shape) {
-  return { points: shape.points, layer: shape.layer, is_circle: shape.is_circle ?? null, children: shape.children ?? [] };
+  return { points: shape.points, layer: shape.layer, is_circle: shape.is_circle ?? null, children: shape.children ?? [], texts: shape.texts ?? [] };
 }
 
 function buildRequest() {
@@ -242,25 +331,11 @@ function buildRequest() {
     margin: Number(el("cfg-margin").value),
     spacing: Number(el("cfg-spacing").value),
     max_threads: Number(el("cfg-max-threads").value),
+    seed: Number(el("cfg-seed").value),
+    // live_visualization: el("cfg-live-viz").checked, // live preview, commented out - see index.html
   };
 
   return { sheets, parts, config };
-}
-
-// Mirrors dto::expand_parts's id assignment exactly: sequential ids
-// starting at 0, in request.parts order, one per physical copy - needed
-// client-side to know which imported shape a returned placement's `id`
-// refers to, since the response only carries id/x/y/rotation, not geometry.
-function idToShape(request) {
-  const map = new Map();
-  let nextId = 0;
-  for (const part of request.parts) {
-    for (let n = 0; n < part.quantity; n++) {
-      map.set(nextId, part.polygon);
-      nextId++;
-    }
-  }
-  return map;
 }
 
 async function handleRunNest() {
@@ -275,28 +350,69 @@ async function handleRunNest() {
   }
 
   const partInstances = request.parts.reduce((n, p) => n + p.quantity, 0);
+  currentGenerations = request.config.generations;
   setStatus("run-status", "nesting...", false);
-  logLine(`nest: ${request.sheets.length} sheet(s), ${partInstances} part instance(s), ${request.config.generations} generation(s)`);
+  logLine(
+    request.config.live_visualization
+      ? `live preview: ${request.sheets.length} sheet(s), ${partInstances} part instance(s), one placement pass`
+      : `nest: ${request.sheets.length} sheet(s), ${partInstances} part instance(s), ${request.config.generations} generation(s)`
+  );
+  invoke("save_config_command", { config: request.config }).catch((err) => logLine(`could not save config: ${err}`));
   el("btn-run").disabled = true;
+  el("btn-stop").hidden = false;
+  el("btn-stop").disabled = false;
+  setControlsLocked(true);
   setBusy("run-spinner", true);
   el("run-progress").hidden = false;
   el("run-progress-fill").style.width = "0%";
+
+  lastNestRequest = request;
+  /* Live preview - commented out, see index.html/app.js's other commented-out live-preview blocks.
+  liveViewActive = request.config.live_visualization;
+  liveShapesById = {};
+  liveSheetEls = {};
+  liveQueue.length = 0; // discard anything still queued/animating from a previous live run
+  syncLivePreviewSectionVisibility();
+  el("live-sheets").innerHTML = "";
+  */
+
   try {
     const response = await invoke("run_nest_command", { request });
-    setStatus("run-status", "done", false);
+    setStatus("run-status", response.cancelled ? "stopped early" : "done", false);
     logLine(
-      `nest done: fitness=${response.fitness.toFixed(1)} sheets=${response.placements.length} unplaced=${response.unplaced_count} util=${response.utilisation.toFixed(1)}%`
+      `nest ${response.cancelled ? "stopped early" : "done"}: fitness=${response.fitness.toFixed(1)} sheets=${response.placements.length} unplaced=${response.unplaced_count} util=${response.utilisation.toFixed(1)}%`
     );
-    el("run-progress-fill").style.width = "100%";
+    if (!response.cancelled) {
+      el("run-progress-fill").style.width = "100%";
+    }
     renderResult(response, request);
     el("panel-result").hidden = false;
   } catch (err) {
     setStatus("run-status", String(err), true);
     logLine(`nest failed: ${err}`);
   } finally {
+    // liveViewActive = false; // live preview, commented out
     el("btn-run").disabled = false;
+    el("btn-stop").hidden = true;
+    setControlsLocked(false);
     setBusy("run-spinner", false);
     el("run-progress").hidden = true;
+  }
+}
+
+async function handleStopNest() {
+  // Cancellation is checked per-part inside place_parts itself (not just
+  // between individuals/generations), so this takes effect within roughly
+  // one part's worth of computation - not instant at the OS level, but
+  // close enough in practice that no "still finishing up" caveat is needed
+  // here anymore.
+  logLine("stop requested");
+  el("btn-stop").disabled = true;
+  try {
+    await invoke("cancel_nest_command");
+  } catch (err) {
+    logLine(`stop request failed: ${err}`);
+    el("btn-stop").disabled = false; // let the user try again instead of getting stuck
   }
 }
 
@@ -343,15 +459,13 @@ function renderSnapshot(snapshot, request) {
     <div><dt>SHEETS USED</dt><dd>${snapshot.placements.length}</dd></div>
   `;
 
-  const partById = idToShape(request);
-
   const unplacedSection = el("unplaced-section");
   const unplacedList = el("unplaced-list");
   unplacedList.innerHTML = "";
   const unplacedIds = snapshot.unplaced_ids ?? [];
   unplacedSection.hidden = unplacedIds.length === 0;
   for (const id of unplacedIds) {
-    const shape = partById.get(id);
+    const shape = lastPartsById[id];
     if (!shape) continue;
     const item = document.createElement("div");
     item.className = "unplaced-item";
@@ -374,7 +488,7 @@ function renderSnapshot(snapshot, request) {
 
     const svgParts = placement.parts
       .map((p) => {
-        const shape = partById.get(p.id);
+        const shape = lastPartsById[p.id];
         if (!shape) return "";
         const transform = (points) => toSvgPoints(rotatedTranslatedPoints(points, p.rotation, p.x, p.y), sheetBounds);
         return renderShapeSvg(shape, transform);
@@ -398,6 +512,7 @@ function renderSnapshot(snapshot, request) {
 // response fields describe).
 function renderResult(response, request) {
   lastNestRequest = request;
+  lastPartsById = response.parts_by_id;
 
   const historyRow = el("history-row");
   const select = el("history-select");
@@ -418,7 +533,7 @@ function renderResult(response, request) {
 }
 
 async function handleExport() {
-  if (!currentSnapshot || !lastNestRequest) return;
+  if (!currentSnapshot || !lastNestRequest || !lastPartsById) return;
 
   const sheetSpacing = Number(el("export-spacing").value);
   if (!(sheetSpacing >= 0)) {
@@ -435,7 +550,11 @@ async function handleExport() {
 
   const request = {
     sheets: lastNestRequest.sheets,
-    parts: lastNestRequest.parts,
+    // The authoritative id -> shape mapping run_nest_command itself built
+    // (RunNestResponse::parts_by_id), not a re-sent parts/quantity list for
+    // export_dxf to re-derive its own mapping from - see that DTO field's
+    // doc comment for the silent-corruption risk this avoids.
+    parts_by_id: lastPartsById,
     placements: currentSnapshot.placements,
     sheet_spacing: sheetSpacing,
     include_sheet_outline: includeSheetOutline,
@@ -459,8 +578,109 @@ async function handleExport() {
 el("btn-import").addEventListener("click", handleBrowse);
 el("btn-add-rect").addEventListener("click", handleAddRectangle);
 el("btn-run").addEventListener("click", handleRunNest);
+el("btn-stop").addEventListener("click", handleStopNest);
 el("btn-toggle-shapes").addEventListener("click", handleToggleShapes);
 el("btn-export").addEventListener("click", handleExport);
+
+// Live percentage readout + dominant-part re-check on every slider move.
+el("cfg-dominant").addEventListener("input", () => {
+  el("cfg-dominant-value").textContent = `${Math.round(Number(el("cfg-dominant").value) * 100)}%`;
+  updateDominantIndicators();
+});
+
+/* Live preview - commented out, see index.html/app.js's other commented-out live-preview blocks.
+el("cfg-live-viz-speed").addEventListener("input", () => {
+  el("cfg-live-viz-speed-value").textContent = `${el("cfg-live-viz-speed").value}ms`;
+});
+
+function syncLivePreviewSectionVisibility() {
+  el("live-preview-section").hidden = !el("cfg-live-viz").checked;
+}
+el("cfg-live-viz").addEventListener("change", syncLivePreviewSectionVisibility);
+*/
+
+// Delegated (not per-row) since rows are added dynamically after this
+// listener is wired - a shape's ROLE changes which shapes count as "sheet"
+// for the dominant-area comparison, so it needs the same re-check.
+el("shapes-body").addEventListener("change", (event) => {
+  if (event.target.matches("[data-role]")) {
+    updateDominantIndicators();
+  }
+});
+
+// Restores the config panel to whatever was last saved
+// (save_config_command, called right before every run) so a new session
+// starts from the previous one's settings instead of index.html's
+// hardcoded defaults - lets a follow-up session actually see what the last
+// test run used.
+async function loadSavedConfig() {
+  let saved;
+  try {
+    saved = await invoke("load_config_command");
+  } catch (err) {
+    logLine(`could not load saved config: ${err}`);
+    return;
+  }
+  if (!saved) return;
+  el("cfg-placement-type").value = saved.placement_type;
+  el("cfg-rotations").value = saved.rotations;
+  el("cfg-population").value = saved.population_size;
+  el("cfg-mutation").value = saved.mutation_rate;
+  el("cfg-dominant").value = saved.dominant_part_area_threshold;
+  el("cfg-dominant-value").textContent = `${Math.round(saved.dominant_part_area_threshold * 100)}%`;
+  el("cfg-generations").value = saved.generations;
+  el("cfg-margin").value = saved.margin;
+  el("cfg-spacing").value = saved.spacing;
+  el("cfg-max-threads").value = saved.max_threads;
+  el("cfg-seed").value = saved.seed ?? 0;
+  // el("cfg-live-viz").checked = Boolean(saved.live_visualization); // live preview, commented out
+  // syncLivePreviewSectionVisibility();
+  el("import-tolerance").value = saved.curve_tolerance;
+  updateDominantIndicators();
+  logLine("restored config from last session");
+}
+loadSavedConfig();
+
+// Offers to restore the best nest result ever saved to disk
+// (run_nest_command persists it after every run that beats the previous
+// best - see that command's own doc comment) so a fresh session doesn't
+// start blank after closing the app mid-work. Renders through the same
+// renderSnapshot() the live run flow uses - a recovered result has no
+// `history` (only the winning snapshot was ever persisted), so it's shown
+// as a single-entry view rather than through renderResult()'s history select.
+async function tryRecoverBestResult() {
+  let best;
+  try {
+    best = await invoke("load_best_result_command");
+  } catch (err) {
+    logLine(`could not load saved best result: ${err}`);
+    return;
+  }
+  if (!best) return;
+
+  const recover = await window.__TAURI__.dialog.ask(
+    `A saved nest result from a previous session exists (${best.placements.length} sheet(s), ${best.utilisation.toFixed(1)}% utilisation). Recover it?`,
+    { title: "Recover last session?", kind: "info" },
+  );
+
+  if (!recover) {
+    try {
+      await invoke("clear_best_result_command");
+    } catch (err) {
+      logLine(`could not clear saved best result: ${err}`);
+    }
+    return;
+  }
+
+  lastPartsById = best.parts_by_id;
+  const request = { sheets: best.sheets };
+  lastNestRequest = request;
+  el("history-row").hidden = true;
+  renderSnapshot(best, request);
+  el("panel-result").hidden = false;
+  logLine("recovered best result from a previous session");
+}
+tryRecoverBestResult();
 
 // Live per-generation stats while a nest run is in progress, emitted by
 // run_nest_command (see src-tauri/src/commands.rs's run_nest_with_progress)
@@ -470,6 +690,108 @@ window.__TAURI__.event.listen("nest-progress", (event) => {
   logLine(`gen ${p.generation}/${p.generations}: fitness=${p.best_fitness.toFixed(1)} sheets=${p.sheets_used} unplaced=${p.unplaced_count} util=${p.utilisation.toFixed(1)}%`);
   el("run-progress-fill").style.width = `${((100 * p.generation) / p.generations).toFixed(1)}%`;
 });
+
+// Fires far more often than "nest-progress" above - once up front and once
+// per individual placed, inside a single generation - so the console and
+// progress bar keep moving during a slow generation instead of sitting
+// still (a single individual's placement against real, non-trivial
+// geometry can take tens of seconds, and without this there was no signal
+// at all between "generation started" and "generation finished").
+window.__TAURI__.event.listen("nest-tick", (event) => {
+  const t = event.payload;
+  logLine(t.individuals_done === 0 ? `gen ${t.generation}: starting (${t.individuals_total} to place)...` : `gen ${t.generation}: ${t.individuals_done}/${t.individuals_total} individuals placed`);
+  if (currentGenerations > 0) {
+    const fraction = t.individuals_total > 0 ? t.individuals_done / t.individuals_total : 0;
+    const overall = ((t.generation - 1 + fraction) / currentGenerations) * 100;
+    el("run-progress-fill").style.width = `${overall.toFixed(1)}%`;
+  }
+});
+
+// Live preview - commented out (2026), never worked reliably; not deleted
+// so it's easy to pick back up later. See index.html's matching commented-
+// out #cfg-live-viz/#live-preview-section and src-tauri's
+// NestConfigDto::live_visualization/run_nest_with_progress (also commented
+// out) for the backend half of this.
+/*
+window.__TAURI__.event.listen("nest-live-start", (event) => {
+  if (!liveViewActive) return; // stale event from a run that already finished/failed
+  liveShapesById = event.payload;
+  liveSheetEls = {};
+  el("live-sheets").innerHTML = "";
+  el("live-caption").textContent = "";
+  logLine(`live preview: starting (${Object.keys(liveShapesById).length} part instance(s))`);
+});
+
+function renderLivePart(sheetIndex, part) {
+  if (!lastNestRequest) return;
+  const shape = liveShapesById[part.id];
+  if (!shape) return;
+
+  let sheetEl = liveSheetEls[sheetIndex];
+  if (!sheetEl) {
+    const sheetDto = lastNestRequest.sheets[sheetIndex];
+    const sheetBounds = boundsOf(sheetDto.points);
+    const { w, h } = sheetBounds;
+    const scale = Math.min(700 / Math.max(w, 1), 500 / Math.max(h, 1));
+
+    const wrapper = document.createElement("div");
+    wrapper.className = "sheet";
+    wrapper.innerHTML = `
+      <svg viewBox="0 0 ${w} ${h}" width="${(w * scale).toFixed(0)}" height="${(h * scale).toFixed(0)}">
+        <polygon points="${pointsToPath(toSvgPoints(sheetDto.points, sheetBounds))}" fill="none" stroke="#8a8a8a" stroke-width="${1 / scale}" />
+      </svg>
+      <div class="caption">SHEET ${sheetIndex} — <span data-count>0</span> part(s)</div>
+    `;
+    el("live-sheets").appendChild(wrapper);
+    sheetEl = { svg: wrapper.querySelector("svg"), sheetBounds, count: 0, caption: wrapper.querySelector("[data-count]") };
+    liveSheetEls[sheetIndex] = sheetEl;
+  }
+
+  const transform = (points) => toSvgPoints(rotatedTranslatedPoints(points, part.rotation, part.x, part.y), sheetEl.sheetBounds);
+  sheetEl.svg.insertAdjacentHTML("beforeend", renderShapeSvg(shape, transform));
+  sheetEl.count += 1;
+  sheetEl.caption.textContent = String(sheetEl.count);
+}
+
+function tickLiveQueue() {
+  if (liveQueue.length === 0) {
+    liveTicking = false;
+    return;
+  }
+  const item = liveQueue.shift();
+  switch (item.type) {
+    case "generation-start":
+      liveSheetEls = {};
+      el("live-sheets").innerHTML = "";
+      el("live-caption").textContent =
+        `GEN ${item.generation}/${item.generations} — fitness ${item.fitness.toFixed(1)}` +
+        (item.unplaced_count > 0 ? ` — ${item.unplaced_count} unplaced` : "");
+      break;
+    case "part-placed":
+      renderLivePart(item.sheet_index, item.part);
+      break;
+  }
+  setTimeout(tickLiveQueue, Number(el("cfg-live-viz-speed").value));
+}
+
+function ensureLiveTicking() {
+  if (liveTicking) return;
+  liveTicking = true;
+  tickLiveQueue();
+}
+
+window.__TAURI__.event.listen("nest-live-generation-result", (event) => {
+  if (!liveViewActive) return;
+  const { generation, generations, fitness, unplaced_count, placements } = event.payload;
+  liveQueue.push({ type: "generation-start", generation, generations, fitness, unplaced_count });
+  for (const sheetPlacement of placements) {
+    for (const part of sheetPlacement.parts) {
+      liveQueue.push({ type: "part-placed", sheet_index: sheetPlacement.sheet_index, part });
+    }
+  }
+  ensureLiveTicking();
+});
+*/
 
 // Drag-and-drop DXF import - Tauri delivers dropped-file paths as a core
 // window event (needs `dragDropEnabled: true` in tauri.conf.json's window

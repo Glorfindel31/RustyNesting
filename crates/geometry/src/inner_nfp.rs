@@ -110,6 +110,7 @@ mod tests {
             layer: "0".into(),
             is_circle: None,
             children: Vec::new(),
+            texts: Vec::new(),
         }
     }
 
@@ -120,12 +121,14 @@ mod tests {
             layer: "0".into(),
             is_circle: Some(Circle { cx: 0.0, cy: 0.0, r: 10.0 }),
             children: Vec::new(),
+            texts: Vec::new(),
         };
         let b = LayeredPolygon {
             points: crate::dxf_import::tessellate_circle(0.0, 0.0, 4.0, 0.01),
             layer: "0".into(),
             is_circle: Some(Circle { cx: 0.0, cy: 0.0, r: 4.0 }),
             children: Vec::new(),
+            texts: Vec::new(),
         };
 
         let result = inner_nfp(&a, &b, 0.01).expect("small circle should fit inside big circle");
@@ -163,6 +166,7 @@ mod tests {
             layer: "DRILL".into(),
             is_circle: None,
             children: Vec::new(),
+            texts: Vec::new(),
         };
         let mut a = square_layered(0.0, 0.0, 20.0);
         a.children.push(hole);

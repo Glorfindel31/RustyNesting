@@ -21,17 +21,38 @@
 //! **Not ported**: `mergedLength` accumulation in `recompute_totals` - see
 //! `nesting::placement`'s module doc for why `config.mergeLines`'s
 //! edge-merge bonus isn't tracked anywhere in this port yet.
+//!
+//! **Ejection-chain relocation (evicting one already-placed part to make
+//! room for another) was tried and reverted** - see `docs/PORT_STATUS.md`'s
+//! "Future directions" section for the measured result: a real 5-trial-each
+//! A/B benchmark against the actual 170-part fixture showed it made results
+//! *worse* (101.0 avg sheets/81.6% util vs 91.2 avg sheets/90.5% util
+//! without it, zero overlap between the two distributions across 10 total
+//! runs) - almost certainly because the extra nested search this file's own
+//! `MAX_TARGET_SHEETS_TRIED` loop would run per failing target sheet ate the
+//! wall-clock `deadline` budget that would otherwise go to many more simple,
+//! successful relocations.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 use geometry::dxf_import::{polygon_material_area, LayeredPolygon};
-use geometry::inner_nfp::inner_nfp;
 use geometry::polygon::polygon_area;
 
-use crate::placement::{try_place_part_on_sheet, PlacedPart, PlacementConfig, SheetPlacement};
+use crate::cache::NfpCache;
+use crate::placement::{cached_inner_nfp, sheet_source, try_place_part_on_sheet, PlacedObstacle, PlacedPart, PlacementConfig, SheetPlacement};
 
-const MAX_TARGET_SHEETS_TRIED: usize = 15;
+// Was 15 - too narrow a slice of a real ~100-sheet job's candidate sheets
+// (confirmed: converged well before the wall-clock deadline on the real
+// 170-part/103-sheet fixture, meaning this cap - not the deadline - was what
+// stopped it from finding more relocations). Raised now that a real NFP call
+// is ~microseconds to low-milliseconds on typical part sizes (see
+// `geometry::clipper::offset_bevel`'s doc comment for the point-count fix
+// that made that true) rather than the 15-20ms it cost before - trying
+// every sheet on a ~100-sheet job is cheap now, not a real budget risk. The
+// wall-clock `deadline` argument is still the real backstop regardless of
+// this number.
+const MAX_TARGET_SHEETS_TRIED: usize = 500;
 
 fn area_of_sheet(sheet_index: usize, sheets: &[LayeredPolygon]) -> f64 {
     polygon_area(&sheets[sheet_index].points).abs()
@@ -41,6 +62,7 @@ fn placed_area_of(entry: &SheetPlacement, parts_by_id: &HashMap<usize, LayeredPo
     entry.parts.iter().filter_map(|p| parts_by_id.get(&p.id)).map(|part| polygon_area(&part.points).abs()).sum()
 }
 
+#[derive(Clone, Debug)]
 pub struct RefineResult {
     pub allplacements: Vec<SheetPlacement>,
     pub changed: bool,
@@ -50,16 +72,40 @@ pub struct RefineResult {
 /// Port of `refineConsolidation`. `deadline` replaces the original's
 /// `deadlineMs` (a `Date.now()`-comparable timestamp) with an `Instant` -
 /// same wall-clock budget, just Rust's monotonic-clock idiom for it.
+///
+/// `cache` should be the same `NfpCache` the `place_parts` call that
+/// produced `allplacements` used - consolidation re-tries sheet/obstacle
+/// pairs placement already computed once, so reusing that cache (rather
+/// than starting a fresh one) turns a lot of this pass's own NFP work into
+/// cache hits too.
+#[must_use]
 pub fn refine_consolidation(
     mut allplacements: Vec<SheetPlacement>,
     parts_by_id: &HashMap<usize, LayeredPolygon>,
+    shape_ids: &HashMap<usize, usize>,
     sheets: &[LayeredPolygon],
     config: &PlacementConfig,
     deadline: Instant,
+    cache: &NfpCache,
 ) -> RefineResult {
+    // Cache-key identity: shared by every quantity-copy of the same
+    // original part (see `placement::NestPart::source_id`'s doc comment).
+    // Falls back to the instance id itself when `shape_ids` doesn't know
+    // better - today's exact behavior (every id is its own shape).
+    let source_id_of = |id: usize| shape_ids.get(&id).copied().unwrap_or(id);
+
     let mut changed = false;
     let mut hit_cap = false;
-    let max_iterations = allplacements.len().min(20);
+    // Was `.min(20)` - each successful pass typically relocates exactly one
+    // part before re-ranking and restarting (see the `break 'sources` below),
+    // so on a real ~100-sheet job this stopped after roughly 20 total
+    // relocations even when many more were profitable and time remained
+    // (confirmed: `hit_cap` was false on the real fixture at this cap, i.e.
+    // the wall-clock `deadline` - the actual intended backstop - wasn't what
+    // stopped it). Raised for the same reason `MAX_TARGET_SHEETS_TRIED` was:
+    // a real NFP call is cheap now (see `geometry::clipper::offset_bevel`'s
+    // doc comment), so many more passes fit in the same `deadline` budget.
+    let max_iterations = allplacements.len().min(500);
     let mut iterations = 0;
     let mut again = true;
 
@@ -95,12 +141,20 @@ pub fn refine_consolidation(
             // attempts most likely to fail, starving the small parts that
             // actually fit the leftover gaps out of a turn before the
             // deadline hits.
+            // Decorate-sort-undecorate: `ranked` above already precomputes
+            // its sort key once per element instead of recomputing it on
+            // every comparison - this sort didn't, despite the same
+            // function doing it correctly six lines up.
             let mut candidate_parts: Vec<PlacedPart> = allplacements[source_pos].parts.clone();
-            candidate_parts.sort_by(|a, b| {
-                let area_a = parts_by_id.get(&a.id).map_or(0.0, |p| polygon_area(&p.points).abs());
-                let area_b = parts_by_id.get(&b.id).map_or(0.0, |p| polygon_area(&p.points).abs());
-                area_a.total_cmp(&area_b)
-            });
+            let mut candidates_with_area: Vec<(PlacedPart, f64)> = candidate_parts
+                .into_iter()
+                .map(|p| {
+                    let area = parts_by_id.get(&p.id).map_or(0.0, |g| polygon_area(&g.points).abs());
+                    (p, area)
+                })
+                .collect();
+            candidates_with_area.sort_by(|(_, area_a), (_, area_b)| area_a.total_cmp(area_b));
+            candidate_parts = candidates_with_area.into_iter().map(|(p, _)| p).collect();
 
             let mut moved_any = false;
 
@@ -149,21 +203,26 @@ pub fn refine_consolidation(
                     tried_this_part += 1;
 
                     let target_sheet = &sheets[target_sheet_index];
-                    let target_geoms: Option<Vec<LayeredPolygon>> =
-                        allplacements[target_pos].parts.iter().map(|p| parts_by_id.get(&p.id).cloned()).collect();
-                    let Some(target_geoms) = target_geoms else {
+                    let target_obstacles: Option<Vec<PlacedObstacle>> = allplacements[target_pos]
+                        .parts
+                        .iter()
+                        .map(|p| parts_by_id.get(&p.id).map(|geom| PlacedObstacle { polygon: geom.clone(), id: p.id, source_id: source_id_of(p.id), rotation: p.rotation, placement: p.placement }))
+                        .collect();
+                    let Some(target_obstacles) = target_obstacles else {
                         continue;
                     };
-                    let target_placements: Vec<_> = allplacements[target_pos].parts.iter().map(|p| p.placement).collect();
 
-                    let Some(sheet_nfp) = inner_nfp(target_sheet, part_geom, config.curve_tolerance) else {
+                    let Some(sheet_nfp) =
+                        cached_inner_nfp(cache, target_sheet, &sheet_source(target_sheet_index), part_geom, source_id_of(candidate.id), candidate.rotation, config.curve_tolerance)
+                    else {
                         continue;
                     };
                     if sheet_nfp.is_empty() {
                         continue;
                     }
 
-                    let Some(result) = try_place_part_on_sheet(part_geom, &sheet_nfp, target_sheet, &target_geoms, &target_placements, config)
+                    let Some(result) = try_place_part_on_sheet(part_geom, source_id_of(candidate.id), candidate.rotation, &sheet_nfp, target_sheet, &target_obstacles, config, cache)
+                        .placed()
                     else {
                         continue;
                     };
@@ -206,6 +265,7 @@ pub fn refine_consolidation(
     RefineResult { allplacements, changed, hit_cap }
 }
 
+#[derive(Clone, Copy, Debug)]
 pub struct Totals {
     pub total_placed_area: f64,
     pub total_usable_sheet_area: f64,
@@ -217,6 +277,7 @@ pub struct Totals {
 /// is deliberately not touched here (refinement only ever relocates
 /// already-successfully-placed parts between already-open sheets, it never
 /// un-places anything, so the original value still holds).
+#[must_use]
 pub fn recompute_totals(allplacements: &[SheetPlacement], parts_by_id: &HashMap<usize, LayeredPolygon>, sheets: &[LayeredPolygon]) -> Totals {
     let mut total_usable_sheet_area = 0.0;
     let mut total_placed_area = 0.0;
@@ -246,6 +307,7 @@ mod tests {
             layer: "0".into(),
             is_circle: None,
             children: Vec::new(),
+            texts: Vec::new(),
         }
     }
 
@@ -273,15 +335,16 @@ mod tests {
         // margin, draining sheet 1 to empty and letting it be removed.
         let sheets = vec![square(1000.0), square(1000.0)];
         let parts = vec![
-            NestPart { id: 0, polygon: square(950.0), rotation: 0.0 },
-            NestPart { id: 1, polygon: square(20.0), rotation: 0.0 },
+            NestPart { id: 0, source_id: 0, polygon: square(950.0), rotation: 0.0 },
+            NestPart { id: 1, source_id: 1, polygon: square(20.0), rotation: 0.0 },
         ];
-        let result = place_parts(&sheets, parts, &config());
+        let cache = NfpCache::new();
+        let result = place_parts(&sheets, parts, &config(), &cache, &|| false, &|_, _| {}).unwrap();
         assert_eq!(result.placements.len(), 2, "sanity: parts start on separate sheets");
 
         let parts_by_id: HashMap<usize, LayeredPolygon> = HashMap::from([(0, square(950.0)), (1, square(20.0))]);
 
-        let refined = refine_consolidation(result.placements, &parts_by_id, &sheets, &config(), far_future());
+        let refined = refine_consolidation(result.placements, &parts_by_id, &HashMap::new(), &sheets, &config(), far_future(), &cache);
 
         assert!(refined.changed);
         assert_eq!(refined.allplacements.len(), 1, "sheet 1 should have drained and been removed");
@@ -294,14 +357,15 @@ mod tests {
         // the whole sheet - nothing can move anywhere.
         let sheets = vec![square(50.0), square(50.0)];
         let parts = vec![
-            NestPart { id: 0, polygon: square(48.0), rotation: 0.0 },
-            NestPart { id: 1, polygon: square(48.0), rotation: 0.0 },
+            NestPart { id: 0, source_id: 0, polygon: square(48.0), rotation: 0.0 },
+            NestPart { id: 1, source_id: 1, polygon: square(48.0), rotation: 0.0 },
         ];
-        let result = place_parts(&sheets, parts, &config());
+        let cache = NfpCache::new();
+        let result = place_parts(&sheets, parts, &config(), &cache, &|| false, &|_, _| {}).unwrap();
         assert_eq!(result.placements.len(), 2, "sanity: 48+48 > 50, both parts can't share one sheet");
         let parts_by_id: HashMap<usize, LayeredPolygon> = HashMap::from([(0, square(48.0)), (1, square(48.0))]);
 
-        let refined = refine_consolidation(result.placements, &parts_by_id, &sheets, &config(), far_future());
+        let refined = refine_consolidation(result.placements, &parts_by_id, &HashMap::new(), &sheets, &config(), far_future(), &cache);
 
         assert!(!refined.changed);
         assert_eq!(refined.allplacements.len(), 2);
@@ -311,14 +375,15 @@ mod tests {
     fn respects_an_already_passed_deadline() {
         let sheets = vec![square(100.0), square(100.0)];
         let parts = vec![
-            NestPart { id: 0, polygon: square(90.0), rotation: 0.0 },
-            NestPart { id: 1, polygon: square(10.0), rotation: 0.0 },
+            NestPart { id: 0, source_id: 0, polygon: square(90.0), rotation: 0.0 },
+            NestPart { id: 1, source_id: 1, polygon: square(10.0), rotation: 0.0 },
         ];
-        let result = place_parts(&sheets, parts, &config());
+        let cache = NfpCache::new();
+        let result = place_parts(&sheets, parts, &config(), &cache, &|| false, &|_, _| {}).unwrap();
         let parts_by_id: HashMap<usize, LayeredPolygon> = HashMap::from([(0, square(90.0)), (1, square(10.0))]);
 
         let already_past = Instant::now() - std::time::Duration::from_secs(1);
-        let refined = refine_consolidation(result.placements, &parts_by_id, &sheets, &config(), already_past);
+        let refined = refine_consolidation(result.placements, &parts_by_id, &HashMap::new(), &sheets, &config(), already_past, &cache);
 
         assert!(refined.hit_cap);
         assert!(!refined.changed);

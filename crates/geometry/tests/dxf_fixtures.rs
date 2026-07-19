@@ -107,6 +107,7 @@ fn inner_nfp_general_fallback_works_against_real_drilled_profiles() {
             layer: "0".into(),
             is_circle: None,
             children: Vec::new(),
+            texts: Vec::new(),
         };
 
         // must not panic - the actual result (Some or None) is real data

@@ -31,6 +31,7 @@ use crate::point::Point;
 use crate::polygon::{almost_equal, point_in_polygon, polygon_area, within_distance};
 use crate::simplify::simplify as dp_simplify;
 
+#[derive(Clone, Copy, Debug)]
 pub struct SimplifyConfig {
     pub curve_tolerance: f64,
     /// Matches `config.simplify` - when set, skip the whole pipeline below
@@ -93,8 +94,10 @@ fn get_target(o: Point, simple: &[Point], simple_exact: &[bool], tol: f64) -> Po
         if !exact_only.is_empty() {
             in_range = exact_only;
         }
-        in_range.sort_by(|a, b| a.1.total_cmp(&b.1));
-        simple[in_range[0].0]
+        // Only the closest candidate is ever used - a full sort just to
+        // read index 0 is O(n log n) where the minimum alone is O(n).
+        let (closest, _) = in_range.into_iter().min_by(|a, b| a.1.total_cmp(&b.1)).expect("just checked non-empty above");
+        simple[closest]
     } else {
         simple
             .iter()
@@ -212,23 +215,25 @@ pub fn simplify_polygon(polygon: &[Point], inside: bool, config: &SimplifyConfig
         let o = offset[i];
         let target = get_target(o, &simple, &simple_exact, 2.0 * tolerance);
 
-        let mut test = offset.clone();
-        test[i] = target;
-        if !is_exterior(&test, &polygon, inside, tiny_tolerance) {
-            offset[i] = target;
+        // Mutate the one point in place and revert it on failure, instead
+        // of cloning the entire `offset` vector just to test a single-point
+        // change (O(n) per candidate, O(n^2) total across this loop, for a
+        // check that only ever inspects one changed element).
+        offset[i] = target;
+        if !is_exterior(&offset, &polygon, inside, tiny_tolerance) {
             continue;
         }
+        offset[i] = o;
 
         for (j, shell_slot) in shells.iter().enumerate().take(numshells).skip(1) {
             let Some(shell) = shell_slot else { continue };
             let delta = j as f64 * (tolerance / numshells as f64);
             let target = get_target(o, shell, &vec![false; shell.len()], 2.0 * delta);
-            let mut test = offset.clone();
-            test[i] = target;
-            if !is_exterior(&test, &polygon, inside, tiny_tolerance) {
-                offset[i] = target;
+            offset[i] = target;
+            if !is_exterior(&offset, &polygon, inside, tiny_tolerance) {
                 break;
             }
+            offset[i] = o;
         }
     }
 

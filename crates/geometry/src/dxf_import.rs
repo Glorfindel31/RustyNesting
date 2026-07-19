@@ -14,12 +14,48 @@
 //! docs/PORT_STATUS.md rather than attempted half-correct here. The older
 //! heavyweight `POLYLINE` entity (pre-LWPOLYLINE, vertices as separate linked
 //! entities) is also not yet supported.
+//!
+//! **`TEXT`/`MTEXT` are carried through, not converted to profiles**: these
+//! entities have no closed boundary (nothing to nest against), so they don't
+//! become `LayeredPolygon` nodes themselves - they're attached to whichever
+//! profile's boundary contains their insertion point (`attach_texts`, reusing
+//! the exact same containment logic `build_polygon_tree` already uses for
+//! hole nesting) and carried in that node's own `texts` field. This is what
+//! makes a part's engraved label/part-number move and rotate correctly with
+//! it through nesting - `rotate_layered_polygon`/`shift_layered_polygon`
+//! transform `texts` right alongside `points`/`children`, and
+//! `dxf_export::add_node` writes them back out on export. A text entity
+//! whose insertion point falls outside every profile (no containing shape at
+//! all) is dropped - there's no "ownerless floating annotation" concept
+//! anywhere else in this pipeline for it to attach to.
 
 use dxf::entities::{Entity, EntityType};
 
 use crate::circular_nfp::Circle;
 use crate::point::Point;
 use crate::polygon::{get_polygon_bounds, point_in_polygon, polygon_area, Bounds};
+
+/// One `TEXT`/`MTEXT` entity, reduced to the fields that matter for
+/// nesting: where it sits and how it's oriented (both of which must move
+/// with whatever part it's attached to), its content, and its height (font
+/// size scales with the drawing, not with the part's rotation, so it's
+/// carried through unchanged). `is_multiline` records which DXF entity type
+/// it came from, so export can round-trip it as the same kind rather than
+/// silently converting every text to a single-line `TEXT`; DXF-specific
+/// formatting beyond that (columns, background fill, text style) isn't
+/// preserved - a real simplification, not a bug, matching this module's
+/// existing "reduce to what nesting needs" approach for circles.
+#[derive(Clone, Debug)]
+pub struct TextAnnotation {
+    pub position: Point,
+    /// Degrees. Note this is already normalized to DXF `TEXT`'s convention
+    /// even for text parsed from an `MTEXT` entity - see `entity_to_text`'s
+    /// doc comment for the radians-vs-degrees quirk between the two.
+    pub rotation_deg: f64,
+    pub height: f64,
+    pub value: String,
+    pub is_multiline: bool,
+}
 
 /// A closed profile extracted from one or more DXF entities, tagged with its
 /// source layer and (for holes) nested children. Mirrors the `.children` /
@@ -30,6 +66,9 @@ pub struct LayeredPolygon {
     pub layer: String,
     pub is_circle: Option<Circle>,
     pub children: Vec<LayeredPolygon>,
+    /// Text/label entities whose insertion point falls inside this specific
+    /// node's boundary - see `attach_texts`.
+    pub texts: Vec<TextAnnotation>,
 }
 
 impl LayeredPolygon {
@@ -39,6 +78,7 @@ impl LayeredPolygon {
             layer,
             is_circle,
             children: Vec::new(),
+            texts: Vec::new(),
         }
     }
 }
@@ -62,12 +102,28 @@ pub fn rotate_layered_polygon(poly: &LayeredPolygon, degrees: f64) -> LayeredPol
         cy: c.cx * sin + c.cy * cos,
         r: c.r,
     });
+    // Text rotates the same way a circle's center does (position) plus its
+    // own rotation angle accumulates - a label glued to a part must end up
+    // reading in the same direction relative to the part, no matter how
+    // many times the part itself gets rotated during placement search.
+    let texts = poly
+        .texts
+        .iter()
+        .map(|t| TextAnnotation {
+            position: Point::new(t.position.x * cos - t.position.y * sin, t.position.x * sin + t.position.y * cos),
+            rotation_deg: (t.rotation_deg + degrees).rem_euclid(360.0),
+            height: t.height,
+            value: t.value.clone(),
+            is_multiline: t.is_multiline,
+        })
+        .collect();
 
     LayeredPolygon {
         points,
         layer: poly.layer.clone(),
         is_circle,
         children,
+        texts,
     }
 }
 
@@ -84,12 +140,18 @@ pub fn shift_layered_polygon(poly: &LayeredPolygon, dx: f64, dy: f64) -> Layered
     let points = poly.points.iter().map(|p| Point::new(p.x + dx, p.y + dy)).collect();
     let children = poly.children.iter().map(|c| shift_layered_polygon(c, dx, dy)).collect();
     let is_circle = poly.is_circle.map(|c| Circle { cx: c.cx + dx, cy: c.cy + dy, r: c.r });
+    let texts = poly
+        .texts
+        .iter()
+        .map(|t| TextAnnotation { position: Point::new(t.position.x + dx, t.position.y + dy), ..t.clone() })
+        .collect();
 
     LayeredPolygon {
         points,
         layer: poly.layer.clone(),
         is_circle,
         children,
+        texts,
     }
 }
 
@@ -180,8 +242,7 @@ fn tessellate_bulge(p0: Point, p1: Point, bulge: f64, tolerance: f64) -> Vec<Poi
         .collect()
 }
 
-fn lwpolyline_to_points(poly: &dxf::entities::LwPolyline, tolerance: f64) -> Vec<Point> {
-    let verts = &poly.vertices;
+fn lwpolyline_to_points(verts: &[dxf::LwPolylineVertex], is_closed: bool, tolerance: f64) -> Vec<Point> {
     let mut points = Vec::with_capacity(verts.len());
     let n = verts.len();
 
@@ -192,7 +253,7 @@ fn lwpolyline_to_points(poly: &dxf::entities::LwPolyline, tolerance: f64) -> Vec
         // only emit the arc between this vertex and the next if there IS a
         // next vertex to connect to (the last vertex only connects onward
         // when the polyline is closed, wrapping back to vertex 0)
-        let has_next = i + 1 < n || poly.is_closed();
+        let has_next = i + 1 < n || is_closed;
         if has_next && verts[i].bulge != 0.0 {
             let next = &verts[if i + 1 < n { i + 1 } else { 0 }];
             let p1 = Point::new(next.x, next.y);
@@ -201,6 +262,25 @@ fn lwpolyline_to_points(poly: &dxf::entities::LwPolyline, tolerance: f64) -> Vec
     }
 
     points
+}
+
+/// True if `poly`'s DXF closed flag is unset but its own vertex list already
+/// closes itself by repeating the first vertex's coordinates as the last -
+/// a real-world export quirk (confirmed against
+/// github.com/christianp/aperiodic-monotile's `hat-monotile.dxf`: a tool
+/// that emits an "open" polyline but duplicates the first point at the end
+/// instead of setting the closed bit and omitting the duplicate). The
+/// duplicate point itself must still be dropped before treating the loop as
+/// closed - see the `entity_to_polygon` call site.
+fn closes_itself_by_duplicate_point(poly: &dxf::entities::LwPolyline) -> bool {
+    if poly.is_closed() {
+        return false;
+    }
+    let verts = &poly.vertices;
+    match (verts.first(), verts.last()) {
+        (Some(first), Some(last)) if verts.len() >= 4 => (first.x - last.x).abs() < 1e-9 && (first.y - last.y).abs() < 1e-9,
+        _ => false,
+    }
 }
 
 /// True if an ARC's angular sweep is a full circle (some DXF exporters
@@ -219,7 +299,18 @@ pub fn entity_to_polygon(entity: &Entity, curve_tolerance: f64) -> Option<Layere
 
     match &entity.specific {
         EntityType::LwPolyline(poly) if poly.is_closed() => {
-            let points = lwpolyline_to_points(poly, curve_tolerance);
+            let points = lwpolyline_to_points(&poly.vertices, true, curve_tolerance);
+            if points.len() < 3 {
+                return None;
+            }
+            Some(LayeredPolygon::new(points, layer, None))
+        }
+        EntityType::LwPolyline(poly) if closes_itself_by_duplicate_point(poly) => {
+            // Drop the redundant closing vertex (identical to the first)
+            // before treating the loop as closed - otherwise it'd produce a
+            // zero-length final edge back to vertex 0.
+            let verts = &poly.vertices[..poly.vertices.len() - 1];
+            let points = lwpolyline_to_points(verts, true, curve_tolerance);
             if points.len() < 3 {
                 return None;
             }
@@ -257,6 +348,43 @@ pub fn entities_to_polygons<'a>(
     entities
         .filter_map(|e| entity_to_polygon(e, curve_tolerance))
         .collect()
+}
+
+/// Converts one `TEXT`/`MTEXT` entity into a `TextAnnotation`, if it is one.
+///
+/// **DXF rotation-unit quirk, load-bearing, easy to get backwards**: `TEXT`'s
+/// group code 50 (`rotation`) is in **degrees**, but `MTEXT`'s group code 50
+/// (`rotation_angle`) is in **radians** - same group code, different unit,
+/// per the DXF reference. `TextAnnotation::rotation_deg` always normalizes to
+/// degrees regardless of source entity, so every other function in this
+/// module (`rotate_layered_polygon`, export) can treat rotation uniformly
+/// without needing to know which entity type a given text came from.
+fn entity_to_text(entity: &Entity) -> Option<TextAnnotation> {
+    match &entity.specific {
+        EntityType::Text(text) => Some(TextAnnotation {
+            position: Point::new(text.location.x, text.location.y),
+            rotation_deg: text.rotation,
+            height: text.text_height,
+            value: text.value.clone(),
+            is_multiline: false,
+        }),
+        EntityType::MText(mtext) => Some(TextAnnotation {
+            position: Point::new(mtext.insertion_point.x, mtext.insertion_point.y),
+            rotation_deg: mtext.rotation_angle.to_degrees(),
+            height: mtext.initial_text_height,
+            value: mtext.text.clone(),
+            is_multiline: true,
+        }),
+        _ => None,
+    }
+}
+
+/// Extracts every `TEXT`/`MTEXT` entity in `entities` - the counterpart to
+/// `entities_to_polygons` for the entity kinds that carry no closed profile
+/// of their own. Attach the result to a built polygon tree via
+/// `attach_texts`.
+pub fn entities_to_texts<'a>(entities: impl Iterator<Item = &'a Entity>) -> Vec<TextAnnotation> {
+    entities.filter_map(entity_to_text).collect()
 }
 
 /// True if `candidate`'s first point lies inside `container` (containment
@@ -321,6 +449,21 @@ pub fn build_polygon_tree(mut flat: Vec<LayeredPolygon>) -> Vec<LayeredPolygon> 
     roots
 }
 
+/// Attaches each text to whichever node in `roots` most tightly contains its
+/// insertion point - reuses `find_container_path`'s exact containment/depth
+/// logic (a single-point "candidate" is a degenerate case it already handles
+/// correctly, since `contains` only ever reads the candidate's first point).
+/// A text whose insertion point falls outside every profile is dropped - see
+/// the module doc comment for why.
+pub fn attach_texts(roots: &mut [LayeredPolygon], texts: Vec<TextAnnotation>) {
+    for text in texts {
+        let path = find_container_path(roots, std::slice::from_ref(&text.position));
+        if !path.is_empty() {
+            get_mut_by_path(roots, &path).texts.push(text);
+        }
+    }
+}
+
 /// Port of the plan's "oversized-part bbox check": true if `part`'s bounds
 /// don't fit within `sheet_bounds` in either dimension (part can never be
 /// placed on this sheet in any rotation-free orientation).
@@ -329,6 +472,23 @@ pub fn is_oversized(part: &[Point], sheet_bounds: Bounds) -> bool {
         Some(b) => b.width > sheet_bounds.width || b.height > sheet_bounds.height,
         None => false,
     }
+}
+
+/// Port of `getOversizedParts`'s "either orientation" check
+/// (`frontend/ui/services/nesting.service.js`): true only if `part` is too
+/// large for `sheet_bounds` at *every* angle in the `rotations`-step grid,
+/// not just its as-imported orientation - a long thin part that's wider
+/// than the sheet at rotation 0 but fits fine rotated 90 degrees must not
+/// read as oversized. `is_oversized` itself stays the single-orientation
+/// primitive this builds on.
+pub fn is_oversized_at_any_rotation(part: &[Point], sheet_bounds: Bounds, rotations: u32) -> bool {
+    let step = 2.0 * std::f64::consts::PI / rotations.max(1) as f64;
+    (0..rotations.max(1)).all(|i| {
+        let angle = step * i as f64;
+        let (sin, cos) = angle.sin_cos();
+        let rotated: Vec<Point> = part.iter().map(|p| Point::new(p.x * cos - p.y * sin, p.x * sin + p.y * cos)).collect();
+        is_oversized(&rotated, sheet_bounds)
+    })
 }
 
 #[cfg(test)]
@@ -414,6 +574,28 @@ mod tests {
         poly.set_is_closed(false);
         let e = entity("0", EntityType::LwPolyline(poly));
         assert!(entity_to_polygon(&e, 0.1).is_none());
+    }
+
+    /// The real-world export quirk confirmed against
+    /// github.com/christianp/aperiodic-monotile's `hat-monotile.dxf`: closed
+    /// bit unset, but the first vertex's coordinates are manually repeated
+    /// as the last. Must still convert, and the duplicate must not survive
+    /// into the output (a triangle has 3 points, not 4).
+    #[test]
+    fn open_lwpolyline_that_repeats_its_first_point_is_still_closed() {
+        let mut poly = LwPolyline {
+            vertices: vec![
+                LwPolylineVertex { x: 0.0, y: 0.0, bulge: 0.0, ..Default::default() },
+                LwPolylineVertex { x: 10.0, y: 0.0, bulge: 0.0, ..Default::default() },
+                LwPolylineVertex { x: 5.0, y: 10.0, bulge: 0.0, ..Default::default() },
+                LwPolylineVertex { x: 0.0, y: 0.0, bulge: 0.0, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        poly.set_is_closed(false);
+        let e = entity("0", EntityType::LwPolyline(poly));
+        let converted = entity_to_polygon(&e, 0.1).expect("should convert despite the unset closed bit");
+        assert_eq!(converted.points.len(), 3, "the duplicated closing point must be dropped");
     }
 
     #[test]
@@ -520,5 +702,124 @@ mod tests {
             Point::new(0.0, 10.0),
         ];
         assert!(!is_oversized(&small_sheet_fitting_part, sheet));
+    }
+
+    /// The exact case `is_oversized` alone gets wrong: a long thin part
+    /// that's wider than the sheet at rotation 0 but fits fine rotated 90
+    /// degrees.
+    #[test]
+    fn is_oversized_at_any_rotation_tries_rotating_before_giving_up() {
+        let long_thin_part = [Point::new(0.0, 0.0), Point::new(80.0, 0.0), Point::new(80.0, 10.0), Point::new(0.0, 10.0)];
+        let sheet = Bounds { x: 0.0, y: 0.0, width: 50.0, height: 100.0 };
+
+        assert!(is_oversized(&long_thin_part, sheet), "80x10 shouldn't fit a 50-wide sheet at rotation 0");
+        assert!(!is_oversized_at_any_rotation(&long_thin_part, sheet, 4), "rotated 90 degrees it's 10x80, which fits a 50x100 sheet");
+    }
+
+    fn square_layered(x: f64, y: f64, size: f64, layer: &str) -> LayeredPolygon {
+        LayeredPolygon::new(
+            vec![Point::new(x, y), Point::new(x + size, y), Point::new(x + size, y + size), Point::new(x, y + size)],
+            layer.to_string(),
+            None,
+        )
+    }
+
+    #[test]
+    fn text_entity_converts_with_degrees_rotation_unchanged() {
+        let e = entity(
+            "LABEL",
+            EntityType::Text(dxf::entities::Text {
+                location: DxfPoint::new(3.0, 4.0, 0.0),
+                value: "PART-42".to_string(),
+                rotation: 90.0,
+                text_height: 2.5,
+                ..Default::default()
+            }),
+        );
+
+        let text = entity_to_text(&e).expect("TEXT should convert");
+        assert_eq!(text.value, "PART-42");
+        assert_eq!(text.position, Point::new(3.0, 4.0));
+        assert_eq!(text.rotation_deg, 90.0, "TEXT's own rotation is already in degrees - no conversion should happen");
+        assert_eq!(text.height, 2.5);
+        assert!(!text.is_multiline);
+    }
+
+    #[test]
+    fn mtext_entity_converts_radians_rotation_to_degrees() {
+        // MTEXT's group code 50 is in RADIANS, unlike TEXT's - this is the
+        // load-bearing quirk entity_to_text's doc comment calls out.
+        let e = entity(
+            "LABEL",
+            EntityType::MText(dxf::entities::MText {
+                insertion_point: DxfPoint::new(1.0, 2.0, 0.0),
+                text: "HELLO".to_string(),
+                rotation_angle: std::f64::consts::FRAC_PI_2, // 90 degrees, in radians
+                initial_text_height: 5.0,
+                ..Default::default()
+            }),
+        );
+
+        let text = entity_to_text(&e).expect("MTEXT should convert");
+        assert_eq!(text.value, "HELLO");
+        assert!((text.rotation_deg - 90.0).abs() < 1e-9, "rotation_deg was {}", text.rotation_deg);
+        assert!(text.is_multiline);
+    }
+
+    #[test]
+    fn non_text_entity_does_not_convert() {
+        let e = entity("0", EntityType::Circle(DxfCircle { center: DxfPoint::origin(), radius: 1.0, ..Default::default() }));
+        assert!(entity_to_text(&e).is_none());
+    }
+
+    #[test]
+    fn attach_texts_attaches_to_the_tightest_containing_shape() {
+        // Outer 20x20 square with a 4x4 part inside it - a text sitting
+        // inside the small part must attach there, not to the outer square,
+        // even though both contain the text's position.
+        let mut roots = vec![square_layered(0.0, 0.0, 20.0, "SHEET")];
+        roots[0].children.push(square_layered(2.0, 2.0, 4.0, "CUT"));
+
+        let text = TextAnnotation { position: Point::new(3.0, 3.0), rotation_deg: 0.0, height: 1.0, value: "X".into(), is_multiline: false };
+        attach_texts(&mut roots, vec![text]);
+
+        assert!(roots[0].texts.is_empty(), "text belongs to the inner part, not the outer sheet");
+        assert_eq!(roots[0].children[0].texts.len(), 1, "text should attach to the smaller containing part");
+        assert_eq!(roots[0].children[0].texts[0].value, "X");
+    }
+
+    #[test]
+    fn attach_texts_drops_a_text_with_no_containing_shape() {
+        let mut roots = vec![square_layered(0.0, 0.0, 10.0, "CUT")];
+        let text = TextAnnotation { position: Point::new(500.0, 500.0), rotation_deg: 0.0, height: 1.0, value: "LOST".into(), is_multiline: false };
+
+        attach_texts(&mut roots, vec![text]); // must not panic
+
+        assert!(roots[0].texts.is_empty());
+    }
+
+    #[test]
+    fn rotate_layered_polygon_rotates_the_attached_texts_position_and_angle() {
+        let mut poly = square_layered(-1.0, -1.0, 2.0, "CUT"); // centered on origin
+        poly.texts.push(TextAnnotation { position: Point::new(1.0, 0.0), rotation_deg: 0.0, height: 1.0, value: "T".into(), is_multiline: false });
+
+        let rotated = rotate_layered_polygon(&poly, 90.0);
+
+        let text = &rotated.texts[0];
+        assert!(text.position.x.abs() < 1e-9, "x was {}", text.position.x);
+        assert!((text.position.y - 1.0).abs() < 1e-9, "y was {}", text.position.y);
+        assert!((text.rotation_deg - 90.0).abs() < 1e-9, "a part's own rotation should accumulate onto the text's rotation");
+    }
+
+    #[test]
+    fn shift_layered_polygon_shifts_the_attached_texts_position_only() {
+        let mut poly = square_layered(0.0, 0.0, 10.0, "CUT");
+        poly.texts.push(TextAnnotation { position: Point::new(1.0, 1.0), rotation_deg: 45.0, height: 1.0, value: "T".into(), is_multiline: false });
+
+        let shifted = shift_layered_polygon(&poly, 5.0, -2.0);
+
+        let text = &shifted.texts[0];
+        assert_eq!(text.position, Point::new(6.0, -1.0));
+        assert_eq!(text.rotation_deg, 45.0, "shifting must not touch rotation");
     }
 }

@@ -53,52 +53,11 @@
                 <th>PREVIEW</th>
                 <th>ROLE</th>
                 <th>QTY</th>
+                <th title="Whether this part alone would take up enough of a sheet (per the DOMINANT AREA setting below) to close that sheet immediately after being placed - it still gets placed, just without any neighbors.">DOMINANT?</th>
               </tr>
             </thead>
             <tbody id="shapes-body"></tbody>
           </table>
-        </div>
-      </section>
-
-      <section class="panel" id="panel-config" hidden>
-        <h2>03 / CONFIGURE</h2>
-        <div class="row">
-          <label for="cfg-placement-type" title="How the program judges where to slide a piece into place. GRAVITY: let pieces settle toward a corner, like Tetris. BOX: try to keep everything placed so far inside as small a rectangle as possible. CONVEX HULL: judge by the simplified outer shape wrapped around everything placed so far.">PLACEMENT</label>
-          <select id="cfg-placement-type" title="How the program judges where to slide a piece into place. GRAVITY: let pieces settle toward a corner, like Tetris. BOX: try to keep everything placed so far inside as small a rectangle as possible. CONVEX HULL: judge by the simplified outer shape wrapped around everything placed so far.">
-            <option value="gravity">GRAVITY</option>
-            <option value="box">BOX</option>
-            <option value="convexhull">CONVEX HULL</option>
-          </select>
-          <label for="cfg-rotations" title="How many different angles the program is allowed to try for each piece before giving up on fitting it. More angles = better chance of a good fit, but slower.">ROTATIONS</label>
-          <input id="cfg-rotations" type="number" value="4" min="1" step="1" title="How many different angles the program is allowed to try for each piece before giving up on fitting it. More angles = better chance of a good fit, but slower." />
-          <label for="cfg-population" title="How many different full arrangements ('attempts') the program tries and compares side by side in every round. More attempts = better results, but each round takes longer.">POPULATION</label>
-          <input id="cfg-population" type="number" value="10" min="2" step="1" title="How many different full arrangements ('attempts') the program tries and compares side by side in every round. More attempts = better results, but each round takes longer." />
-        </div>
-        <div class="row">
-          <label for="cfg-mutation" title="The chance that a small random change (swap two pieces' order, or reroll one piece's rotation) gets made when mixing two good attempts together to make a new one. Keeps the search from getting stuck repeating itself.">MUTATION %</label>
-          <input id="cfg-mutation" type="number" value="10" min="0" max="100" step="1" title="The chance that a small random change (swap two pieces' order, or reroll one piece's rotation) gets made when mixing two good attempts together to make a new one. Keeps the search from getting stuck repeating itself." />
-          <label for="cfg-generations" title="How many rounds of 'try a bunch of attempts, keep the best, breed a new batch, repeat' to run. More rounds = better packing, but takes longer.">GENERATIONS</label>
-          <input id="cfg-generations" type="number" value="5" min="1" step="1" title="How many rounds of 'try a bunch of attempts, keep the best, breed a new batch, repeat' to run. More rounds = better packing, but takes longer." />
-          <label for="cfg-dominant" title="If one piece alone takes up more than this fraction of a sheet (0.9 = 90%), the program stops trying to fit more onto that sheet and starts a fresh one, since there's basically no room left anyway.">DOMINANT AREA</label>
-          <input id="cfg-dominant" type="number" value="0.9" min="0.01" max="1" step="0.01" title="If one piece alone takes up more than this fraction of a sheet (0.9 = 90%), the program stops trying to fit more onto that sheet and starts a fresh one, since there's basically no room left anyway." />
-        </div>
-        <div class="row">
-          <label for="cfg-margin" title="Minimum empty gap kept between a piece and the true edge of the sheet - e.g. so a cutting tool has room to run without going off the material. Set to 0 for jobs where the tool can safely overhang the edge (like most laser cutting).">MARGIN (mm)</label>
-          <input id="cfg-margin" type="number" value="0" min="0" step="0.1" title="Minimum empty gap kept between a piece and the true edge of the sheet - e.g. so a cutting tool has room to run without going off the material. Set to 0 for jobs where the tool can safely overhang the edge (like most laser cutting)." />
-          <label for="cfg-spacing" title="Minimum gap kept between two pieces placed next to each other, so a cutting tool fits between them and they don't touch. Set to 0 if pieces can be placed edge-to-edge with no gap at all.">SPACING (mm)</label>
-          <input id="cfg-spacing" type="number" value="0" min="0" step="0.1" title="Minimum gap kept between two pieces placed next to each other, so a cutting tool fits between them and they don't touch. Set to 0 if pieces can be placed edge-to-edge with no gap at all." />
-        </div>
-        <div class="row">
-          <label for="cfg-max-threads" title="How many CPU cores the program is allowed to use at once while it searches for a good packing. 0 = use every core your computer has (fastest). Set a lower number to leave some CPU free for other programs while it runs.">MAX CPU THREADS</label>
-          <input id="cfg-max-threads" type="number" value="0" min="0" step="1" title="How many CPU cores the program is allowed to use at once while it searches for a good packing. 0 = use every core your computer has (fastest). Set a lower number to leave some CPU free for other programs while it runs." />
-        </div>
-        <div class="row">
-          <button id="btn-run" class="primary">RUN NEST</button>
-          <span class="spinner" id="run-spinner" hidden></span>
-          <span class="status" id="run-status"></span>
-        </div>
-        <div class="progress" id="run-progress" hidden>
-          <div class="progress-fill" id="run-progress-fill"></div>
         </div>
       </section>
 
@@ -115,6 +74,14 @@
         </div>
         <div id="sheets"></div>
 
+        <!-- Live preview - commented out (2026), never worked reliably; not deleted so it's easy to pick back up later.
+        <section id="live-preview-section" hidden>
+          <p class="hint">LIVE PREVIEW — every generation that found a better arrangement, replayed part by part in order found (not every attempt - the result above still reflects the final winner once the run finishes):</p>
+          <p class="status" id="live-caption"></p>
+          <div id="live-sheets"></div>
+        </section>
+        -->
+
         <p class="hint" style="margin-top: 16px;">Export the attempt currently shown above to a DXF file:</p>
         <div class="row">
           <label for="export-spacing" title="A DXF file has no separate concept of 'sheets' - every sheet used gets written into the same drawing, laid out left to right. This is the gap kept between each one so they don't overlap.">SHEET SPACING (mm)</label>
@@ -128,11 +95,72 @@
         <p class="status" id="export-status"></p>
       </section>
 
+    </main>
+
+    <div class="floating-stack">
       <section class="panel" id="panel-console">
         <h2>05 / CONSOLE</h2>
         <pre id="console-log"></pre>
       </section>
-    </main>
+
+      <section class="panel" id="panel-config" hidden>
+        <h2>03 / CONFIGURE</h2>
+        <div class="row">
+          <label for="cfg-placement-type" title="How the program judges where to slide a piece into place. GRAVITY: let pieces settle toward a corner, like Tetris. BOX: try to keep everything placed so far inside as small a rectangle as possible. CONVEX HULL: judge by the simplified outer shape wrapped around everything placed so far. TIGHT FIT: judge by how snugly a piece touches already-placed pieces or the sheet edge, not the overall shape of everything placed - better for interlocking/irregular pieces. GRAVITY + TIGHT FIT: use GRAVITY first, then break ties between equally-good spots by which one touches more - usually the best of both, at a smaller speed cost than TIGHT FIT alone. GRAVITY + CORRECTIVE: the sheet's first two pieces settle by GRAVITY, then every piece after switches outright to the exact TIGHT FIT contact measure - and a repeated piece shape reuses whichever rotation already worked for it, instead of re-searching every angle from scratch.">PLACEMENT</label>
+          <select id="cfg-placement-type" title="How the program judges where to slide a piece into place. GRAVITY: let pieces settle toward a corner, like Tetris. BOX: try to keep everything placed so far inside as small a rectangle as possible. CONVEX HULL: judge by the simplified outer shape wrapped around everything placed so far. TIGHT FIT: judge by how snugly a piece touches already-placed pieces or the sheet edge, not the overall shape of everything placed - better for interlocking/irregular pieces. GRAVITY + TIGHT FIT: use GRAVITY first, then break ties between equally-good spots by which one touches more - usually the best of both, at a smaller speed cost than TIGHT FIT alone. GRAVITY + CORRECTIVE: the sheet's first two pieces settle by GRAVITY, then every piece after switches outright to the exact TIGHT FIT contact measure - and a repeated piece shape reuses whichever rotation already worked for it, instead of re-searching every angle from scratch.">
+            <option value="gravity">GRAVITY</option>
+            <option value="box">BOX</option>
+            <option value="convexhull">CONVEX HULL</option>
+            <option value="tightfit">TIGHT FIT</option>
+            <option value="gravitytightfit">GRAVITY + TIGHT FIT</option>
+            <option value="gravitycorrective">GRAVITY + CORRECTIVE</option>
+          </select>
+          <!-- Live preview - commented out (2026), never worked reliably; not deleted so it's easy to pick back up later. See frontend/app.js's matching commented-out state/listeners and src-tauri/src/dto.rs's NestConfigDto::live_visualization.
+          <label for="cfg-live-viz" title="Watch the nest improve generation by generation as the real search runs at full speed - every time it finds a better arrangement, that whole arrangement appears below, part by part. Only genuine improvements are shown, not the many discarded random attempts in between.">
+            <input id="cfg-live-viz" type="checkbox" title="Watch the nest improve generation by generation as the real search runs at full speed - every time it finds a better arrangement, that whole arrangement appears below, part by part. Only genuine improvements are shown, not the many discarded random attempts in between." />
+            LIVE PREVIEW
+          </label>
+          <label for="cfg-live-viz-speed" title="Pause between each part appearing in the LIVE PREVIEW view below. Purely a playback speed for what you watch - the actual placement computation always runs at full speed regardless of this setting.">STEP DELAY (ms)</label>
+          <input id="cfg-live-viz-speed" type="range" value="150" min="0" max="1000" step="10" title="Pause between each part appearing in the LIVE PREVIEW view below. Purely a playback speed for what you watch - the actual placement computation always runs at full speed regardless of this setting." />
+          <output id="cfg-live-viz-speed-value" for="cfg-live-viz-speed">150ms</output>
+          -->
+          <label for="cfg-rotations" title="How many different angles the program is allowed to try for each piece before giving up on fitting it. More angles = better chance of a good fit, but slower.">ROTATIONS</label>
+          <input id="cfg-rotations" type="number" value="4" min="1" step="1" title="How many different angles the program is allowed to try for each piece before giving up on fitting it. More angles = better chance of a good fit, but slower." />
+          <label for="cfg-population" title="How many different full arrangements ('attempts') the program tries and compares side by side in every round. More attempts = better results, but each round takes longer.">POPULATION</label>
+          <input id="cfg-population" type="number" value="10" min="2" step="1" title="How many different full arrangements ('attempts') the program tries and compares side by side in every round. More attempts = better results, but each round takes longer." />
+        </div>
+        <div class="row">
+          <label for="cfg-mutation" title="The chance that a small random change (swap two pieces' order, or reroll one piece's rotation) gets made when mixing two good attempts together to make a new one. Keeps the search from getting stuck repeating itself.">MUTATION %</label>
+          <input id="cfg-mutation" type="number" value="10" min="0" max="100" step="1" title="The chance that a small random change (swap two pieces' order, or reroll one piece's rotation) gets made when mixing two good attempts together to make a new one. Keeps the search from getting stuck repeating itself." />
+          <label for="cfg-generations" title="How many rounds of 'try a bunch of attempts, keep the best, breed a new batch, repeat' to run. More rounds = better packing, but takes longer.">GENERATIONS</label>
+          <input id="cfg-generations" type="number" value="5" min="1" step="1" title="How many rounds of 'try a bunch of attempts, keep the best, breed a new batch, repeat' to run. More rounds = better packing, but takes longer." />
+          <label for="cfg-dominant" title="If one piece alone takes up more than this fraction of a sheet (0.9 = 90%), the program stops trying to fit more onto that sheet and starts a fresh one, since there's basically no room left anyway. It still gets placed - it just gets a sheet to itself instead of sharing.">DOMINANT AREA</label>
+          <input id="cfg-dominant" type="range" value="0.9" min="0.01" max="1" step="0.01" title="If one piece alone takes up more than this fraction of a sheet (0.9 = 90%), the program stops trying to fit more onto that sheet and starts a fresh one, since there's basically no room left anyway. It still gets placed - it just gets a sheet to itself instead of sharing." />
+          <output id="cfg-dominant-value" for="cfg-dominant">90%</output>
+        </div>
+        <div class="row">
+          <label for="cfg-margin" title="Minimum empty gap kept between a piece and the true edge of the sheet - e.g. so a cutting tool has room to run without going off the material. Set to 0 for jobs where the tool can safely overhang the edge (like most laser cutting).">MARGIN (mm)</label>
+          <input id="cfg-margin" type="number" value="0" min="0" step="0.1" title="Minimum empty gap kept between a piece and the true edge of the sheet - e.g. so a cutting tool has room to run without going off the material. Set to 0 for jobs where the tool can safely overhang the edge (like most laser cutting)." />
+          <label for="cfg-spacing" title="Minimum gap kept between two pieces placed next to each other, so a cutting tool fits between them and they don't touch. Set to 0 if pieces can be placed edge-to-edge with no gap at all.">SPACING (mm)</label>
+          <input id="cfg-spacing" type="number" value="0" min="0" step="0.1" title="Minimum gap kept between two pieces placed next to each other, so a cutting tool fits between them and they don't touch. Set to 0 if pieces can be placed edge-to-edge with no gap at all." />
+        </div>
+        <div class="row">
+          <label for="cfg-max-threads" title="How many CPU cores the program is allowed to use at once while it searches for a good packing. 0 = use every core your computer has (fastest). Set a lower number to leave some CPU free for other programs while it runs.">MAX CPU THREADS</label>
+          <input id="cfg-max-threads" type="number" value="0" min="0" step="1" title="How many CPU cores the program is allowed to use at once while it searches for a good packing. 0 = use every core your computer has (fastest). Set a lower number to leave some CPU free for other programs while it runs." />
+          <label for="cfg-seed" title="Starting point for the search's randomness (initial attempt order/rotations, every mutation/breeding choice across every round). The same seed with the same everything else always reproduces the exact same result - change it to sample a different random starting point, keep it fixed to compare other settings fairly.">SEED</label>
+          <input id="cfg-seed" type="number" value="0" min="0" step="1" title="Starting point for the search's randomness (initial attempt order/rotations, every mutation/breeding choice across every round). The same seed with the same everything else always reproduces the exact same result - change it to sample a different random starting point, keep it fixed to compare other settings fairly." />
+        </div>
+        <div class="row">
+          <button id="btn-run" class="primary">RUN NEST</button>
+          <button id="btn-stop" hidden>STOP</button>
+          <span class="spinner" id="run-spinner" hidden></span>
+          <span class="status" id="run-status"></span>
+        </div>
+        <div class="progress" id="run-progress" hidden>
+          <div class="progress-fill" id="run-progress-fill"></div>
+        </div>
+      </section>
+    </div>
 
     <script type="module" src="app.js"></script>
   </body>

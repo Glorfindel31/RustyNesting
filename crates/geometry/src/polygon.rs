@@ -171,6 +171,7 @@ pub struct Bounds {
 }
 
 /// Port of `getPolygonBounds`.
+#[must_use]
 pub fn get_polygon_bounds(polygon: &[Point]) -> Option<Bounds> {
     if polygon.len() < 3 {
         return None;
@@ -205,6 +206,7 @@ pub fn get_polygon_bounds(polygon: &[Point]) -> Option<Bounds> {
 /// Port of `pointInPolygon`. `offset` is added to every polygon vertex before
 /// testing (mirrors JS's `polygon.offsetx`/`offsety`). Returns `None` if the
 /// point lies exactly on a vertex or edge (JS returns `null` there too).
+#[must_use]
 pub fn point_in_polygon(
     point: Point,
     polygon: &[Point],
@@ -247,6 +249,7 @@ pub fn point_in_polygon(
 }
 
 /// Port of `polygonArea`. A negative area indicates counter-clockwise winding.
+#[must_use]
 pub fn polygon_area(polygon: &[Point]) -> f64 {
     let mut area = 0.0;
     let mut j = polygon.len() - 1;
@@ -258,39 +261,17 @@ pub fn polygon_area(polygon: &[Point]) -> f64 {
 }
 
 /// Port of `isRectangle`.
+#[must_use]
 pub fn is_rectangle(poly: &[Point], tolerance: Option<f64>) -> bool {
     let Some(bb) = get_polygon_bounds(poly) else {
         return false;
     };
     let tol = tolerance.unwrap_or(TOL);
 
-    for p in poly {
-        if !almost_equal(p.x, bb.x, Some(tol)) && !almost_equal(p.x, bb.x + bb.width, Some(tol)) {
-            return false;
-        }
-        if !almost_equal(p.y, bb.y, Some(tol)) && !almost_equal(p.y, bb.y + bb.height, Some(tol)) {
-            return false;
-        }
-    }
-
-    true
-}
-
-/// Port of `rotatePolygon`. Returns the rotated points along with the
-/// recomputed bounding box (JS stashes `x`/`y`/`width`/`height` on the
-/// returned array).
-pub fn rotate_polygon(polygon: &[Point], angle_deg: f64) -> (Vec<Point>, Option<Bounds>) {
-    let angle = angle_deg * std::f64::consts::PI / 180.0;
-    let rotated: Vec<Point> = polygon
-        .iter()
-        .map(|p| {
-            let x1 = p.x * angle.cos() - p.y * angle.sin();
-            let y1 = p.x * angle.sin() + p.y * angle.cos();
-            Point::new(x1, y1)
-        })
-        .collect();
-    let bounds = get_polygon_bounds(&rotated);
-    (rotated, bounds)
+    poly.iter().all(|p| {
+        (almost_equal(p.x, bb.x, Some(tol)) || almost_equal(p.x, bb.x + bb.width, Some(tol)))
+            && (almost_equal(p.y, bb.y, Some(tol)) || almost_equal(p.y, bb.y + bb.height, Some(tol)))
+    })
 }
 
 #[cfg(test)]

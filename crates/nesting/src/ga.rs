@@ -15,13 +15,21 @@
 //! (`nesting::placement::NestPart`), same separation of concerns as the
 //! original had via object reference vs. `.id`, just made explicit.
 //!
-//! **`widenRotationsIfStalled`/`refineStalledBest` are deliberately not
-//! ported here** (see `docs/PORT_STATUS.md`'s Phase 4 table) - both mutate
-//! live dispatch-loop state (stagnation counters, in-flight refine
-//! requests) that doesn't exist yet; porting them before `nesting::dispatch`
-//! exists would be scaffolding with nothing to call it.
+//! **`widenRotationsIfStalled` is now ported, but split across two places**:
+//! this module only exposes `set_rotations` (widening what future mutations
+//! can draw from); the stagnation counter that decides *when* to call it
+//! lives in `src-tauri/src/commands.rs`'s generation loop, the caller that
+//! actually persists across many `dispatch::run_generation` calls (this
+//! module and `nesting::dispatch` both only ever see one generation at a
+//! time). **`refineStalledBest` is still not ported** - it re-runs
+//! consolidation against a stalled run's current champion, which needs the
+//! same generation-loop-level caller `widenRotationsIfStalled` just gained,
+//! but doing so hasn't been requested yet.
 
-use rand::Rng;
+use std::cell::Cell;
+
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 use crate::placement::PlaceResult;
 
@@ -34,6 +42,7 @@ use crate::placement::PlaceResult;
 /// Simpler than the original: `PlaceResult`'s fields are always concrete
 /// (`usize`/`Vec`/`f64`), so there's no `a.unplacedCount || 0`-style
 /// undefined-coercion to replicate.
+#[must_use]
 pub fn is_better_nest(a: &PlaceResult, b: &PlaceResult) -> bool {
     if a.unplaced_count != b.unplaced_count {
         return a.unplaced_count < b.unplaced_count;
@@ -66,7 +75,14 @@ pub struct Individual {
     pub fitness: Option<f64>,
 }
 
+/// `rotations.max(1)`: `rotations: 0` would make `rng.gen_range(0..0)` panic
+/// (an empty range) - `PlacementConfig`'s own use of `rotations` already
+/// guards this exact case the same way (`placement.rs`'s `config.rotations.max(1)`
+/// calls); `GaConfig` needs the same floor, since this is `pub` API reachable
+/// without going through `src-tauri`'s own `rotations == 0` request
+/// validation (a test, a future caller, `nesting`'s own bench harness).
 fn random_angles(length: usize, rotations: u32, rng: &mut impl Rng) -> Vec<f64> {
+    let rotations = rotations.max(1);
     let step = 360.0 / rotations as f64;
     (0..length).map(|_| (rng.gen_range(0..rotations) as f64) * step).collect()
 }
@@ -74,6 +90,12 @@ fn random_angles(length: usize, rotations: u32, rng: &mut impl Rng) -> Vec<f64> 
 pub struct GeneticAlgorithm {
     pub population: Vec<Individual>,
     config: GaConfig,
+    // `Cell`, not a plain field, deliberately: it lets every RNG-consuming
+    // method below keep taking `&self` (unchanged signatures, no call-site
+    // churn) while still advancing a real, continuing random sequence each
+    // call - see `next_rng`'s own doc comment for why a `&mut self` design
+    // (the more obvious choice) doesn't actually work here.
+    next_seed: Cell<u64>,
 }
 
 impl GeneticAlgorithm {
@@ -82,28 +104,39 @@ impl GeneticAlgorithm {
     /// starting orders (same alternate-sort-order idea the original uses) -
     /// any whose length doesn't match `adam`'s is dropped, same as the
     /// original's `.filter(o => o && o.length === adam.length)`.
-    pub fn new(adam: Vec<usize>, config: GaConfig, extra_seeds: Vec<Vec<usize>>) -> Self {
-        let mut rng = rand::thread_rng();
+    ///
+    /// `seed` makes the *entire* run's randomness (initial rotation angles,
+    /// every `mutate`/`mate`/parent-selection roll across every generation)
+    /// fully reproducible: the same `seed` with the same `adam`/`config`/
+    /// `extra_seeds` always produces the exact same sequence of individuals.
+    /// Deliberately not left to `rand::thread_rng()` (OS entropy, different
+    /// every process run) - comparing placement strategies needs to isolate
+    /// "did this scoring change actually help" from "did this run just
+    /// happen to get a luckier random population," which thread_rng's
+    /// unrepeatable seed made impossible to tell apart.
+    pub fn new(adam: Vec<usize>, config: GaConfig, extra_seeds: Vec<Vec<usize>>, seed: u64) -> Self {
         let adam_len = adam.len();
+        let mut ga = GeneticAlgorithm { population: Vec::new(), config, next_seed: Cell::new(seed) };
 
-        let mut population = vec![Individual {
-            rotation: random_angles(adam_len, config.rotations, &mut rng),
+        let mut rng = ga.next_rng();
+        ga.population.push(Individual {
+            rotation: random_angles(adam_len, ga.config.rotations, &mut rng),
             placement: adam,
             fitness: None,
-        }];
+        });
 
         for seed in extra_seeds.into_iter().filter(|s| s.len() == adam_len) {
-            if population.len() >= config.population_size {
+            if ga.population.len() >= ga.config.population_size {
                 break;
             }
-            population.push(Individual {
-                rotation: random_angles(adam_len, config.rotations, &mut rng),
+            let mut rng = ga.next_rng();
+            ga.population.push(Individual {
+                rotation: random_angles(adam_len, ga.config.rotations, &mut rng),
                 placement: seed,
                 fitness: None,
             });
         }
 
-        let mut ga = GeneticAlgorithm { population, config };
         while ga.population.len() < ga.config.population_size {
             let mutant = ga.mutate(&ga.population[0]);
             ga.population.push(mutant);
@@ -111,11 +144,43 @@ impl GeneticAlgorithm {
         ga
     }
 
+    /// Hands out a fresh, deterministically-seeded RNG and advances the
+    /// counter it draws from - every call in one `GeneticAlgorithm`'s
+    /// lifetime gets a *different* seed (so calls don't all repeat the same
+    /// first-few-draws), but the whole sequence is 100% reproducible given
+    /// the constructor's own `seed`. `&self`, not `&mut self` (via `Cell`'s
+    /// interior mutability): the obvious alternative - storing one `StdRng`
+    /// field directly and taking `&mut self` in `mutate`/`mate`/
+    /// `random_weighted_individual` - breaks every existing call site
+    /// shaped like `ga.mutate(&ga.population[0])` (an immutable borrow of
+    /// `ga.population` alongside a mutable borrow of `ga` in the same
+    /// expression), which is exactly how `generation()` and this
+    /// constructor both already call it.
+    fn next_rng(&self) -> StdRng {
+        let seed = self.next_seed.get();
+        self.next_seed.set(seed.wrapping_add(1));
+        StdRng::seed_from_u64(seed)
+    }
+
+    /// Port of half of `widenRotationsIfStalled`'s effect: widens the
+    /// rotation grid `mutate`'s rotation-reroll draws from for every future
+    /// mutation, without touching any already-existing individual's current
+    /// rotation genes (same as the original - widening only ever changes
+    /// what *future* mutations can pick, not what's already in the
+    /// population). The stagnation tracking itself (counting generations
+    /// since the last improvement, deciding *when* to call this) is the
+    /// caller's job - `nesting::dispatch`'s per-generation loop is the thing
+    /// that persists across calls, not anything in this module.
+    pub fn set_rotations(&mut self, rotations: u32) {
+        self.config.rotations = rotations;
+    }
+
     /// Returns a mutated copy of `individual` at the configured mutation
     /// rate. Three operators, same as the original: adjacent-swap (per
     /// part), rotation-reroll (per part, rate capped independently - see
     /// `ROTATION_MUTATION_RATE_CAP`'s doc below), and a single whole-individual
     /// relocate (moves one part to a random different slot in one step).
+    #[must_use]
     pub fn mutate(&self, individual: &Individual) -> Individual {
         // The shared NFP cache is keyed by {sourceA, sourceB, rotationA,
         // rotationB} - a cache hit needs the exact same rotation pair seen
@@ -131,8 +196,11 @@ impl GeneticAlgorithm {
         const ROTATION_MUTATION_RATE_CAP: f64 = 15.0;
         let rotation_mutation_chance = 0.01 * self.config.mutation_rate.min(ROTATION_MUTATION_RATE_CAP);
         let swap_chance = 0.01 * self.config.mutation_rate;
+        // Same `rotations: 0` guard as `random_angles` above - `rotations`
+        // reaches this function straight from caller-supplied `GaConfig`.
+        let rotations = self.config.rotations.max(1);
 
-        let mut rng = rand::thread_rng();
+        let mut rng = self.next_rng();
         let mut clone = individual.clone();
         clone.fitness = None;
 
@@ -151,7 +219,7 @@ impl GeneticAlgorithm {
                 }
             }
             if rng.gen::<f64>() < rotation_mutation_chance {
-                clone.rotation[i] = (rng.gen_range(0..self.config.rotations) as f64) * (360.0 / self.config.rotations as f64);
+                clone.rotation[i] = (rng.gen_range(0..rotations) as f64) * (360.0 / rotations as f64);
             }
         }
 
@@ -188,10 +256,18 @@ impl GeneticAlgorithm {
     /// same length by construction), but not enforced by the type system
     /// since this is a `pub` method. A mismatched pair panics via
     /// out-of-bounds slicing below rather than a clean error.
+    #[must_use]
     pub fn mate(&self, male: &Individual, female: &Individual) -> (Individual, Individual) {
-        debug_assert_eq!(male.placement.len(), female.placement.len(), "mate() requires male/female to have the same gene length");
+        // A real assert, not debug_assert!: `mate` is `pub`, callable with
+        // any two individuals by a caller other than `generation()` (which
+        // is the only call site that currently guarantees equal length by
+        // construction). In a release build a debug_assert compiles out
+        // entirely, leaving a mismatched pair to fail via an unexplained
+        // out-of-bounds panic several lines down instead of this clear
+        // message at the actual violated precondition.
+        assert_eq!(male.placement.len(), female.placement.len(), "mate() requires male/female to have the same gene length");
 
-        let mut rng = rand::thread_rng();
+        let mut rng = self.next_rng();
         let r: f64 = rng.gen::<f64>().clamp(0.1, 0.9);
         let cutpoint = (r * (male.placement.len() as f64 - 1.0)).round() as usize;
 
@@ -256,7 +332,7 @@ impl GeneticAlgorithm {
     fn random_weighted_individual(&self, exclude: Option<usize>) -> usize {
         let indices: Vec<usize> = (0..self.population.len()).filter(|&i| Some(i) != exclude).collect();
         let n = indices.len();
-        let mut rng = rand::thread_rng();
+        let mut rng = self.next_rng();
         let rand: f64 = rng.gen();
 
         let mut lower = 0.0;
@@ -293,16 +369,55 @@ mod tests {
         sorted == (0..expected_len).collect::<Vec<_>>()
     }
 
+    /// Regression test: `rotations: 0` used to panic immediately inside
+    /// `GeneticAlgorithm::new` (`random_angles`'s `rng.gen_range(0..0)` on
+    /// an empty range) and again in `mutate`. `src-tauri` validates against
+    /// this at its own request boundary, but `GaConfig`/`GeneticAlgorithm`
+    /// are `pub` API reachable without going through that check at all.
+    #[test]
+    fn rotations_zero_does_not_panic() {
+        let cfg = GaConfig { population_size: 4, mutation_rate: 50.0, rotations: 0 };
+        let ga = GeneticAlgorithm::new(adam(4), cfg, Vec::new(), 0);
+        assert_eq!(ga.population.len(), 4);
+        for individual in &ga.population {
+            assert!(individual.rotation.iter().all(|&r| r == 0.0), "rotations: 0 should fall back to a single 0-degree angle");
+        }
+
+        // mutate() must not panic either - roll it enough times to hit both
+        // the swap and rotation-reroll branches at least once.
+        for _ in 0..20 {
+            let _ = ga.mutate(&ga.population[0]);
+        }
+    }
+
+    /// Regression test for `set_rotations` (the `widenRotationsIfStalled`
+    /// port's other half - see the module doc comment): with `rotations: 1`
+    /// every angle is forced to exactly 0.0 degrees, so if `mutate`'s
+    /// rotation-reroll ever produces anything else, the grid it's drawing
+    /// from must have actually widened, not just been recorded.
+    #[test]
+    fn set_rotations_widens_the_grid_mutate_draws_from() {
+        let mut ga = GeneticAlgorithm::new(adam(6), GaConfig { population_size: 4, mutation_rate: 100.0, rotations: 1 }, Vec::new(), 0);
+        for _ in 0..20 {
+            let mutant = ga.mutate(&ga.population[0]);
+            assert!(mutant.rotation.iter().all(|&r| r == 0.0), "rotations: 1 should never produce a non-zero angle");
+        }
+
+        ga.set_rotations(4);
+        let saw_nonzero = (0..50).any(|_| ga.mutate(&ga.population[0]).rotation.iter().any(|&r| r != 0.0));
+        assert!(saw_nonzero, "widened rotations should let mutate draw a non-zero angle at least once in 50 tries");
+    }
+
     #[test]
     fn population_is_filled_to_the_configured_size() {
-        let ga = GeneticAlgorithm::new(adam(6), config(), Vec::new());
+        let ga = GeneticAlgorithm::new(adam(6), config(), Vec::new(), 0);
         assert_eq!(ga.population.len(), 8);
     }
 
     #[test]
     fn adam_survives_unmutated_as_population_zero() {
         let a = adam(6);
-        let ga = GeneticAlgorithm::new(a.clone(), config(), Vec::new());
+        let ga = GeneticAlgorithm::new(a.clone(), config(), Vec::new(), 0);
         assert_eq!(ga.population[0].placement, a);
     }
 
@@ -311,14 +426,14 @@ mod tests {
         let mut cfg = config();
         cfg.population_size = 3;
         let seeds = vec![vec![5, 4, 3, 2, 1, 0], vec![1, 2, 3, 4, 5, 6, 7]]; // 2nd is wrong length, dropped
-        let ga = GeneticAlgorithm::new(adam(6), cfg, seeds);
+        let ga = GeneticAlgorithm::new(adam(6), cfg, seeds, 0);
         assert_eq!(ga.population.len(), 3);
         assert_eq!(ga.population[1].placement, vec![5, 4, 3, 2, 1, 0]);
     }
 
     #[test]
     fn every_individual_is_a_valid_permutation_with_a_rotation_per_part() {
-        let ga = GeneticAlgorithm::new(adam(7), config(), Vec::new());
+        let ga = GeneticAlgorithm::new(adam(7), config(), Vec::new(), 0);
         for ind in &ga.population {
             assert!(same_ids(&ind.placement, 7));
             assert_eq!(ind.rotation.len(), 7);
@@ -331,7 +446,7 @@ mod tests {
 
     #[test]
     fn mutate_preserves_the_part_set() {
-        let ga = GeneticAlgorithm::new(adam(10), config(), Vec::new());
+        let ga = GeneticAlgorithm::new(adam(10), config(), Vec::new(), 0);
         for _ in 0..20 {
             let mutant = ga.mutate(&ga.population[0]);
             assert!(same_ids(&mutant.placement, 10));
@@ -342,7 +457,7 @@ mod tests {
 
     #[test]
     fn mate_produces_two_full_permutations_from_the_parents() {
-        let ga = GeneticAlgorithm::new(adam(8), config(), Vec::new());
+        let ga = GeneticAlgorithm::new(adam(8), config(), Vec::new(), 0);
         let male = &ga.population[0];
         let female = ga.mutate(male);
         for _ in 0..20 {
@@ -356,7 +471,7 @@ mod tests {
 
     #[test]
     fn generation_keeps_population_size_and_elitism() {
-        let mut ga = GeneticAlgorithm::new(adam(6), config(), Vec::new());
+        let mut ga = GeneticAlgorithm::new(adam(6), config(), Vec::new(), 0);
         for (i, ind) in ga.population.iter_mut().enumerate() {
             ind.fitness = Some(100.0 - i as f64); // last-indexed starts fittest
         }
@@ -375,7 +490,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "fitness must be set")]
     fn generation_panics_if_fitness_is_missing() {
-        let mut ga = GeneticAlgorithm::new(adam(4), config(), Vec::new());
+        let mut ga = GeneticAlgorithm::new(adam(4), config(), Vec::new(), 0);
         ga.generation();
     }
 

@@ -4,7 +4,7 @@
 //! for the non-NFP helpers this module builds on.
 
 use crate::point::Point;
-use crate::polygon::{almost_equal, normalize_vector, on_segment, point_in_polygon, TOL};
+use crate::polygon::{almost_equal, get_polygon_bounds, normalize_vector, on_segment, point_in_polygon, TOL};
 
 fn points_equal_or_almost(a: Point, b: Point) -> bool {
     (a.x == b.x && a.y == b.y) || almost_equal(a.x, b.x, None) && almost_equal(a.y, b.y, None)
@@ -468,46 +468,28 @@ pub fn search_start_point(
 
 /// Port of `noFitPolygonRectangle`: the interior-NFP fast path for the
 /// special case where A is a rectangle.
+///
+/// Delegates bounding-box math to `get_polygon_bounds`, which returns `None`
+/// for fewer than 3 points - matching this module's own documented
+/// "invalid input -> `None`" contract instead of the unguarded `a[0]`/`b[0]`
+/// indexing this used to do (empty/single-point input panicked).
 pub fn no_fit_polygon_rectangle(a: &[Point], b: &[Point]) -> Option<Vec<Vec<Point>>> {
-    let (mut min_ax, mut min_ay, mut max_ax, mut max_ay) = (a[0].x, a[0].y, a[0].x, a[0].y);
-    for p in &a[1..] {
-        if p.x < min_ax {
-            min_ax = p.x;
-        }
-        if p.y < min_ay {
-            min_ay = p.y;
-        }
-        if p.x > max_ax {
-            max_ax = p.x;
-        }
-        if p.y > max_ay {
-            max_ay = p.y;
-        }
-    }
+    let bounds_a = get_polygon_bounds(a)?;
+    let bounds_b = get_polygon_bounds(b)?;
 
-    let (mut min_bx, mut min_by, mut max_bx, mut max_by) = (b[0].x, b[0].y, b[0].x, b[0].y);
-    for p in &b[1..] {
-        if p.x < min_bx {
-            min_bx = p.x;
-        }
-        if p.y < min_by {
-            min_by = p.y;
-        }
-        if p.x > max_bx {
-            max_bx = p.x;
-        }
-        if p.y > max_by {
-            max_by = p.y;
-        }
-    }
-
-    if max_bx - min_bx > max_ax - min_ax {
+    if bounds_b.width > bounds_a.width {
         return None;
     }
-    if max_by - min_by > max_ay - min_ay {
+    if bounds_b.height > bounds_a.height {
         return None;
     }
 
+    let (min_ax, min_ay) = (bounds_a.x, bounds_a.y);
+    let (max_ax, max_ay) = (bounds_a.x + bounds_a.width, bounds_a.y + bounds_a.height);
+    let (min_bx, min_by) = (bounds_b.x, bounds_b.y);
+    let (max_bx, max_by) = (bounds_b.x + bounds_b.width, bounds_b.y + bounds_b.height);
+
+    // `b[0]` is safe: `bounds_b` being `Some` guarantees `b.len() >= 3`.
     Some(vec![vec![
         Point::new(min_ax - min_bx + b[0].x, min_ay - min_by + b[0].y),
         Point::new(max_ax - max_bx + b[0].x, min_ay - min_by + b[0].y),
@@ -900,7 +882,16 @@ pub fn polygon_hull(a_in: &[Point], a_offset_in: Point, b_in: &[Point], b_offset
         current += 1;
     }
 
-    // scan backward from the starting point
+    // scan backward from the starting point. Accumulated into a separate
+    // `back` vec via `push` (O(1) amortized) in the exact same order the
+    // original's `c.insert(0, _)` calls happened, instead of repeatedly
+    // shifting the front of `c` itself (O(n) per insert, O(n^2) total across
+    // this loop) - `back` gets reversed once and prepended to `c` after the
+    // loop, which produces the identical final order (each `insert(0, X)`
+    // moves X to the front ahead of everything already there, so N
+    // sequential inserts-at-front are exactly a reverse of N sequential
+    // appends).
+    let mut back: Vec<Point> = Vec::new();
     let mut current_i: i64 = start_index as i64 - 1;
     for _ in 0..a.len() + 1 {
         if current_i < 0 {
@@ -920,18 +911,18 @@ pub fn polygon_hull(a_in: &[Point], a_offset_in: Point, b_in: &[Point], b_offset
             // NB: preserves the original's asymmetry - this y-comparison is
             // missing `+ a_offset.y` on the A side, unlike the forward scan above.
             if almost_equal(ac.x, bj.x, None) && almost_equal(a[current].y, bj.y, None) {
-                c.insert(0, ac);
+                back.push(ac);
                 intercept2 = Some(j);
                 touching = true;
                 break;
             } else if on_segment(ac, an, bj, None) {
-                c.insert(0, bj);
-                c.insert(0, ac);
+                back.push(bj);
+                back.push(ac);
                 intercept2 = Some(j);
                 touching = true;
                 break;
             } else if on_segment(bj, bn, ac, None) {
-                c.insert(0, ac);
+                back.push(ac);
                 intercept2 = Some(j);
                 touching = true;
                 break;
@@ -941,9 +932,12 @@ pub fn polygon_hull(a_in: &[Point], a_offset_in: Point, b_in: &[Point], b_offset
         if touching {
             break;
         }
-        c.insert(0, Point::new(a[current].x + a_offset.x, a[current].y + a_offset.y));
+        back.push(Point::new(a[current].x + a_offset.x, a[current].y + a_offset.y));
         current_i -= 1;
     }
+    back.reverse();
+    back.extend(c);
+    c = back;
 
     let (Some(intercept1), Some(intercept2)) = (intercept1, intercept2) else {
         return None;
@@ -1052,6 +1046,23 @@ mod tests {
             Point::new(0.0, 20.0),
         ];
         assert!(no_fit_polygon_rectangle(&a, &b).is_none());
+    }
+
+    /// Regression test: empty or too-few-point input must return `None`,
+    /// like every other invalid-input case in this module - not panic on
+    /// an unchecked `a[0]`/`b[0]` index.
+    #[test]
+    fn no_fit_polygon_rectangle_returns_none_instead_of_panicking_on_degenerate_input() {
+        let square = [
+            Point::new(0.0, 0.0),
+            Point::new(10.0, 0.0),
+            Point::new(10.0, 10.0),
+            Point::new(0.0, 10.0),
+        ];
+        assert!(no_fit_polygon_rectangle(&[], &square).is_none());
+        assert!(no_fit_polygon_rectangle(&square, &[]).is_none());
+        assert!(no_fit_polygon_rectangle(&[], &[]).is_none());
+        assert!(no_fit_polygon_rectangle(&[Point::new(0.0, 0.0)], &square).is_none());
     }
 
     #[test]

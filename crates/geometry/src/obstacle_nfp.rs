@@ -17,6 +17,7 @@ use crate::clipper::outer_nfp;
 use crate::point::Point;
 use crate::polygon::get_polygon_bounds;
 
+#[derive(Clone, Debug)]
 pub struct ObstacleNfp {
     pub outer: Vec<Point>,
     pub children: Vec<Vec<Point>>,
@@ -62,6 +63,7 @@ mod tests {
             layer: "0".into(),
             is_circle: None,
             children: Vec::new(),
+            texts: Vec::new(),
         }
     }
 
@@ -89,6 +91,7 @@ mod tests {
             layer: "DRILL".into(),
             is_circle: None,
             children: Vec::new(),
+            texts: Vec::new(),
         };
         let mut a = square_layered(0.0, 0.0, 20.0);
         a.children.push(hole);
@@ -110,6 +113,7 @@ mod tests {
             layer: "DRILL".into(),
             is_circle: None,
             children: Vec::new(),
+            texts: Vec::new(),
         };
         let mut a = square_layered(0.0, 0.0, 20.0);
         a.children.push(hole);

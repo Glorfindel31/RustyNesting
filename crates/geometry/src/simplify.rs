@@ -35,16 +35,28 @@ fn simplify_radial_dist(points: &[Point], sq_tolerance: f64) -> Vec<Point> {
     let mut prev_point = points[0];
     let mut new_points = vec![prev_point];
     let mut point = prev_point;
+    // Ports `prevPoint !== point` (JS reference-identity: "is the final
+    // input point the exact same object we already pushed as prevPoint").
+    // A Rust value comparison can't express "same object" - two distinct
+    // points that happen to share identical (x, y) would wrongly compare
+    // equal (or, before this fix, wrongly compare *unequal* whenever they
+    // differed only in the unrelated `marked` bookkeeping field). Tracking
+    // "did the loop just push this exact point" directly sidesteps value
+    // equality entirely and matches the original's intent exactly.
+    let mut last_was_pushed = true;
 
     for &p in &points[1..] {
         point = p;
         if point.marked || sq_dist(point, prev_point) > sq_tolerance {
             new_points.push(point);
             prev_point = point;
+            last_was_pushed = true;
+        } else {
+            last_was_pushed = false;
         }
     }
 
-    if prev_point != point {
+    if !last_was_pushed {
         new_points.push(point);
     }
 
@@ -126,5 +138,27 @@ mod tests {
     fn passes_through_short_inputs_unchanged() {
         let points = [Point::new(0.0, 0.0), Point::new(1.0, 1.0)];
         assert_eq!(simplify(&points, Some(0.01), false), points.to_vec());
+    }
+
+    /// Regression test for a JS-reference-identity-vs-Rust-value-equality
+    /// bug: `simplify_radial_dist`'s "was the endpoint already pushed?"
+    /// check used to compare `Point` values (including the unrelated
+    /// `marked` field), so a genuinely distinct final input point that
+    /// happens to share coordinates with the last *accepted* point (a very
+    /// real case - closed polygons routinely repeat their first point's
+    /// coordinates) was wrongly treated as "already there" and silently
+    /// dropped. `highest_quality: false` is required to exercise this - it
+    /// skips straight to the radial-distance prefilter this bug lives in.
+    #[test]
+    fn keeps_the_final_point_even_when_it_coincides_with_the_last_accepted_point() {
+        let points = [
+            Point::new(0.0, 0.0),   // always kept (first point)
+            Point::new(0.1, 0.1),   // within tolerance of (0,0) - filtered out
+            Point::new(0.0, 0.0),   // last point - same coordinates as the first, but a distinct input point that must still be kept
+        ];
+        let result = simplify(&points, Some(1.0), false);
+        assert_eq!(result.len(), 2, "must keep both the first and the genuinely-last point, even though they share coordinates: {result:?}");
+        assert_eq!(result[0], Point::new(0.0, 0.0));
+        assert_eq!(result[1], Point::new(0.0, 0.0));
     }
 }

@@ -5,9 +5,23 @@
 //! log, `nest-benchmark.log`, and a per-run summary CSV,
 //! `nest-benchmark-runs.csv`, both at the repo root).
 //!
-//! Usage: `cargo run --release -p nesting --example bench -- [num_runs] [run_seconds]`
-//! (defaults: 40 runs, 60s each - pass small values to smoke-test first,
-//! release mode matters a lot here, this is a perf measurement).
+//! Usage: `cargo run --release -p nesting --example bench -- [num_runs] [run_seconds] [placement_type]`
+//! (defaults: 40 runs, 60s each, gravity - pass small values to smoke-test
+//! first, release mode matters a lot here, this is a perf measurement).
+//! `placement_type` is one of `gravity`/`box`/`convexhull`/`tightfit`/
+//! `gravitytightfit`/`gravitycorrective`.
+//!
+//! **Grid-sweep mode**: `cargo run --release -p nesting --example bench -- grid`
+//! runs a fixed-generations (5) sweep across `placement_type` x
+//! `population_size` x `rotations` x `dominant_part_area_threshold`
+//! combinations instead of the single fixed config above, answering "which
+//! settings find the best arrangement (fewest sheets, highest utilisation)
+//! fastest" rather than "how fast is one fixed config." Each combination
+//! gets its own fresh `GeneticAlgorithm`/`NfpCache` (same as the normal
+//! per-run loop below - a cache doesn't carry over between combinations,
+//! since a real user changing these settings between runs wouldn't share
+//! one either). Results go to `nest-grid-results.csv`, one row per
+//! combination, so they can be sorted/compared after the sweep finishes.
 //!
 //! Sheet is a plain 2440x1220mm rectangle with a 3mm margin and 6.5mm
 //! spacing applied via `geometry::clearance::prepare_sheet`/`prepare_part`
@@ -45,6 +59,7 @@ use dxf::Drawing;
 use geometry::clearance::{prepare_part, prepare_sheet};
 use geometry::dxf_import::{build_polygon_tree, entities_to_polygons, LayeredPolygon};
 use nesting::benchmark_log::{append_benchmark_line, append_run_summary_row, git_revision};
+use nesting::cache::NfpCache;
 use nesting::dispatch;
 use nesting::ga::{GaConfig, GeneticAlgorithm};
 use nesting::placement::{PlacementConfig, PlacementType, DEFAULT_DOMINANT_PART_AREA_THRESHOLD};
@@ -84,7 +99,10 @@ fn load_parts() -> HashMap<usize, LayeredPolygon> {
                 skipped += 1;
                 continue;
             };
-            parts_by_id.insert(next_id, LayeredPolygon { points: expanded_points, layer: root.layer, is_circle: None, children: root.children });
+            parts_by_id.insert(
+                next_id,
+                LayeredPolygon { points: expanded_points, layer: root.layer, is_circle: None, children: root.children, texts: root.texts },
+            );
             next_id += 1;
         }
     }
@@ -106,14 +124,14 @@ fn build_sheet() -> LayeredPolygon {
     // the sheet's own inset here has to be net of that padding, which is
     // exactly what `prepare_sheet` computes).
     let points = prepare_sheet(&raw, MARGIN, SPACING).expect("margin/spacing should leave a usable sheet at these dimensions");
-    LayeredPolygon { points, layer: "SHEET".into(), is_circle: None, children: Vec::new() }
+    LayeredPolygon { points, layer: "SHEET".into(), is_circle: None, children: Vec::new(), texts: Vec::new() }
 }
 
-fn main() {
-    let mut args = std::env::args().skip(1);
-    let num_runs: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(40);
-    let run_seconds: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(60);
-
+/// Loads the fixture set, builds the sheet pool, and sanity-checks
+/// `SHEET_COPIES` has real headroom - shared setup between the normal
+/// fixed-config loop in `main()` and `run_grid()`'s sweep, so both measure
+/// against the exact same parts/sheets.
+fn setup_fixture() -> (HashMap<usize, LayeredPolygon>, Vec<usize>, Vec<LayeredPolygon>) {
     let parts_by_id = load_parts();
     let adam: Vec<usize> = {
         let mut ids: Vec<usize> = parts_by_id.keys().copied().collect();
@@ -142,8 +160,34 @@ fn main() {
         ASSUMED_PACKING_EFFICIENCY * 100.0,
     );
 
+    (parts_by_id, adam, sheets)
+}
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let first = args.next();
+
+    if first.as_deref() == Some("grid") {
+        run_grid();
+        return;
+    }
+
+    let num_runs: usize = first.and_then(|s| s.parse().ok()).unwrap_or(40);
+    let run_seconds: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(60);
+    let placement_type = match args.next().as_deref() {
+        Some("box") => PlacementType::Box,
+        Some("convexhull") => PlacementType::ConvexHull,
+        Some("tightfit") => PlacementType::TightFit,
+        Some("gravitytightfit") => PlacementType::GravityTightFit,
+        Some("gravitycorrective") => PlacementType::GravityCorrective,
+        Some("gravity") | None => PlacementType::Gravity,
+        Some(other) => panic!("unknown placement_type {other:?} - expected gravity/box/convexhull/tightfit/gravitytightfit/gravitycorrective"),
+    };
+
+    let (parts_by_id, adam, sheets) = setup_fixture();
+
     let placement_config =
-        PlacementConfig { placement_type: PlacementType::Gravity, rotations: 4, dominant_part_area_threshold: DEFAULT_DOMINANT_PART_AREA_THRESHOLD, curve_tolerance: CURVE_TOLERANCE };
+        PlacementConfig { placement_type, rotations: 4, dominant_part_area_threshold: DEFAULT_DOMINANT_PART_AREA_THRESHOLD, curve_tolerance: CURVE_TOLERANCE };
     let ga_config = GaConfig { population_size: 10, mutation_rate: 10.0, rotations: 4 };
 
     let detail_log = repo_root().join("nest-benchmark.log");
@@ -158,7 +202,16 @@ fn main() {
     );
 
     for run in 1..=num_runs {
-        let mut ga = GeneticAlgorithm::new(adam.clone(), ga_config.clone(), Vec::new());
+        // seed = run - 1: run 1 uses seed 0, run 2 seed 1, etc. - each run
+        // is its own fully reproducible trial (same seed always reproduces
+        // the same result), while different runs sample different starting
+        // populations, same as `rand::thread_rng()` used to but repeatably.
+        let mut ga = GeneticAlgorithm::new(adam.clone(), ga_config.clone(), Vec::new(), (run - 1) as u64);
+        // Fresh per run, shared across every generation within it - matches
+        // real usage (one NfpCache per run_nest_command call, not per
+        // generation), so this bench measures the same cache-hit-rate
+        // shape a real run gets.
+        let cache = NfpCache::new();
         let run_start = Instant::now();
         let deadline = Duration::from_secs(run_seconds);
 
@@ -171,7 +224,7 @@ fn main() {
 
         while run_start.elapsed() < deadline {
             let gen_start = Instant::now();
-            let results = dispatch::run_generation(&mut ga, &sheets, &parts_by_id, &placement_config);
+            let results = dispatch::run_generation(&mut ga, &sheets, &parts_by_id, &HashMap::new(), &placement_config, &|| false, &|_, _| {}, &cache);
             let gen_ms = gen_start.elapsed().as_millis();
             generation += 1;
             gen_times_ms.push(gen_ms);
@@ -238,6 +291,104 @@ fn main() {
     }
 
     println!("all runs complete. see {} and {}", detail_log.display(), runs_csv.display());
+}
+
+/// Fixed-generations sweep across `placement_type` x `population_size` x
+/// `rotations` x `dominant_part_area_threshold` - see this file's module
+/// doc comment for the "which settings find the best arrangement fastest"
+/// question this answers, as distinct from `main()`'s "how fast is one
+/// fixed config" loop above.
+fn run_grid() {
+    const GENERATIONS: usize = 5;
+    let placement_types = [PlacementType::Gravity, PlacementType::Box, PlacementType::ConvexHull];
+    let population_sizes = [6usize, 10, 20];
+    let rotations_options = [1u32, 2, 4];
+    let dominant_thresholds = [0.5f64, 0.9];
+
+    let (parts_by_id, adam, sheets) = setup_fixture();
+    let total_combos = placement_types.len() * population_sizes.len() * rotations_options.len() * dominant_thresholds.len();
+
+    let grid_csv = repo_root().join("nest-grid-results.csv");
+    let grid_header = "timestamp,git_rev,placement_type,population_size,rotations,dominant_threshold,gen1_ms,gen2_ms,gen3_ms,gen4_ms,gen5_ms,total_time_s,best_fitness,sheets_used,parts_placed,parts_unplaced,utilisation_pct";
+
+    println!(
+        "grid: {} parts, {} sheet copies, {GENERATIONS} generations/combo, {total_combos} combinations, rev={}",
+        adam.len(),
+        SHEET_COPIES,
+        git_revision()
+    );
+
+    let mut combo_num = 0usize;
+    for &placement_type in &placement_types {
+        for &population_size in &population_sizes {
+            for &rotations in &rotations_options {
+                for &dominant_part_area_threshold in &dominant_thresholds {
+                    combo_num += 1;
+
+                    let placement_config = PlacementConfig { placement_type, rotations, dominant_part_area_threshold, curve_tolerance: CURVE_TOLERANCE };
+                    let ga_config = GaConfig { population_size, mutation_rate: 10.0, rotations };
+                    let mut ga = GeneticAlgorithm::new(adam.clone(), ga_config, Vec::new(), 0);
+                    // Fresh per combination, not shared across them - a real
+                    // user changing these settings between runs wouldn't
+                    // share a cache either, and reusing one here would let
+                    // an earlier combination's warm cache flatter a later
+                    // combination's numbers.
+                    let cache = NfpCache::new();
+
+                    let mut best_fitness = f64::INFINITY;
+                    let mut best_unplaced = usize::MAX;
+                    let mut best_sheets_used = 0usize;
+                    let mut best_utilisation = 0.0;
+                    let mut gen_times_ms: Vec<u128> = Vec::with_capacity(GENERATIONS);
+
+                    let combo_start = Instant::now();
+                    for _ in 0..GENERATIONS {
+                        let gen_start = Instant::now();
+                        let results = dispatch::run_generation(&mut ga, &sheets, &parts_by_id, &HashMap::new(), &placement_config, &|| false, &|_, _| {}, &cache);
+                        gen_times_ms.push(gen_start.elapsed().as_millis());
+
+                        for r in &results {
+                            if r.fitness < best_fitness {
+                                best_fitness = r.fitness;
+                                best_unplaced = r.unplaced_count;
+                                best_sheets_used = r.placements.len();
+                                best_utilisation = r.utilisation;
+                            }
+                        }
+                    }
+                    let total_time_s = combo_start.elapsed().as_secs_f64();
+                    let parts_placed = adam.len().saturating_sub(best_unplaced.min(adam.len()));
+
+                    println!(
+                        "[{combo_num}/{total_combos}] placement={placement_type:?} pop={population_size} rot={rotations} dominant={dominant_part_area_threshold:.2}: \
+                         {total_time_s:.1}s, fitness={best_fitness:.0}, sheets={best_sheets_used}, unplaced={best_unplaced}, util={best_utilisation:.1}%"
+                    );
+
+                    let gen_ms_cols: Vec<String> = (0..GENERATIONS).map(|i| gen_times_ms.get(i).map_or_else(String::new, u128::to_string)).collect();
+                    let mut row = vec![
+                        unix_timestamp(),
+                        git_revision().to_string(),
+                        format!("{placement_type:?}"),
+                        population_size.to_string(),
+                        rotations.to_string(),
+                        format!("{dominant_part_area_threshold:.2}"),
+                    ];
+                    row.extend(gen_ms_cols);
+                    row.extend([
+                        format!("{total_time_s:.1}"),
+                        format!("{best_fitness:.1}"),
+                        best_sheets_used.to_string(),
+                        parts_placed.to_string(),
+                        best_unplaced.to_string(),
+                        format!("{best_utilisation:.2}"),
+                    ]);
+                    append_run_summary_row(&grid_csv, grid_header, &row);
+                }
+            }
+        }
+    }
+
+    println!("grid sweep complete: {total_combos} combinations. see {}", grid_csv.display());
 }
 
 /// No `chrono`/`time` dependency for one timestamp column - a fixed-offset

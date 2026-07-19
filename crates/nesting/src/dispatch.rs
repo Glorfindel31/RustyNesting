@@ -24,17 +24,20 @@
 //! 4 row this superseded).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
 use geometry::dxf_import::LayeredPolygon;
 
+use crate::cache::NfpCache;
 use crate::ga::{is_better_nest, GeneticAlgorithm};
 use crate::placement::{place_parts, NestPart, PlaceResult, PlacementConfig};
 
 /// Evaluates every individual in the current generation's population in
 /// parallel, assigns each one's `fitness`, then advances the GA
-/// (`GeneticAlgorithm::generation()`). Returns the `PlaceResult` for every
+/// (`GeneticAlgorithm::generation()`) - unless `should_cancel` cut this
+/// generation short, see below. Returns the `PlaceResult` for every
 /// individual actually (re-)placed this call - useful for a caller that
 /// wants to track the best-so-far result, not just the best fitness (see
 /// `is_better_nest`'s doc comment for why those can rank differently).
@@ -47,29 +50,88 @@ use crate::placement::{place_parts, NestPart, PlaceResult, PlacementConfig};
 /// Matches the original (`launchWorkers`'s dispatch loop skips any
 /// individual whose `.fitness` is already truthy) and skips a real,
 /// otherwise-redundant placement computation every generation.
+///
+/// `should_cancel` is checked once per individual, right before that
+/// individual's own placement work starts - not while one is already
+/// running; there's no way to abort a `place_parts` call already in flight
+/// without restructuring the placement engine itself. Once it returns
+/// true, every individual not yet started returns early instead of running
+/// a real placement. For a population bigger than the thread pool's
+/// parallelism (the common case), that means only the currently in-flight
+/// batch - bounded by thread count, not population size - still has to
+/// finish, not the whole generation. This is what makes a caller's
+/// per-generation cancel check (checking `should_cancel` again between
+/// calls to this function) actually responsive instead of only ever
+/// taking effect at generation boundaries.
+///
+/// A cancelled call leaves some individuals without a fitness, so
+/// `GeneticAlgorithm::generation()` - which requires every individual's
+/// fitness to already be set - is skipped rather than called on a
+/// half-evaluated population (it would panic). The caller is expected to
+/// stop calling `run_generation` once it observes cancellation, not to
+/// treat a cut-short call as a normal completed generation.
+///
+/// `on_individual_placed(done, total)` is called once up front with
+/// `(0, total)` before any placement starts, then again after each
+/// individual's `place_parts` call returns - `total` is how many
+/// individuals this call will actually evaluate (population size minus any
+/// already-fitness'd elite). A single individual's placement is real,
+/// possibly tens-of-seconds work against non-trivial real geometry, and
+/// without this a caller has no signal at all between "generation started"
+/// and "generation finished", which reads as the whole run having stalled
+/// even though it's working the entire time.
+///
+/// `cache` should be the same `NfpCache` for the whole run (every
+/// individual, every generation) - see `place_parts`'s own doc comment for
+/// why. Every individual in a generation shares the one cache (behind its
+/// own internal `Mutex`, safe across `par_iter`'s parallel threads).
+#[must_use]
 pub fn run_generation(
     ga: &mut GeneticAlgorithm,
     sheets: &[LayeredPolygon],
     parts_by_id: &HashMap<usize, LayeredPolygon>,
+    shape_ids: &HashMap<usize, usize>,
     placement_config: &PlacementConfig,
+    should_cancel: &(impl Fn() -> bool + Sync),
+    on_individual_placed: &(impl Fn(usize, usize) + Sync),
+    cache: &NfpCache,
 ) -> Vec<PlaceResult> {
+    let total = ga.population.iter().filter(|ind| ind.fitness.is_none()).count();
+    on_individual_placed(0, total);
+    let completed = AtomicUsize::new(0);
+
     let evaluated: Vec<(usize, PlaceResult)> = ga
         .population
         .par_iter()
         .enumerate()
         .filter(|(_, individual)| individual.fitness.is_none())
-        .map(|(idx, individual)| {
+        .filter_map(|(idx, individual)| {
+            if should_cancel() {
+                return None;
+            }
             let nest_parts: Vec<NestPart> = individual
                 .placement
                 .iter()
                 .zip(&individual.rotation)
                 .map(|(&id, &rotation)| NestPart {
                     id,
+                    source_id: shape_ids.get(&id).copied().unwrap_or(id),
                     polygon: parts_by_id.get(&id).expect("every gene id must have a matching part").clone(),
                     rotation,
                 })
                 .collect();
-            (idx, place_parts(sheets, nest_parts, placement_config))
+            // `?`: `place_parts` returns `None` if `should_cancel` fired
+            // partway through its own work - same "not evaluated" outcome
+            // as the check above, just discovered mid-placement instead of
+            // before starting. This is what makes cancellation a real kill
+            // switch rather than only ever skipping individuals that
+            // hadn't started yet: `place_parts` itself bails out of its
+            // per-part loop within a fraction of a second of the flag
+            // flipping, instead of running to completion regardless.
+            let result = place_parts(sheets, nest_parts, placement_config, cache, should_cancel, &|_, _| {})?;
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            on_individual_placed(done, total);
+            Some((idx, result))
         })
         .collect();
 
@@ -78,28 +140,57 @@ pub fn run_generation(
     }
 
     let results: Vec<PlaceResult> = evaluated.into_iter().map(|(_, result)| result).collect();
-    ga.generation();
+    if ga.population.iter().all(|ind| ind.fitness.is_some()) {
+        ga.generation();
+    }
     results
 }
 
 /// Runs `generations` full generations, tracking the best result seen
 /// across all of them via `is_better_nest` (not raw GA fitness, which
 /// bundles in placement-strategy shape penalties that don't map to "which
-/// result would I actually want"). `None` only if `generations == 0`.
+/// result would I actually want"). `None` only if `generations == 0` (or a
+/// cancellation lands before generation 1 produces anything).
+///
+/// Takes `should_cancel`/`on_individual_placed` the same way
+/// `run_generation` does (forwarded straight through, plus checked once
+/// more here between generations) - a caller reaching for this top-level
+/// entry point instead of hand-rolling the generation loop `run_generation`
+/// leaves to its wrapper still gets real cancellation responsiveness, not
+/// a silently-hardcoded `|| false` that discards it. Pass `&|| false` and
+/// `&|_, _| {}` explicitly if a caller genuinely doesn't want either.
+#[must_use]
 pub fn run(
     ga: &mut GeneticAlgorithm,
     sheets: &[LayeredPolygon],
     parts_by_id: &HashMap<usize, LayeredPolygon>,
+    shape_ids: &HashMap<usize, usize>,
     placement_config: &PlacementConfig,
     generations: usize,
+    should_cancel: &(impl Fn() -> bool + Sync),
+    on_individual_placed: &(impl Fn(usize, usize) + Sync),
 ) -> Option<PlaceResult> {
+    // Fresh cache for this call - `run` (unlike `run_generation`) is a
+    // whole self-contained nest attempt, so there's no longer-lived run for
+    // it to share a cache with (matches `place_parts`'s own doc comment:
+    // one cache per whole run, not per generation).
+    let cache = NfpCache::new();
     let mut best: Option<PlaceResult> = None;
     for _ in 0..generations {
-        let results = run_generation(ga, sheets, parts_by_id, placement_config);
+        if should_cancel() {
+            break;
+        }
+        let results = run_generation(ga, sheets, parts_by_id, shape_ids, placement_config, should_cancel, on_individual_placed, &cache);
         for result in results {
             if best.as_ref().is_none_or(|b| is_better_nest(&result, b)) {
                 best = Some(result);
             }
+        }
+        // `run_generation` may have been cut short mid-population by the
+        // same flag - stop here rather than starting another generation on
+        // a population it deliberately left half-evaluated.
+        if should_cancel() {
+            break;
         }
     }
     best
@@ -123,6 +214,7 @@ mod tests {
             layer: "0".into(),
             is_circle: None,
             children: Vec::new(),
+            texts: Vec::new(),
         }
     }
 
@@ -138,7 +230,7 @@ mod tests {
     fn setup(part_count: usize) -> (GeneticAlgorithm, Vec<LayeredPolygon>, HashMap<usize, LayeredPolygon>) {
         let parts_by_id: HashMap<usize, LayeredPolygon> = (0..part_count).map(|id| (id, square(10.0))).collect();
         let adam: Vec<usize> = (0..part_count).collect();
-        let ga = GeneticAlgorithm::new(adam, GaConfig { population_size: 6, mutation_rate: 20.0, rotations: 1 }, Vec::new());
+        let ga = GeneticAlgorithm::new(adam, GaConfig { population_size: 6, mutation_rate: 20.0, rotations: 1 }, Vec::new(), 0);
         let sheets = vec![square(100.0)];
         (ga, sheets, parts_by_id)
     }
@@ -150,7 +242,8 @@ mod tests {
 
         // first call: every individual is freshly constructed with no
         // fitness yet, so all of them get placed.
-        let results = run_generation(&mut ga, &sheets, &parts_by_id, &cfg);
+        let cache = NfpCache::new();
+        let results = run_generation(&mut ga, &sheets, &parts_by_id, &HashMap::new(), &cfg, &|| false, &|_, _| {}, &cache);
         assert_eq!(results.len(), 6);
         for result in &results {
             assert_eq!(result.unplaced_count, 0, "4 small squares should all fit on one 100x100 sheet");
@@ -171,8 +264,51 @@ mod tests {
 
         // second call: the carried-over elite must NOT be re-placed - only
         // population_size - 1 fresh results this time.
-        let results2 = run_generation(&mut ga, &sheets, &parts_by_id, &cfg);
+        let results2 = run_generation(&mut ga, &sheets, &parts_by_id, &HashMap::new(), &cfg, &|| false, &|_, _| {}, &cache);
         assert_eq!(results2.len(), 5, "the elite survivor should be skipped, not re-placed");
+    }
+
+    #[test]
+    fn run_generation_stops_early_and_skips_advancing_the_ga_when_cancelled() {
+        let (mut ga, sheets, parts_by_id) = setup(4);
+        let cfg = placement_config();
+
+        let population_before = ga.population.clone();
+        let results = run_generation(&mut ga, &sheets, &parts_by_id, &HashMap::new(), &cfg, &|| true, &|_, _| {}, &NfpCache::new());
+
+        assert!(results.is_empty(), "cancelling before any individual starts should place none of them");
+        assert!(
+            ga.population.iter().zip(&population_before).all(|(a, b)| a.placement == b.placement),
+            "generation() must not have run - the population should be untouched"
+        );
+        for individual in &ga.population {
+            assert!(individual.fitness.is_none(), "no individual should have been evaluated");
+        }
+    }
+
+    #[test]
+    fn run_generation_reports_progress_once_up_front_and_once_per_individual() {
+        let (mut ga, sheets, parts_by_id) = setup(4);
+        let cfg = placement_config();
+
+        let ticks = std::sync::Mutex::new(Vec::new());
+        let results = run_generation(&mut ga, &sheets, &parts_by_id, &HashMap::new(), &cfg, &|| false, &|done, total| {
+            ticks.lock().unwrap().push((done, total));
+        }, &NfpCache::new());
+
+        let ticks = ticks.into_inner().unwrap();
+        // one upfront (0, total) call before any placement, then one per
+        // individual actually placed - 6 individuals fresh (population_size
+        // from setup's GaConfig), so 7 calls total.
+        assert_eq!(ticks.len(), 1 + results.len());
+        assert_eq!(ticks[0], (0, results.len()));
+        // done counts strictly increase 1..=total across the remaining calls
+        // (order isn't guaranteed across parallel individuals, but the
+        // shared counter is atomic, so every value 1..=total appears exactly
+        // once).
+        let mut dones: Vec<usize> = ticks[1..].iter().map(|&(done, _)| done).collect();
+        dones.sort_unstable();
+        assert_eq!(dones, (1..=results.len()).collect::<Vec<_>>());
     }
 
     #[test]
@@ -180,7 +316,7 @@ mod tests {
         let (mut ga, sheets, parts_by_id) = setup(5);
         let cfg = placement_config();
 
-        let best = run(&mut ga, &sheets, &parts_by_id, &cfg, 3).expect("3 generations should produce a best result");
+        let best = run(&mut ga, &sheets, &parts_by_id, &HashMap::new(), &cfg, 3, &|| false, &|_, _| {}).expect("3 generations should produce a best result");
 
         assert_eq!(best.unplaced_count, 0);
         assert!(best.fitness.is_finite());
@@ -190,6 +326,24 @@ mod tests {
     fn run_returns_none_for_zero_generations() {
         let (mut ga, sheets, parts_by_id) = setup(3);
         let cfg = placement_config();
-        assert!(run(&mut ga, &sheets, &parts_by_id, &cfg, 0).is_none());
+        assert!(run(&mut ga, &sheets, &parts_by_id, &HashMap::new(), &cfg, 0, &|| false, &|_, _| {}).is_none());
+    }
+
+    /// Regression test: `run()` used to hardcode `&|| false` internally, so
+    /// a caller reaching for this top-level API instead of hand-rolling
+    /// `run_generation`'s own loop (as `src-tauri`'s `run_nest_with_progress`
+    /// does) silently got no cancellation at all - the exact bug class
+    /// commit `7c6334b` ("Fix UI freeze on long nest runs") already fixed
+    /// once, reintroduced by this one function.
+    #[test]
+    fn run_actually_stops_when_should_cancel_fires() {
+        let (mut ga, sheets, parts_by_id) = setup(5);
+        let cfg = placement_config();
+
+        // Cancel immediately - if `run()` ignored this (as it used to),
+        // `generations: 1000` would still run to completion.
+        let best = run(&mut ga, &sheets, &parts_by_id, &HashMap::new(), &cfg, 1000, &|| true, &|_, _| {});
+
+        assert!(best.is_none(), "an immediate cancel should stop run() before any generation produces a result");
     }
 }

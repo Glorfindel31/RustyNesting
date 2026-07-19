@@ -20,6 +20,7 @@
 /// anything that doesn't parse as an integer, including NaN) then
 /// `((n % 360) + 360) % 360` (handles negative values correctly, unlike a
 /// plain `% 360`).
+#[must_use]
 pub fn normalize_rotation(rotation: f64) -> i64 {
     let n = if rotation.is_finite() { rotation.trunc() as i64 } else { 0 };
     ((n % 360) + 360) % 360
@@ -33,6 +34,7 @@ pub fn normalize_rotation(rotation: f64) -> i64 {
 /// them true - no mirrored-part feature exists yet) but are kept as real
 /// parameters rather than dropped, since they're part of the on-the-wire key
 /// format this must stay compatible with.
+#[must_use]
 pub fn nfp_cache_key(a: &str, b: &str, a_rotation: f64, b_rotation: f64, a_flipped: bool, b_flipped: bool) -> String {
     let a_rotation = normalize_rotation(a_rotation);
     let b_rotation = normalize_rotation(b_rotation);

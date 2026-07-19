@@ -131,6 +131,24 @@ input[type="number"] {
   width: 90px;
 }
 
+input[type="range"] {
+  width: 140px;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
+output {
+  color: var(--text);
+  font-size: 13px;
+  min-width: 3.5em;
+}
+
+.dominant-flag {
+  color: var(--error);
+  font-size: 11px;
+  letter-spacing: 0.03em;
+}
+
 input[type="checkbox"] {
   width: auto;
   padding: 0;
@@ -267,18 +285,44 @@ td input {
   display: block;
 }
 
-/* Floating, semi-transparent, always on top - so you can see what the
-   program is doing without scrolling down to find it, and without it
-   fully hiding whatever's behind it. */
-#panel-console {
+/* Floating, semi-transparent, always on top - so the console and the
+   config panel are visible without scrolling down to find them, and
+   without fully hiding whatever's behind them. Console on top, config
+   stacked directly under it - a single fixed-position flex column so the
+   config panel always sits right below the console regardless of how
+   tall the console's log content grows. */
+.floating-stack {
   position: fixed;
   top: 16px;
   right: 16px;
-  width: 340px;
+  width: 420px;
   max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+  z-index: 500;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* The config panel's rows were designed for the wide main column - label
+   above input, one field per line, keeps them readable at the floating
+   stack's narrower width instead of wrapping mid-row. */
+.floating-stack #panel-config .row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+
+.floating-stack #panel-config input,
+.floating-stack #panel-config select {
+  width: 100%;
+}
+
+.floating-stack .panel {
   background: rgba(31, 31, 31, 0.72);
   backdrop-filter: blur(3px);
-  z-index: 500;
+  flex-shrink: 0;
 }
 
 #console-log {

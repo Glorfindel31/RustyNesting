@@ -35,8 +35,19 @@ fn rotate_log_if_needed(path: &Path) {
         Some(ext) => format!("{}.old", ext.to_string_lossy()),
         None => "old".to_string(),
     });
-    let _ = fs::remove_file(&old_path);
-    let _ = fs::rename(path, &old_path);
+    // Failures here are swallowed the same way `append_benchmark_line`'s own
+    // write failure is (a diagnostic log falling behind on rotation
+    // shouldn't crash the run it's observing) - but printed to stderr for
+    // the same reason too, so a permissions/disk-space problem isn't
+    // silently invisible, consistent with this file's other two functions.
+    if let Err(e) = fs::remove_file(&old_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("benchmark log rotation: couldn't remove old {}: {e}", old_path.display());
+        }
+    }
+    if let Err(e) = fs::rename(path, &old_path) {
+        eprintln!("benchmark log rotation: couldn't rename {} to {}: {e}", path.display(), old_path.display());
+    }
 }
 
 static CACHED_GIT_REV: OnceLock<String> = OnceLock::new();

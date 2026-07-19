@@ -183,3 +183,87 @@ about hole handling was simplified away, only the file format changed.
 - `main/util/interact.js`, `ractive.js`, `svgpanzoom.js`, `pathsegpolyfill.js`, `parallel.js` — vendored JS libs, ported to `frontend/util/` as-is (no Rust port; frontend is reused, not rewritten)
 - `main/font/**`, `main/img/**`, `main/style.css` — static assets, ported to `frontend/` as-is
 - `tests/index.spec.ts` — general test harness scaffolding, not a spec to port 1:1; revisit once `nest-cli` exists
+
+## Future directions (beyond the JS port)
+
+Everything above tracks parity with the original Electron app. These two are
+real, considered next steps that go past that scope — captured here so
+they don't get re-derived from scratch or silently dropped later.
+
+### Ejection-chain relocation in `nesting::consolidation` — tried, measured as a regression, reverted
+
+`refine_consolidation` only ever relocates one already-placed part at a time
+into a sheet with genuine free room (an exact, zero-overlap NFP fit) - it
+never rearranges parts already on a sheet, and never moves one part to make
+room for another. Real jobs show visibly fittable gaps this can't close,
+because the exact-fit search is already exhaustive against the *current*
+layout - if it fails, something else genuinely has to move first.
+
+Implemented `try_eject_and_place` (depth-1 ejection chain: evict one of a
+target sheet's own parts, see if that unblocks the candidate, then find the
+evictee a new home - the candidate's own former sheet first, then a small,
+bounded number of other sheets), correctness-verified via two new
+deterministic unit tests (both passed), reusing the existing exact-NFP
+placement machinery with no new dependency.
+
+**Then measured properly and reverted.** A single before/after comparison
+was inconclusive (97 sheets/85.0% vs 101/81.6%, within the noise band of an
+unseeded GA). Ran a real 5-trial-each A/B instead (same fixture, same
+config, `SKIP_EJECTION` env toggle to isolate the one variable): **without**
+ejection, avg 91.2 sheets / 90.5% util across `[85, 93, 93, 94, 91]`;
+**with** ejection, avg 101.0 sheets / 81.6% util across `[102, 100, 102, 99,
+102]` - zero overlap between the two distributions across 10 total runs.
+Ejection-chain relocation made results measurably worse, not better.
+
+Root cause (plausible, not separately re-verified): the feature's own
+nested search - up to ~3 evictees x (1 + 5 resettle attempts) real
+placement attempts per failing target sheet, tried across up to 500 target
+sheets per candidate - burns the consolidation pass's wall-clock `deadline`
+budget on mostly-futile eviction searches, starving the many cheap,
+successful *plain* relocations that budget would otherwise go to. The
+design review that shaped the implementation (see the session transcript)
+did flag this exact cost-multiplication risk before any code was written
+and recommended small constants specifically to bound it - which were used
+- but even the bounded version was too expensive relative to how often
+eviction actually pays off on this real job's part/sheet distribution.
+
+Reverted in full (removed `try_eject_and_place` and its helpers from
+`consolidation.rs`, kept the unrelated `MAX_TARGET_SHEETS_TRIED`/iteration
+cap increases from the wiring-in-consolidation work, since those were
+independently measured as a real improvement earlier). If revisited, the
+real lever is probably *not* trying eviction on every failing target sheet
+- e.g. only attempting it on the single sparsest/best-candidate target per
+part, or budgeting eviction attempts as their own separate, much smaller
+slice of the deadline rather than letting them compete unbounded with plain
+relocations for the same budget.
+
+### Full SOTA adoption (sparrow / jagua-rs) — investigated, deferred, possible future fork
+
+Investigated adopting `sparrow`/`jagua-rs` wholesale instead of the NFP+GA
+lineage this port is built on. Findings, so this doesn't need re-researching:
+
+- `sparrow` (github.com/JeroenGar/sparrow, MIT, KU Leuven, 2025) is the
+  actual current state-of-the-art heuristic for 2D irregular nesting - a
+  two-phase (exploration/compression) collision-relaxation search that
+  matches or beats every prior best-known result on academic benchmarks.
+- **It only solves single-strip packing** (minimize the length of one
+  continuous strip) — not this project's actual problem (minimize the
+  *count* of discrete, fixed-size sheets). That's a real architectural
+  mismatch, not a config difference.
+- `jagua-rs` (github.com/JeroenGar/jagua-rs, MIT, published on crates.io) is
+  the collision-detection engine underneath `sparrow`. It *models*
+  bin-packing as a variant (`bpp` feature, alongside `spp`/`mspp`), but ships
+  no competitive optimizer for that variant - its own reference
+  implementation (`lbf`) is explicitly documented as "not for real-world
+  use," a bare demo of the API surface, not a usable nester.
+- Neither project understands DXF - both speak only their own JSON format,
+  so any integration needs a translation layer regardless of approach.
+- Net assessment: getting true SOTA quality for *this* project's actual
+  problem shape (discrete multi-sheet, not strip) means writing a new
+  bin-packing optimizer on top of jagua-rs's primitives - closer to a
+  research project than an integration task, with real risk of landing
+  worse than the current (already-tuned) NFP+GA+consolidation pipeline for a
+  long time before it might become better.
+- Decision: not pursued now. If revisited, do it as a separate fork/branch
+  experiment rather than inside this port - it would be a genuinely
+  different engine, not an increment on this one.

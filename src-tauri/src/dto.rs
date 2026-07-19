@@ -8,13 +8,13 @@
 
 use std::collections::HashMap;
 
-use geometry::dxf_import::LayeredPolygon;
+use geometry::dxf_import::{LayeredPolygon, TextAnnotation};
 use geometry::point::Point;
 use nesting::ga::GaConfig;
 use nesting::placement::{PlacementConfig, PlacementType};
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, Serialize, Clone, Copy, Debug)]
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq)]
 pub struct PointDto {
     pub x: f64,
     pub y: f64,
@@ -32,11 +32,49 @@ impl From<PointDto> for Point {
     }
 }
 
-#[derive(Deserialize, Serialize, Clone, Copy, Debug)]
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq)]
 pub struct CircleDto {
     pub cx: f64,
     pub cy: f64,
     pub r: f64,
+}
+
+/// A `TEXT`/`MTEXT` label attached to a part/sheet, matching
+/// `geometry::dxf_import::TextAnnotation` field-for-field - see that type's
+/// doc comment for why this exists (DXF text has no closed boundary, so it
+/// rides along attached to whichever profile contains it instead of being a
+/// `PolygonDto` of its own).
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct TextDto {
+    pub position: PointDto,
+    pub rotation_deg: f64,
+    pub height: f64,
+    pub value: String,
+    pub is_multiline: bool,
+}
+
+impl From<&TextAnnotation> for TextDto {
+    fn from(text: &TextAnnotation) -> Self {
+        TextDto {
+            position: PointDto::from(&text.position),
+            rotation_deg: text.rotation_deg,
+            height: text.height,
+            value: text.value.clone(),
+            is_multiline: text.is_multiline,
+        }
+    }
+}
+
+impl From<TextDto> for TextAnnotation {
+    fn from(dto: TextDto) -> Self {
+        TextAnnotation {
+            position: Point::from(dto.position),
+            rotation_deg: dto.rotation_deg,
+            height: dto.height,
+            value: dto.value,
+            is_multiline: dto.is_multiline,
+        }
+    }
 }
 
 /// A polygon plus its holes, matching `geometry::dxf_import::LayeredPolygon`
@@ -51,6 +89,8 @@ pub struct PolygonDto {
     pub is_circle: Option<CircleDto>,
     #[serde(default)]
     pub children: Vec<PolygonDto>,
+    #[serde(default)]
+    pub texts: Vec<TextDto>,
 }
 
 impl From<&LayeredPolygon> for PolygonDto {
@@ -60,6 +100,7 @@ impl From<&LayeredPolygon> for PolygonDto {
             layer: poly.layer.clone(),
             is_circle: poly.is_circle.map(|c| CircleDto { cx: c.cx, cy: c.cy, r: c.r }),
             children: poly.children.iter().map(PolygonDto::from).collect(),
+            texts: poly.texts.iter().map(TextDto::from).collect(),
         }
     }
 }
@@ -71,6 +112,7 @@ impl From<PolygonDto> for LayeredPolygon {
             layer: dto.layer,
             is_circle: dto.is_circle.map(|c| geometry::circular_nfp::Circle { cx: c.cx, cy: c.cy, r: c.r }),
             children: dto.children.into_iter().map(LayeredPolygon::from).collect(),
+            texts: dto.texts.into_iter().map(TextAnnotation::from).collect(),
         }
     }
 }
@@ -102,36 +144,65 @@ fn one() -> usize {
 /// (`Number(quantity) || totalPartInstances || 1`, "0 means unlimited"), a
 /// different code path with different semantics that doesn't apply to
 /// parts.
-pub fn expand_parts(parts: Vec<PartDto>) -> (Vec<usize>, HashMap<usize, LayeredPolygon>) {
+#[must_use]
+/// Also returns `shape_ids` (instance id -> source id): every quantity-copy
+/// of the same `PartDto` shares one source id (this loop's own index over
+/// the input `Vec<PartDto>`, before per-quantity expansion) - lets the NFP
+/// cache dedupe by shape instead of by per-instance id, restoring parity
+/// with the original app's `.source`-keyed cache (see
+/// `docs/PORT_STATUS.md`'s Phase 4 entry, and `nesting::placement::NestPart::
+/// source_id`'s doc comment for where this actually gets used). A
+/// definition-order identity, not a content-hash one - two separate
+/// `PartDto` entries with byte-identical polygons still get different
+/// source ids; fine for "one imported shape, quantity N", not "the same
+/// shape imported twice as separate parts".
+pub fn expand_parts(parts: Vec<PartDto>) -> (Vec<usize>, HashMap<usize, LayeredPolygon>, HashMap<usize, usize>) {
     let mut parts_by_id = HashMap::new();
+    let mut shape_ids = HashMap::new();
     let mut adam = Vec::new();
     let mut next_id = 0usize;
 
-    for part in parts {
+    for (source_id, part) in parts.into_iter().enumerate() {
         let polygon: LayeredPolygon = part.polygon.into();
-        for _ in 0..part.quantity {
+        let Some(last) = part.quantity.checked_sub(1) else { continue };
+        // Clone for every copy but the last, where a move does instead -
+        // `quantity` copies never need more than `quantity - 1` clones.
+        for _ in 0..last {
             parts_by_id.insert(next_id, polygon.clone());
+            shape_ids.insert(next_id, source_id);
             adam.push(next_id);
             next_id += 1;
         }
+        parts_by_id.insert(next_id, polygon);
+        shape_ids.insert(next_id, source_id);
+        adam.push(next_id);
+        next_id += 1;
     }
 
-    adam.sort_by(|&a, &b| {
-        let area_a = geometry::polygon::polygon_area(&parts_by_id[&a].points).abs();
-        let area_b = geometry::polygon::polygon_area(&parts_by_id[&b].points).abs();
-        area_b.total_cmp(&area_a)
-    });
+    // Decorate-sort-undecorate: each id's area is computed once up front
+    // instead of being recomputed on every comparison a sort makes
+    // (O(n log n) recomputations otherwise, for a value that never changes
+    // mid-sort).
+    let mut adam_with_area: Vec<(usize, f64)> = adam.into_iter().map(|id| (id, geometry::polygon::polygon_area(&parts_by_id[&id].points).abs())).collect();
+    adam_with_area.sort_by(|&(_, area_a), &(_, area_b)| area_b.total_cmp(&area_a));
+    let adam: Vec<usize> = adam_with_area.into_iter().map(|(id, _)| id).collect();
 
-    (adam, parts_by_id)
+    (adam, parts_by_id, shape_ids)
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum PlacementTypeDto {
     Gravity,
     Box,
     #[serde(rename = "convexhull")]
     ConvexHull,
+    #[serde(rename = "tightfit")]
+    TightFit,
+    #[serde(rename = "gravitytightfit")]
+    GravityTightFit,
+    #[serde(rename = "gravitycorrective")]
+    GravityCorrective,
 }
 
 impl From<PlacementTypeDto> for PlacementType {
@@ -140,11 +211,14 @@ impl From<PlacementTypeDto> for PlacementType {
             PlacementTypeDto::Gravity => PlacementType::Gravity,
             PlacementTypeDto::Box => PlacementType::Box,
             PlacementTypeDto::ConvexHull => PlacementType::ConvexHull,
+            PlacementTypeDto::TightFit => PlacementType::TightFit,
+            PlacementTypeDto::GravityTightFit => PlacementType::GravityTightFit,
+            PlacementTypeDto::GravityCorrective => PlacementType::GravityCorrective,
         }
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct NestConfigDto {
     pub placement_type: PlacementTypeDto,
     pub rotations: u32,
@@ -175,6 +249,28 @@ pub struct NestConfigDto {
     /// pool, which can only ever be configured once per process.
     #[serde(default)]
     pub max_threads: usize,
+    /// Seed for `nesting::ga::GeneticAlgorithm`'s RNG - the same seed with
+    /// the same everything else always reproduces the exact same run
+    /// (initial population, every mutation/crossover/selection roll across
+    /// every generation). Defaults to 0 for old saved configs that predate
+    /// this field. See `GeneticAlgorithm::new`'s own doc comment for why
+    /// this replaced `rand::thread_rng()` - comparing placement strategies
+    /// needs to isolate "did this change actually help" from "did this run
+    /// just get a luckier starting population."
+    #[serde(default)]
+    pub seed: u64,
+    // Live preview - commented out (2026), never worked reliably (see
+    // git history for `frontend/index.html`'s `#cfg-live-viz`/
+    // `#live-preview-section` and `frontend/app.js`'s matching listeners/
+    // queue, also commented out) - not deleted, so it's easy to pick back
+    // up later. When true, `run_nest_command` was going to stream every
+    // generation that improved on the best-so-far (full placement, not
+    // just summary stats) via a `"nest-live-generation-result"` event, for
+    // the frontend to replay part by part - see
+    // `commands::run_nest_with_progress`'s own (also commented-out)
+    // `on_generation_improved`/`on_start` hooks.
+    // #[serde(default)]
+    // pub live_visualization: bool,
 }
 
 fn default_dominant_part_area_threshold() -> f64 {
@@ -188,7 +284,7 @@ fn default_curve_tolerance() -> f64 {
 impl NestConfigDto {
     pub fn placement_config(&self) -> PlacementConfig {
         PlacementConfig {
-            placement_type: self.placement_type.clone().into(),
+            placement_type: self.placement_type.into(),
             rotations: self.rotations,
             dominant_part_area_threshold: self.dominant_part_area_threshold,
             curve_tolerance: self.curve_tolerance,
@@ -236,6 +332,17 @@ pub struct RunNestResponse {
     /// *which* parts are missing (highlighted distinctly) instead of just
     /// the count.
     pub unplaced_ids: Vec<usize>,
+    /// The authoritative id -> shape mapping `expand_parts` built for this
+    /// run (true, unpadded geometry) - the frontend should hand this back
+    /// to `export_dxf_command` verbatim rather than resending its own
+    /// `parts`/quantities for `export_dxf` to re-run `expand_parts` on a
+    /// second time. Re-deriving ids from client-resent input was a real
+    /// silent-corruption risk: if that resent list ever differed in order,
+    /// count, or content from what actually produced `placements`' ids (a
+    /// stale cached array, a reorder, anything), `export_dxf` would resolve
+    /// a placement's id to the *wrong* part's geometry with no error at
+    /// all - just the wrong outline silently written at that position.
+    pub parts_by_id: HashMap<usize, PolygonDto>,
     /// Every genuinely-better nest found during the run, in the order
     /// found (chronological, not sorted by fitness) - the top-level
     /// `placements`/`fitness`/etc. above are just `history`'s last entry,
@@ -243,6 +350,11 @@ pub struct RunNestResponse {
     /// about the rest. Lets the frontend show "the other nests it tried",
     /// not just the one that ended up best.
     pub history: Vec<NestSnapshotDto>,
+    /// True if a `cancel_nest_command` call cut the run short before
+    /// `generations` completed - `placements`/`fitness`/etc. above are still
+    /// the best found up to that point, not an error, since a user-requested
+    /// stop is a normal outcome, not a failure.
+    pub cancelled: bool,
 }
 
 /// One candidate nest result kept in `RunNestResponse::history` - the same
@@ -258,15 +370,39 @@ pub struct NestSnapshotDto {
     pub unplaced_ids: Vec<usize>,
 }
 
+/// The best nest result across every run this app has ever completed,
+/// persisted to disk (`commands::best_result_file_path`) so a later session
+/// can offer to recover it instead of starting blank. Deliberately a
+/// separate, smaller type from `RunNestResponse` - no `history` (a past
+/// run's intermediate attempts aren't meaningful once you're just restoring
+/// the winner) and no `cancelled` (irrelevant to a persisted snapshot) - and
+/// deliberately carries its own `sheets`, which `RunNestResponse` doesn't:
+/// a live session already has the request's sheets in hand to render
+/// against, but a result recovered fresh in a *new* session has nothing
+/// else to render it with.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BestResultDto {
+    pub placements: Vec<SheetPlacementDto>,
+    pub fitness: f64,
+    pub utilisation: f64,
+    pub unplaced_count: usize,
+    pub unplaced_ids: Vec<usize>,
+    pub parts_by_id: HashMap<usize, PolygonDto>,
+    pub sheets: Vec<PolygonDto>,
+}
+
 /// What `export_dxf_command` needs to write a nest result back out to DXF -
 /// exactly what the frontend already has after a `run_nest_command` call:
-/// the original request's `sheets`/`parts` (true, unpadded geometry - the
-/// same ones `run_nest` was given, not the padded shapes it built
-/// internally) and that call's own `placements` response.
+/// the original request's `sheets` (true, unpadded geometry - the same ones
+/// `run_nest` was given, not the padded shapes it built internally),
+/// `RunNestResponse::parts_by_id` (the authoritative id -> shape mapping
+/// that call already built - see its own doc comment for why this must be
+/// the same mapping, not re-derived from a resent `parts`/quantity list),
+/// and that call's own `placements` response.
 #[derive(Deserialize, Clone, Debug)]
 pub struct ExportDxfRequest {
     pub sheets: Vec<PolygonDto>,
-    pub parts: Vec<PartDto>,
+    pub parts_by_id: HashMap<usize, PolygonDto>,
     pub placements: Vec<SheetPlacementDto>,
     /// Gap, in the same units as the geometry (mm), kept between
     /// consecutive sheets when laying them out left-to-right in one DXF
@@ -293,4 +429,41 @@ pub struct NestProgressDto {
     pub unplaced_count: usize,
     pub utilisation: f64,
 }
+
+/// Payload for the `"nest-tick"` event, emitted from inside a single
+/// generation as individuals are placed (not just once the whole generation
+/// finishes, like `"nest-progress"` above) - see
+/// `nesting::dispatch::run_generation`'s `on_individual_placed` doc comment
+/// for why: a single individual can be real, tens-of-seconds work against
+/// non-trivial geometry, and without a signal at this granularity a slow
+/// generation looks indistinguishable from a hung one.
+#[derive(Serialize, Clone, Copy, Debug)]
+pub struct NestTickDto {
+    pub generation: usize,
+    pub individuals_done: usize,
+    pub individuals_total: usize,
+}
+
+// Live preview - commented out, see `NestConfigDto::live_visualization`'s
+// own comment for why (not deleted, easy to restore later).
+//
+// /// Payload for the `"nest-live-generation-result"` event `run_nest_command`
+// /// emits during a `live_visualization` run, once per generation that
+// /// actually improves on the best found so far (the same trigger
+// /// `RunNestResponse::history` already uses - see
+// /// `commands::run_nest_with_progress`'s `on_generation_improved` hook).
+// /// Carries the *full* placement, not just summary stats like
+// /// `NestProgressDto` - the frontend replays it part by part client-side
+// /// (see `frontend/app.js`'s live-preview listeners), so there's no need for
+// /// the backend to stream individual part-placement events at all: only
+// /// genuinely meaningful arrangements (an improving generation's winner) are
+// /// ever shown, not the GA's many discarded random attempts in between.
+// #[derive(Serialize, Clone, Debug)]
+// pub struct LiveGenerationResultDto {
+//     pub generation: usize,
+//     pub generations: usize,
+//     pub fitness: f64,
+//     pub unplaced_count: usize,
+//     pub placements: Vec<SheetPlacementDto>,
+// }
 

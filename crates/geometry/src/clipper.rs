@@ -51,6 +51,11 @@ fn from_paths(paths: ClipperPaths) -> Vec<Vec<Point>> {
 /// Clipper2 offsetting knob - callers that need round/bevel joins can call
 /// `clipper2::inflate` directly.
 pub fn offset(polygon: &[Point], delta: f64) -> Vec<Vec<Point>> {
+    // Exact comparison is deliberate, not a float_cmp footgun: `delta: 0.0`
+    // is a real, common sentinel (a caller with margin/spacing both zero,
+    // e.g. `clearance::prepare_sheet`/`prepare_part`), and a true zero-input
+    // no-op short-circuit is the correct behavior - there's no "close to
+    // zero" case here that should still go through the Clipper round-trip.
     if delta == 0.0 {
         return vec![polygon.to_vec()];
     }
@@ -61,29 +66,44 @@ pub fn offset(polygon: &[Point], delta: f64) -> Vec<Vec<Point>> {
 }
 
 /// Expands (positive `delta`) or contracts (negative `delta`) a polygon
-/// using a **round** join instead of `offset`'s miter one - i.e. a true
-/// Minkowski sum with a disk of radius `|delta|`, which can never overshoot
-/// by more than `delta` in any direction. `offset`'s miter join is correct
-/// for parity with the original app's `polygonOffset` (used by the
-/// simplification pipeline, where matching the JS output matters), but a
-/// miter join's spike length grows without bound as a corner gets more
-/// acute (capped only by the miter limit, e.g. up to 4x `delta` at the
-/// sharpest corners `offset` allows before falling back to a bevel) - which
-/// is exactly wrong for a clearance/keep-out buffer (`geometry::clearance`):
-/// a sliver-shaped part with a sharp tip would get padded far more than the
-/// requested spacing at that tip, potentially no longer fitting a sheet it
-/// obviously should (confirmed against the real `tests/fixtures/*.dxf`
-/// parts - several sliver profiles grew by 15-44mm instead of the expected
-/// ~6.5mm at a spacing of 6.5). Round join has no such spike: every point
-/// on the result is within exactly `delta` of some point on the original
-/// boundary, corner or not.
-pub fn offset_round(polygon: &[Point], delta: f64) -> Vec<Vec<Point>> {
+/// using a **bevel** join instead of `offset`'s miter one - safe for a
+/// clearance/keep-out buffer (`geometry::clearance`) the same way a round
+/// join would be, but without a round join's cost.
+///
+/// `offset`'s miter join is correct for parity with the original app's
+/// `polygonOffset` (used by the simplification pipeline, where matching the
+/// JS output matters), but a miter join's spike length grows without bound
+/// as a corner gets more acute (capped only by the miter limit, e.g. up to
+/// 4x `delta` at the sharpest corners `offset` allows before falling back to
+/// a bevel) - which is exactly wrong for a clearance buffer: a sliver-shaped
+/// part with a sharp tip would get padded far more than the requested
+/// spacing at that tip, potentially no longer fitting a sheet it obviously
+/// should (confirmed against the real `tests/fixtures/*.dxf` parts - several
+/// sliver profiles grew by 15-44mm instead of the expected ~6.5mm at a
+/// spacing of 6.5).
+///
+/// A **round** join (this function's first version) also has no such
+/// spike - every point on the result is within exactly `delta` of some point
+/// on the original boundary - but it pays for that guarantee by tessellating
+/// every corner into an arc, and this crate's coordinate scale
+/// (`DeepnestScale`, x10^7) makes Clipper2's default arc tessellation far
+/// denser than needed: a plain 4-point rectangle came back as ~56 points on
+/// real fixture parts, and every downstream NFP computation (a Minkowski
+/// diff per obstacle pair, per rotation, per generation) then did legitimate
+/// but pointless O(n*m) work on those bloated shapes - confirmed to be the
+/// dominant real-world cost of a full nest run. A **bevel** join gives the
+/// same no-spike guarantee (confirmed against the same real fixtures: never
+/// more than `delta` growth, often exactly `delta`) while flat-cutting each
+/// corner with a single extra segment instead of an arc - about 2x the
+/// original point count on real parts, not ~14x.
+pub fn offset_bevel(polygon: &[Point], delta: f64) -> Vec<Vec<Point>> {
+    // Same deliberate exact-zero short-circuit as `offset` above, same reason.
     if delta == 0.0 {
         return vec![polygon.to_vec()];
     }
 
     let paths: ClipperPaths = vec![to_raw_path(polygon)].into();
-    let result = inflate(paths, delta, JoinType::Round, EndType::Polygon, 4.0);
+    let result = inflate(paths, delta, JoinType::Bevel, EndType::Polygon, 4.0);
     from_paths(result)
 }
 
@@ -93,6 +113,7 @@ pub fn offset_round(polygon: &[Point], delta: f64) -> Vec<Vec<Point>> {
 /// points (Clipper2's `simplify` is the equivalent of Clipper1's
 /// `CleanPolygon`) within `0.01 * curve_tolerance`. Returns `None` if
 /// nothing is left after simplification, same as the original.
+#[must_use]
 pub fn clean_polygon(polygon: &[Point], curve_tolerance: f64) -> Option<Vec<Point>> {
     let paths: ClipperPaths = vec![to_raw_path(polygon)].into();
     let empty: ClipperPaths = Vec::<Vec<(f64, f64)>>::new().into();
@@ -169,6 +190,7 @@ pub fn xor_polygons(subject: &[Vec<Point>], clip: &[Vec<Point>], fill_rule: Fill
 /// step, largest-loop selection, and the translate-back-to-`b[0]` that the
 /// original does inline. Returns `None` for degenerate input or if Clipper2
 /// produces no solution.
+#[must_use]
 pub fn outer_nfp(a: &[Point], b: &[Point]) -> Option<Vec<Point>> {
     if a.len() < 3 || b.len() < 3 {
         return None;
