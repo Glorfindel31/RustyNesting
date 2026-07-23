@@ -90,12 +90,23 @@ pub fn repack_sheet(
     }
 
     let baseline_cache = NfpCache::new();
-    let original = place_parts(sheets, original_parts, placement_config, &baseline_cache, &|| false, &|_, _| {}, &|_, _, _| {})?;
+    let original = place_parts(sheets, original_parts, placement_config, &baseline_cache, should_cancel, &|_, _| {}, &|_, _, _| {})?;
     if original.unplaced_count != 0 {
         return None; // shouldn't happen (these parts already fit today), but never trust the replay blindly
     }
 
     let adam: Vec<usize> = current.parts.iter().map(|p| p.id).collect();
+    // Deliberately *not* warm-starting population[0]'s rotation genes from
+    // current.parts' actual rotations, despite looking like an obvious
+    // improvement (an earlier review flagged exactly this as a gap) -
+    // measured it directly against this module's own "finds and applies a
+    // strictly better arrangement" fixture and it's a real regression, not
+    // a neutral change: seed 0 finds fitness 14850 starting from
+    // GeneticAlgorithm::new's own random rotation roll, but gets stuck
+    // exactly at the 14955 baseline when population[0] starts tied to it
+    // instead. A population[0] identical to `original` gives mutation/
+    // crossover a worse starting diversity than a random one for this
+    // search, not a better one - keep the random init.
     let mut ga = GeneticAlgorithm::new(adam, ga_config.clone(), Vec::new(), seed);
     let candidate = dispatch::run(&mut ga, sheets, parts_by_id, shape_ids, placement_config, generations, should_cancel, &|_, _| {})?;
 

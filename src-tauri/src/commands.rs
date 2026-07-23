@@ -319,17 +319,24 @@ pub fn repack_sheet(request: RepackSheetRequest) -> Result<RepackSheetResponse, 
 
     let original_totals = recompute_totals(std::slice::from_ref(&current), &parts_by_id, std::slice::from_ref(&sheet));
 
-    // Gravity, not whatever placement_type the main run used: a repack's
-    // whole point is tightening up a single sheet, and Gravity's
-    // settle-toward-a-corner behavior clusters parts onto one side of the
-    // sheet - the visually "tidier" result users actually expect from
-    // REPACK, more than TightFit's local snug-contact scoring (which can
-    // leave an equally valid but scattered arrangement, since utilisation
-    // alone can't tell the two apart - see nesting::repack's own module
-    // doc for why is_better_sheet exists at all). Every other config value
-    // (rotations, dominant area, tolerance, GA params) still comes from
-    // the user's real config, only the scoring strategy changes.
-    let repack_placement_config = PlacementConfig { placement_type: PlacementType::Gravity, ..request.config.placement_config() };
+    // GravityTightFit, not whatever placement_type the main run used, and
+    // not plain Gravity either: a repack's whole point is tightening up a
+    // single sheet. Plain Gravity only scores the *overall bounding
+    // envelope* of everything placed so far (width*5+height) - it has no
+    // notion of "touching a neighbor" at all, so multiple candidate
+    // positions that happen to produce the same envelope score exactly the
+    // same, and the search picks among them with no preference for closing
+    // gaps. That's visibly bad for plain rectangles specifically, which tie
+    // on envelope score constantly. GravityTightFit keeps the same
+    // gravity-driven envelope scoring to decide the general area/side
+    // (`find_best_hybrid_candidate`'s champion pick), but breaks ties
+    // between equally-good envelope candidates by real contact area
+    // instead of arbitrarily - so among positions that tie on compactness,
+    // it always prefers the one that actually hugs its neighbors. Every
+    // other config value (rotations, dominant area, tolerance, GA params)
+    // still comes from the user's real config, only the scoring strategy
+    // changes.
+    let repack_placement_config = PlacementConfig { placement_type: PlacementType::GravityTightFit, ..request.config.placement_config() };
 
     // Same "0 means uncapped, otherwise a scoped pool for this call" pattern
     // run_nest_with_progress uses for the main escalation loop - without
@@ -904,11 +911,15 @@ pub fn run_nest_with_progress(
     // fully-placed sheet's arrangement, it never un-places anything.
     let mut best = best;
     if let Some(threshold) = cleanup_threshold {
-        // Same Gravity override as the manual REPACK command (commands::repack_sheet)
-        // - both call nesting::repack::repack_sheet for the same "tighten up
-        // this one sheet" job, so both should cluster toward a corner
-        // instead of reusing the main run's placement_type verbatim.
-        let repack_placement_config = PlacementConfig { placement_type: PlacementType::Gravity, ..placement_config.clone() };
+        // Same GravityTightFit override as the manual REPACK command
+        // (commands::repack_sheet) - both call nesting::repack::repack_sheet
+        // for the same "tighten up this one sheet" job, so both should get
+        // the same gravity-driven-envelope-plus-contact-tiebreak scoring
+        // instead of reusing the main run's placement_type verbatim. See
+        // that command's own comment for why plain Gravity alone isn't
+        // enough (no tie-break at all between equally-compact envelope
+        // candidates, visibly bad for plain rectangles).
+        let repack_placement_config = PlacementConfig { placement_type: PlacementType::GravityTightFit, ..placement_config.clone() };
         // Matches repack_placement_config's rotations (the *winning* run's,
         // possibly escalated past the request's original value), not
         // base_ga_config's pre-escalation one - GaConfig::rotations bounds
