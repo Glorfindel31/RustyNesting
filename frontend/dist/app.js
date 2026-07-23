@@ -752,6 +752,17 @@ el("lang-switch").value = getLang();
 applyStaticTranslations();
 el("settings-bar-label").innerHTML = renderSettingsBarLabel(true);
 
+// Reads the real app version from tauri.conf.json (via Tauri's own core
+// app module, already covered by capabilities/default.json's core:default
+// grant - no new permission needed) instead of hardcoding a copy here that
+// could drift out of sync with the actual build.
+window.__TAURI__.app
+  .getVersion()
+  .then((version) => {
+    el("app-version").textContent = `v${version}`;
+  })
+  .catch((err) => logLine(`could not read app version: ${err}`));
+
 el("lang-switch").addEventListener("change", (event) => {
   setLang(event.target.value);
   el("help-lang-switch").value = event.target.value;
