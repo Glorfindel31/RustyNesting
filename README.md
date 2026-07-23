@@ -91,3 +91,7 @@ implementation on purpose.
 - [`docs/PORT_STATUS.md`](docs/PORT_STATUS.md) — phase-by-phase status
 - [`CLAUDE.md`](CLAUDE.md) — guidance for AI coding assistants working in
   this repo; also doubles as detailed architecture documentation for humans
+
+## License
+
+[MIT](LICENSE)
