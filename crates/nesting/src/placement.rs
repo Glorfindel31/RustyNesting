@@ -266,6 +266,25 @@ pub struct PlaceResult {
     pub unplaced_ids: Vec<usize>,
 }
 
+/// One rotation/position `try_place_part_on_sheet` (or the TightFit-family
+/// first-part rotation search in `place_parts`) actually scored while
+/// placing a part - not just the winner. `score` is always
+/// `CandidateScore::area()`'s raw number (lower wins, same convention
+/// `find_best_candidate` uses for every placement type, including
+/// `TightFit`'s already-negated contact area) - a caller replaying these
+/// doesn't need to know which placement type produced them to rank "better"
+/// vs "worse". Only candidates that survived the "does this even land inside
+/// the sheet" filter are recorded - an NFP vertex rejected before scoring
+/// was never a real option, not a rejected one.
+#[derive(Clone, Copy, Debug)]
+pub struct CandidateTrace {
+    pub x: f64,
+    pub y: f64,
+    pub rotation: f64,
+    pub score: f64,
+    pub accepted: bool,
+}
+
 fn shift_points(points: &[Point], dx: f64, dy: f64) -> Vec<Point> {
     points.iter().map(|p| Point::new(p.x + dx, p.y + dy)).collect()
 }
@@ -562,12 +581,58 @@ impl PlaceOnSheetOutcome {
     }
 }
 
+/// `TightFit`'s "neighborhood" against a given sheet/already-placed-obstacle
+/// set - see `tight_fit_neighborhood`'s own doc comment. Depends only on
+/// `sheet`/`placed`/`placement_type`, never on any candidate part's
+/// rotation or position.
+type TightFitNeighborhood = (Vec<(Bounds, Vec<Point>)>, Vec<(Bounds, Vec<Point>)>);
+
+/// Builds `TightFit`'s "neighborhood", kept as two separate lists (not
+/// merged) so `tight_fit_contact_area` can weight contact against an
+/// already-placed part higher than contact against the empty sheet border -
+/// see that function's own doc comment for why. Each polygon's bounding box
+/// is precomputed alongside it so every candidate can cheaply cull down to
+/// "only obstacles close enough to possibly touch" before paying for a real
+/// Clipper call.
+///
+/// Depends only on `sheet`/`placed`/`placement_type` - never on a candidate
+/// part's rotation or position - so a caller placing the same part at
+/// several rotations in a row (`place_parts`'s 2nd+ part rotation search)
+/// computes this once and reuses it across every rotation tried via
+/// `try_place_part_on_sheet_with_neighborhood`, instead of paying for
+/// `sheet_border_band`'s real `offset_bevel`/`difference_polygons` Clipper
+/// call again on every single rotation - confirmed via code review to be a
+/// real, avoidable cost on exactly the densely-packed-sheet jobs the
+/// multi-rotation search itself targets.
+fn tight_fit_neighborhood(sheet: &LayeredPolygon, placed: &[PlacedObstacle], placement_type: PlacementType) -> TightFitNeighborhood {
+    if matches!(placement_type, PlacementType::TightFit | PlacementType::GravityTightFit | PlacementType::GravityCorrective) {
+        let parts: Vec<(Bounds, Vec<Point>)> = placed
+            .iter()
+            .map(|o| shift_points(&o.polygon.points, o.placement.x, o.placement.y))
+            .filter_map(|p| get_polygon_bounds(&p).map(|b| (b, p)))
+            .collect();
+        let border: Vec<(Bounds, Vec<Point>)> = sheet_border_band(sheet).into_iter().filter_map(|p| get_polygon_bounds(&p).map(|b| (b, p))).collect();
+        (parts, border)
+    } else {
+        (Vec::new(), Vec::new())
+    }
+}
+
 /// Port of `tryPlacePartOnSheet`. `place_parts` never calls this for a
 /// sheet's first part (that stays the inline top-left-corner fast path,
 /// same as the original) but `placed` being empty is otherwise handled
 /// correctly here - `nesting::consolidation`'s cross-sheet relocation needs
 /// that, since a relocation target isn't guaranteed to already have a part
 /// on it.
+///
+/// Convenience wrapper computing its own `tight_fit_neighborhood` from
+/// `sheet`/`placed`/`config.placement_type` - the right choice for any
+/// caller placing at just one rotation (every test in this module,
+/// `consolidation::refine_consolidation`'s single relocation attempt). A
+/// caller trying several rotations of the *same* part/sheet/`placed` set in
+/// a row should call `tight_fit_neighborhood` once and reuse
+/// `try_place_part_on_sheet_with_neighborhood` directly instead - see that
+/// function's own doc comment.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn try_place_part_on_sheet(
@@ -579,7 +644,31 @@ pub fn try_place_part_on_sheet(
     placed: &[PlacedObstacle],
     config: &PlacementConfig,
     cache: &NfpCache,
+    on_candidates: &(impl Fn(&[CandidateTrace]) + Sync),
 ) -> PlaceOnSheetOutcome {
+    let neighborhood = tight_fit_neighborhood(sheet, placed, config.placement_type);
+    try_place_part_on_sheet_with_neighborhood(part, part_source_id, part_rotation, sheet_nfp, sheet, placed, config, cache, on_candidates, &neighborhood)
+}
+
+/// Same as `try_place_part_on_sheet`, but takes a precomputed
+/// `TightFitNeighborhood` instead of building its own - see
+/// `tight_fit_neighborhood`'s own doc comment for why/when a caller should
+/// prefer this directly.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn try_place_part_on_sheet_with_neighborhood(
+    part: &LayeredPolygon,
+    part_source_id: usize,
+    part_rotation: f64,
+    sheet_nfp: &[Vec<Point>],
+    sheet: &LayeredPolygon,
+    placed: &[PlacedObstacle],
+    config: &PlacementConfig,
+    cache: &NfpCache,
+    on_candidates: &(impl Fn(&[CandidateTrace]) + Sync),
+    neighborhood: &TightFitNeighborhood,
+) -> PlaceOnSheetOutcome {
+    let (tight_fit_parts_neighborhood, tight_fit_sheet_neighborhood) = neighborhood;
     let mut final_nfp: Vec<Vec<Point>> = sheet_nfp.to_vec();
 
     // Obstacles with no holes just subtract from final_nfp - since set
@@ -653,30 +742,6 @@ pub fn try_place_part_on_sheet(
     } else {
         None
     };
-
-    // `TightFit`'s "neighborhood", kept as two separate lists (not merged)
-    // so `tight_fit_contact_area` can weight contact against an
-    // already-placed part higher than contact against the empty sheet
-    // border - see that function's own doc comment for why. Built once per
-    // call, not per candidate - neither depends on candidate position.
-    // Each polygon's bounding box is precomputed alongside it so every
-    // candidate can cheaply cull down to "only obstacles close enough to
-    // possibly touch" before paying for a real Clipper call - `parts_neighborhood`
-    // only grows as more parts get placed on a sheet, so late in a sheet's
-    // fill this cull is what keeps each candidate's cost from scaling with
-    // how much is already placed.
-    let (tight_fit_parts_neighborhood, tight_fit_sheet_neighborhood): (Vec<(Bounds, Vec<Point>)>, Vec<(Bounds, Vec<Point>)>) =
-        if matches!(config.placement_type, PlacementType::TightFit | PlacementType::GravityTightFit | PlacementType::GravityCorrective) {
-            let parts: Vec<(Bounds, Vec<Point>)> = placed
-                .iter()
-                .map(|o| shift_points(&o.polygon.points, o.placement.x, o.placement.y))
-                .filter_map(|p| get_polygon_bounds(&p).map(|b| (b, p)))
-                .collect();
-            let border: Vec<(Bounds, Vec<Point>)> = sheet_border_band(sheet).into_iter().filter_map(|p| get_polygon_bounds(&p).map(|b| (b, p))).collect();
-            (parts, border)
-        } else {
-            (Vec::new(), Vec::new())
-        };
 
     let mut candidates: Vec<Candidate> = Vec::new();
     for region in &final_nfp {
@@ -768,7 +833,7 @@ pub fn try_place_part_on_sheet(
                 }
                 PlacementType::TightFit => {
                     let part_bounds = part_bounds.expect("part always has points");
-                    let contact_area = tight_fit_contact_area(part, shiftvector, part_bounds, &tight_fit_parts_neighborhood, &tight_fit_sheet_neighborhood);
+                    let contact_area = tight_fit_contact_area(part, shiftvector, part_bounds, tight_fit_parts_neighborhood, tight_fit_sheet_neighborhood);
                     CandidateScore::TightFit { area: -contact_area }
                 }
                 PlacementType::GravityCorrective => unreachable!("mapped to Gravity or TightFit above"),
@@ -786,7 +851,7 @@ pub fn try_place_part_on_sheet(
     let mut excluded: HashSet<usize> = HashSet::new();
     loop {
         let champion = if config.placement_type == PlacementType::GravityTightFit {
-            find_best_hybrid_candidate(&candidates, &excluded, part, part_bounds.expect("part always has points"), &tight_fit_parts_neighborhood, &tight_fit_sheet_neighborhood)
+            find_best_hybrid_candidate(&candidates, &excluded, part, part_bounds.expect("part always has points"), tight_fit_parts_neighborhood, tight_fit_sheet_neighborhood)
         } else {
             find_best_candidate(&candidates, &excluded)
         };
@@ -795,7 +860,10 @@ pub fn try_place_part_on_sheet(
             // Every candidate has been tried and excluded (all of them
             // overlapped once checked against real geometry) - genuinely
             // nowhere left to place this part, not a computation failure.
-            None => return PlaceOnSheetOutcome::NoRoom,
+            None => {
+                on_candidates(&trace_candidates(&candidates, None, part_rotation));
+                return PlaceOnSheetOutcome::NoRoom;
+            }
         };
         let champion = &candidates[champion_idx];
         let shiftvector = champion.shiftvector;
@@ -813,6 +881,7 @@ pub fn try_place_part_on_sheet(
         }
 
         if !is_overlapping {
+            on_candidates(&trace_candidates(&candidates, Some(champion_idx), part_rotation));
             return PlaceOnSheetOutcome::Placed(PlaceOnSheetResult {
                 position: shiftvector,
                 minarea: champion.score.area(),
@@ -822,6 +891,19 @@ pub fn try_place_part_on_sheet(
 
         excluded.insert(champion_idx);
     }
+}
+
+/// Flattens `try_place_part_on_sheet`'s internal `Candidate` list into the
+/// public `CandidateTrace` shape, marking `accepted_idx` (if any) as the one
+/// that won. Kept as its own function rather than inlined at both call
+/// sites above, since a real overlap-retry means the champion the caller
+/// cares about isn't necessarily `candidates`' first or only entry.
+fn trace_candidates(candidates: &[Candidate], accepted_idx: Option<usize>, rotation: f64) -> Vec<CandidateTrace> {
+    candidates
+        .iter()
+        .enumerate()
+        .map(|(idx, c)| CandidateTrace { x: c.shiftvector.x, y: c.shiftvector.y, rotation, score: c.score.area(), accepted: Some(idx) == accepted_idx })
+        .collect()
 }
 
 /// Port of `placeParts`: opens sheets once and never revisits them (a part
@@ -853,6 +935,17 @@ pub fn try_place_part_on_sheet(
 /// one part at a time (e.g. a visualization), not just receive the final
 /// `PlaceResult`. Every non-visualization caller passes a no-op
 /// (`&|_, _| {}`); this adds no behavior of its own.
+///
+/// `on_candidates(sheet_index, part_id, &candidates)` fires right alongside
+/// `on_part_placed` (before it, on the same part attempt) with every
+/// rotation/position `try_place_part_on_sheet` actually scored for that
+/// part - not just the one that won. The sheet's first part (both the
+/// plain top-left-corner fast path and the TightFit-family rotation search)
+/// don't go through `try_place_part_on_sheet` at all; the former reports an
+/// empty candidate list (it does no scoring, just picks the first valid NFP
+/// vertex), the latter reports every rotation/position it actually
+/// compared. Every non-visualization caller passes a no-op
+/// (`&|_, _, _| {}`).
 #[must_use]
 pub fn place_parts(
     sheets: &[LayeredPolygon],
@@ -861,6 +954,7 @@ pub fn place_parts(
     cache: &NfpCache,
     should_cancel: &(impl Fn() -> bool + Sync),
     on_part_placed: &(impl Fn(usize, &PlacedPart) + Sync),
+    on_candidates: &(impl Fn(usize, usize, &[CandidateTrace]) + Sync),
 ) -> Option<PlaceResult> {
     let mut parts: Vec<NestPart> = parts
         .into_iter()
@@ -899,8 +993,9 @@ pub fn place_parts(
         let sheet = &sheets[sheet_idx];
         let sheet_src = sheet_source(sheet_idx);
         let sheet_area = polygon_area(&sheet.points).abs();
+        let sheet_usable_area = polygon_material_area(sheet);
         total_sheet_area += sheet_area;
-        total_usable_sheet_area += polygon_material_area(sheet);
+        total_usable_sheet_area += sheet_usable_area;
         fitness += sheet_area;
 
         let mut placed: Vec<PlacedObstacle> = Vec::new();
@@ -966,9 +1061,36 @@ pub fn place_parts(
                 let mut trial_polygon = parts[i].polygon.clone();
                 // (contact_area, position, rotation, polygon) of the best
                 // rotation/position seen so far - contact_area first so a
-                // genuinely tighter rotation always wins; among ties, the
-                // same top-left-most tiebreak the generic path below uses.
+                // genuinely tighter rotation always wins; among near-ties
+                // (within FIRST_PART_CONTACT_TOLERANCE of each other, not
+                // just exactly equal), the same top-left-most tiebreak the
+                // generic path below uses.
+                //
+                // Widened from an exact-equality tie ("almost_equal") to a
+                // relative tolerance band: `sheet_border_band` treats all
+                // four edges as equally attractive contact, so for an
+                // irregular part the single rotation/corner that happens to
+                // nestle marginally tighter than the rest wins outright,
+                // anchoring the sheet's *entire* pack wherever that
+                // happened to be - not necessarily anywhere near the
+                // origin. Every part placed after this one only ever
+                // extends the growing cluster (try_place_part_on_sheet's own
+                // contact scoring, weighted 2x toward touching existing
+                // parts over the sheet border - see TIGHT_FIT_PART_CONTACT_
+                // WEIGHT), so a low-density job (a sheet with far more room
+                // than the parts need) ends up as one tight blob parked in
+                // whatever corner this first search preferred, leaving most
+                // of the sheet empty - confirmed against a real 20-part/
+                // 500x500 job that clustered entirely into x=[328,500]/
+                // y=[304,500], nowhere near the origin. A genuinely
+                // much-tighter-fitting corner elsewhere still wins outright
+                // (this only changes *near-ties*), so this doesn't touch the
+                // dense-packing case (a real 252-part/500x500 tessellation)
+                // where the best corner is unambiguous either way.
+                const FIRST_PART_CONTACT_TOLERANCE: f64 = 0.05; // 5%
                 let mut best: Option<(f64, Placement, f64, LayeredPolygon)> = None;
+                let mut candidate_traces: Vec<CandidateTrace> = Vec::new();
+                let mut best_trace_idx: Option<usize> = None;
                 for _ in 0..config.rotations {
                     if let Some(nfp) = cached_inner_nfp(cache, sheet, &sheet_src, &trial_polygon, parts[i].source_id, trial_rotation, config.curve_tolerance) {
                         if !nfp.is_empty() {
@@ -984,13 +1106,20 @@ pub fn place_parts(
                                     let better = match &best {
                                         None => true,
                                         Some((best_contact, best_pos, ..)) => {
-                                            contact > *best_contact + 1e-6
-                                                || (almost_equal(contact, *best_contact, None)
+                                            let tolerance = contact.max(*best_contact) * FIRST_PART_CONTACT_TOLERANCE;
+                                            contact > *best_contact + tolerance
+                                                || (contact >= *best_contact - tolerance
                                                     && (candidate.x < best_pos.x || (almost_equal(candidate.x, best_pos.x, None) && candidate.y < best_pos.y)))
                                         }
                                     };
+                                    // Negated, same as `CandidateScore::TightFit` - keeps
+                                    // "lower score wins" a universal convention across
+                                    // every `CandidateTrace`, not just the ones that went
+                                    // through `try_place_part_on_sheet`'s own scoring.
+                                    candidate_traces.push(CandidateTrace { x: candidate.x, y: candidate.y, rotation: trial_rotation, score: -contact, accepted: false });
                                     if better {
                                         best = Some((contact, candidate, trial_rotation, trial_polygon.clone()));
+                                        best_trace_idx = Some(candidate_traces.len() - 1);
                                     }
                                 }
                             }
@@ -1007,6 +1136,11 @@ pub fn place_parts(
                     trial_polygon = rotate_layered_polygon(&trial_polygon, step);
                     trial_rotation = new_rotation;
                 }
+
+                if let Some(idx) = best_trace_idx {
+                    candidate_traces[idx].accepted = true;
+                }
+                on_candidates(sheet_idx, parts[i].id, &candidate_traces);
 
                 let Some((_, position, rotation, polygon)) = best else {
                     i += 1;
@@ -1053,49 +1187,51 @@ pub fn place_parts(
                 }
             }
 
-            // Inner NFP, trying all configured rotations until the part fits
-            // the sheet at all (only needed for the first-fit test - once
-            // placed, subsequent obstacle math uses whatever rotation won).
-            let mut sheet_nfp: Option<Vec<Vec<Point>>> = None;
-            let step = 360.0 / config.rotations.max(1) as f64;
-            for _ in 0..config.rotations.max(1) {
-                sheet_nfp = cached_inner_nfp(cache, sheet, &sheet_src, &parts[i].polygon, parts[i].source_id, parts[i].rotation, config.curve_tolerance);
-                if sheet_nfp.as_ref().is_some_and(|n| !n.is_empty()) {
-                    break;
+            if placed.is_empty() {
+                // Inner NFP, trying all configured rotations until the part
+                // fits the sheet at all - there's nothing placed yet to
+                // score contact/tightness against, so "first rotation that
+                // fits" is as good as any other here (unlike the 2nd+ part
+                // case below, where which rotation wins is the whole point).
+                let mut sheet_nfp: Option<Vec<Vec<Point>>> = None;
+                let step = 360.0 / config.rotations.max(1) as f64;
+                for _ in 0..config.rotations.max(1) {
+                    sheet_nfp = cached_inner_nfp(cache, sheet, &sheet_src, &parts[i].polygon, parts[i].source_id, parts[i].rotation, config.curve_tolerance);
+                    if sheet_nfp.as_ref().is_some_and(|n| !n.is_empty()) {
+                        break;
+                    }
+                    let new_rotation = {
+                        let r = parts[i].rotation + step;
+                        if r >= 360.0 {
+                            r % 360.0
+                        } else {
+                            r
+                        }
+                    };
+                    let new_polygon = rotate_layered_polygon(&parts[i].polygon, step);
+                    parts[i] = NestPart {
+                        id: parts[i].id,
+                        source_id: parts[i].source_id,
+                        polygon: new_polygon,
+                        rotation: new_rotation,
+                    };
                 }
-                let new_rotation = {
-                    let r = parts[i].rotation + step;
-                    if r >= 360.0 {
-                        r % 360.0
-                    } else {
-                        r
+
+                let sheet_nfp = match sheet_nfp {
+                    Some(n) if !n.is_empty() => n,
+                    _ => {
+                        i += 1;
+                        continue;
                     }
                 };
-                let new_polygon = rotate_layered_polygon(&parts[i].polygon, step);
-                parts[i] = NestPart {
-                    id: parts[i].id,
-                    source_id: parts[i].source_id,
-                    polygon: new_polygon,
-                    rotation: new_rotation,
-                };
-            }
 
-            let sheet_nfp = match sheet_nfp {
-                Some(n) if !n.is_empty() => n,
-                _ => {
-                    i += 1;
-                    continue;
-                }
-            };
+                // Borrowed, not cloned, until a placement is actually confirmed -
+                // most evaluated parts on a busy sheet fail to place (no room,
+                // overlap, wrong rotation), so cloning up front paid for a full
+                // polygon copy (points + recursive hole children) on the common
+                // reject path for nothing.
+                let part = &parts[i].polygon;
 
-            // Borrowed, not cloned, until a placement is actually confirmed -
-            // most evaluated parts on a busy sheet fail to place (no room,
-            // overlap, wrong rotation), so cloning up front paid for a full
-            // polygon copy (points + recursive hole children) on the common
-            // reject path for nothing.
-            let part = &parts[i].polygon;
-
-            if placed.is_empty() {
                 // first placement on this sheet: top-left corner
                 let mut position: Option<Placement> = None;
                 for region in &sheet_nfp {
@@ -1127,6 +1263,9 @@ pub fn place_parts(
                 let placed_part = PlacedPart { id: parts[i].id, placement: position, rotation: parts[i].rotation };
                 placed_parts_out.push(placed_part);
                 on_part_placed(sheet_idx, &placed_part);
+                // No scoring happens on this fast path (first valid NFP
+                // vertex wins outright) - nothing to report as candidates.
+                on_candidates(sheet_idx, parts[i].id, &[]);
                 let part_area = polygon_area(&part.points).abs();
                 placed.push(PlacedObstacle {
                     polygon: parts[i].polygon.clone(),
@@ -1147,23 +1286,139 @@ pub fn place_parts(
                 continue;
             }
 
-            if let Some(result) = try_place_part_on_sheet(part, parts[i].source_id, parts[i].rotation, &sheet_nfp, sheet, &placed, config, cache).placed() {
+            // 2nd+ part on this sheet: try every configured rotation, each
+            // scored by try_place_part_on_sheet's real obstacle-aware
+            // contact/area metric, and commit to whichever rotation+position
+            // scores best - not just whichever rotation happens to fit the
+            // sheet's bare remaining shape first, which is all a single
+            // `try_place_part_on_sheet` call used to compare. This is the
+            // same "which orientation actually fits best here" question the
+            // dedicated first-part TightFit-family search above already
+            // answers for a sheet's first part; every part after it used to
+            // commit to one rotation before any position/score comparison
+            // ever happened at all - no measurement of whether a different
+            // orientation would sit tighter at this specific spot. Same NFP
+            // cache as everywhere else in this file, so trying
+            // `config.rotations` angles here is mostly cache hits after the
+            // first few parts of any given shape have been tried.
+            let step = 360.0 / config.rotations.max(1) as f64;
+            let mut trial_rotation = parts[i].rotation;
+            let mut trial_polygon = parts[i].polygon.clone();
+            // (score, result, rotation, polygon) of the best rotation seen so
+            // far - `result.minarea` is always `CandidateScore::area()`'s raw
+            // number (lower wins), the same convention every other
+            // comparison in this file already uses.
+            //
+            // Known, accepted gap for `GravityTightFit` specifically: within
+            // one rotation's own candidates, `find_best_hybrid_candidate`
+            // breaks near-ties by real contact area, not just `minarea`'s
+            // coarse Gravity score - but that contact-area tiebreak never
+            // carries across rotations here, since `minarea` (Gravity's
+            // score) is all this cross-rotation comparison sees. Two
+            // different rotations with near-identical Gravity scores (a
+            // realistic outcome for a symmetric-ish part) get resolved by
+            // whichever is infinitesimally smaller, not by which one
+            // actually sits tighter. `TightFit`/`GravityCorrective` aren't
+            // affected - their own `minarea` already *is* the real contact
+            // score.
+            let mut best: Option<(f64, PlaceOnSheetResult, f64, LayeredPolygon)> = None;
+            // `Mutex`, not a plain `Vec`: `try_place_part_on_sheet` requires
+            // its `on_candidates` hook to be `Sync` (it's called from
+            // `dispatch`'s `par_iter()` across individuals, even though any
+            // *one* `place_parts` call like this one is itself single-
+            // threaded) - same pattern already used for exactly this reason
+            // elsewhere (e.g. `commands.rs`'s `retrace_generation`).
+            let rotation_traces: std::sync::Mutex<Vec<CandidateTrace>> = std::sync::Mutex::new(Vec::new());
+            // Computed once, outside the rotation loop below - it depends
+            // only on `sheet`/`placed`/`config.placement_type`, never on
+            // which rotation is currently being tried, so recomputing it
+            // per rotation (as calling the plain `try_place_part_on_sheet`
+            // wrapper in a loop would) paid for `sheet_border_band`'s real
+            // Clipper offset/difference call `config.rotations` times over
+            // for no reason - exactly the densely-packed-sheet workload this
+            // rotation search itself targets.
+            let neighborhood = tight_fit_neighborhood(sheet, &placed, config.placement_type);
+
+            for _ in 0..config.rotations.max(1) {
+                // Checked every iteration, not just once per part: each
+                // iteration is a real Clipper-backed placement attempt
+                // (`try_place_part_on_sheet_with_neighborhood`), so without
+                // this a Stop request could still have to wait out up to
+                // `config.rotations` of them before the caller sees it -
+                // same responsiveness contract as the per-part check above.
+                if should_cancel() {
+                    cancelled_early = true;
+                    break;
+                }
+                if let Some(sheet_nfp) = cached_inner_nfp(cache, sheet, &sheet_src, &trial_polygon, parts[i].source_id, trial_rotation, config.curve_tolerance) {
+                    if !sheet_nfp.is_empty() {
+                        let outcome = try_place_part_on_sheet_with_neighborhood(
+                            &trial_polygon,
+                            parts[i].source_id,
+                            trial_rotation,
+                            &sheet_nfp,
+                            sheet,
+                            &placed,
+                            config,
+                            cache,
+                            &|candidates| rotation_traces.lock().expect("single-threaded call, lock never contested").extend_from_slice(candidates),
+                            &neighborhood,
+                        );
+                        if let Some(result) = outcome.placed() {
+                            // `total_cmp`, not a bare `<`: this codebase treats bare
+                            // float `<` against a possibly-NaN value as a real gap
+                            // elsewhere (see this module's own `Option<f64>` fitness
+                            // handling) - NaN sorts as "never wins" here, not silently
+                            // passed through as an unexamined tie.
+                            let better = match &best {
+                                None => true,
+                                Some((best_score, ..)) => result.minarea.total_cmp(best_score).is_lt(),
+                            };
+                            if better {
+                                best = Some((result.minarea, result, trial_rotation, trial_polygon.clone()));
+                            }
+                        }
+                    }
+                }
+                let new_rotation = {
+                    let r = trial_rotation + step;
+                    if r >= 360.0 {
+                        r % 360.0
+                    } else {
+                        r
+                    }
+                };
+                trial_polygon = rotate_layered_polygon(&trial_polygon, step);
+                trial_rotation = new_rotation;
+            }
+
+            let mut rotation_traces = rotation_traces.into_inner().expect("single-threaded call, lock never poisoned");
+
+            if let Some((_, result, rotation, polygon)) = best {
+                // Only the overall winning rotation's champion candidate
+                // should read as accepted - `try_place_part_on_sheet` marks
+                // its own per-call champion for whichever single rotation it
+                // was scoring at the time, which isn't necessarily this
+                // loop's best-across-rotations winner.
+                for trace in &mut rotation_traces {
+                    trace.accepted =
+                        almost_equal(trace.rotation, rotation, None) && almost_equal(trace.x, result.position.x, None) && almost_equal(trace.y, result.position.y, None);
+                }
+                on_candidates(sheet_idx, parts[i].id, &rotation_traces);
+
                 placed_indices.push(i);
-                let placed_part = PlacedPart { id: parts[i].id, placement: result.position, rotation: parts[i].rotation };
+                let placed_part = PlacedPart { id: parts[i].id, placement: result.position, rotation };
                 placed_parts_out.push(placed_part);
                 on_part_placed(sheet_idx, &placed_part);
-                placed.push(PlacedObstacle {
-                    polygon: parts[i].polygon.clone(),
-                    id: parts[i].id,
-                    source_id: parts[i].source_id,
-                    rotation: parts[i].rotation,
-                    placement: result.position,
-                });
+                placed.push(PlacedObstacle { polygon: polygon.clone(), id: parts[i].id, source_id: parts[i].source_id, rotation, placement: result.position });
                 if config.placement_type == PlacementType::GravityCorrective {
-                    rotation_by_source.insert(parts[i].source_id, parts[i].rotation);
+                    rotation_by_source.insert(parts[i].source_id, rotation);
                 }
+                parts[i] = NestPart { id: parts[i].id, source_id: parts[i].source_id, polygon, rotation };
                 minarea = Some(result.minarea);
                 minwidth = result.minwidth;
+            } else {
+                on_candidates(sheet_idx, parts[i].id, &rotation_traces);
             }
 
             i += 1;
@@ -1178,9 +1433,27 @@ pub fn place_parts(
         // implicit for a sheet where 0-1 parts got placed.
         fitness += (minwidth.unwrap_or(0.0) / sheet_area) + minarea.unwrap_or(0.0);
 
-        for p in &placed {
-            total_placed_area += polygon_material_area(&p.polygon);
-        }
+        // Reward how much of THIS sheet actually got used, not just the
+        // bounding-box shape of the last part placed on it - `minarea`/
+        // `minwidth` above are a per-candidate positioning tiebreak (ported
+        // from SVGnest as-is), not a measure of the sheet's overall packing
+        // quality, so two same-sheet-count solutions that both place every
+        // part could score almost identically regardless of how much slack
+        // either one leaves behind - there was no gradient actually pushing
+        // the GA toward denser packing once "does everyone fit" was
+        // satisfied. Normalized by `sheet_area` (same convention
+        // `minwidth/sheet_area` above already uses), so this stays a
+        // same-sheet-count tiebreak, never a sheet-count override: even a
+        // sheet left almost entirely empty contributes at most ~1.0, versus
+        // `sheet_area` itself (into the hundreds of thousands for a real
+        // sheet) charged once per *additional* sheet opened - opening one
+        // more sheet can never pay for itself via a better leftover score
+        // on this one.
+        let sheet_placed_area: f64 = placed.iter().map(|p| polygon_material_area(&p.polygon)).sum();
+        let leftover = (sheet_usable_area - sheet_placed_area).max(0.0);
+        fitness += leftover / sheet_area;
+
+        total_placed_area += sheet_placed_area;
 
         // Remove exactly the placed slots, by position - see the
         // `placed_indices` doc comment above for why this can't be `.id`-keyed.
@@ -1292,7 +1565,7 @@ mod tests {
         let part = square(0.0, 0.0, 10.0);
         let parts = vec![NestPart { id: 0, source_id: 0, polygon: part, rotation: 0.0 }];
 
-        let result = place_parts(&[sheet], parts, &config(PlacementType::Gravity), &NfpCache::new(), &|| false, &|_, _| {}).unwrap();
+        let result = place_parts(&[sheet], parts, &config(PlacementType::Gravity), &NfpCache::new(), &|| false, &|_, _| {}, &|_, _, _| {}).unwrap();
 
         assert_eq!(result.unplaced_count, 0);
         assert_eq!(result.placements.len(), 1);
@@ -1316,7 +1589,7 @@ mod tests {
             NestPart { id: 1, source_id: 1, polygon: square(0.0, 0.0, 20.0), rotation: 0.0 },
         ];
 
-        let result = place_parts(&[sheet], parts, &config(PlacementType::Gravity), &NfpCache::new(), &|| false, &|_, _| {}).unwrap();
+        let result = place_parts(&[sheet], parts, &config(PlacementType::Gravity), &NfpCache::new(), &|| false, &|_, _| {}, &|_, _, _| {}).unwrap();
 
         assert_eq!(result.unplaced_count, 0);
         assert_eq!(result.placements.len(), 1);
@@ -1351,7 +1624,7 @@ mod tests {
         let cache = NfpCache::new();
         assert_eq!(cache.stats(), 0);
 
-        let result = place_parts(&[sheet], parts, &config(PlacementType::Gravity), &cache, &|| false, &|_, _| {}).unwrap();
+        let result = place_parts(&[sheet], parts, &config(PlacementType::Gravity), &cache, &|| false, &|_, _| {}, &|_, _, _| {}).unwrap();
 
         assert_eq!(result.unplaced_count, 0);
         assert!(cache.stats() > 0, "placing 2 parts (at least one inner-NFP and one obstacle-NFP lookup) should populate the cache");
@@ -1373,11 +1646,11 @@ mod tests {
         };
         let cache = NfpCache::new();
 
-        let _ = place_parts(&[sheet.clone()], parts(), &config(PlacementType::Gravity), &cache, &|| false, &|_, _| {});
+        let _ = place_parts(&[sheet.clone()], parts(), &config(PlacementType::Gravity), &cache, &|| false, &|_, _| {}, &|_, _, _| {});
         let entries_after_first = cache.stats();
         assert!(entries_after_first > 0);
 
-        let _ = place_parts(&[sheet], parts(), &config(PlacementType::Gravity), &cache, &|| false, &|_, _| {});
+        let _ = place_parts(&[sheet], parts(), &config(PlacementType::Gravity), &cache, &|| false, &|_, _| {}, &|_, _, _| {});
         assert_eq!(cache.stats(), entries_after_first, "an identical second placement should hit the cache, not add new entries");
     }
 
@@ -1402,10 +1675,10 @@ mod tests {
         ];
 
         let same_shape_cache = NfpCache::new();
-        place_parts(&[sheet.clone()], same_shape_parts, &config(PlacementType::Gravity), &same_shape_cache, &|| false, &|_, _| {}).unwrap();
+        place_parts(&[sheet.clone()], same_shape_parts, &config(PlacementType::Gravity), &same_shape_cache, &|| false, &|_, _| {}, &|_, _, _| {}).unwrap();
 
         let distinct_shape_cache = NfpCache::new();
-        place_parts(&[sheet], distinct_shape_parts, &config(PlacementType::Gravity), &distinct_shape_cache, &|| false, &|_, _| {}).unwrap();
+        place_parts(&[sheet], distinct_shape_parts, &config(PlacementType::Gravity), &distinct_shape_cache, &|| false, &|_, _| {}, &|_, _, _| {}).unwrap();
 
         assert!(
             same_shape_cache.stats() < distinct_shape_cache.stats(),
@@ -1415,12 +1688,53 @@ mod tests {
         );
     }
 
+    /// Regression test for the leftover-area fitness term: two single-part,
+    /// single-sheet placements with the *same* sheet count (so the dominant
+    /// `sheet_area`-per-sheet term is identical between them) but very
+    /// different packing density must not score as an near-tie the way the
+    /// old last-part-only `minwidth`/`minarea` tiebreak could - the denser
+    /// one should score a strictly lower (better) fitness. Both parts are
+    /// under the 0.9 dominant-area threshold (81% and 1% of the sheet,
+    /// respectively), so neither takes the dominant-part-closes-sheet
+    /// shortcut - both go through the same first-part fast path and the
+    /// same per-sheet leftover computation afterward.
+    #[test]
+    fn leftover_area_makes_a_denser_single_part_placement_score_a_better_fitness() {
+        let sheet = square(0.0, 0.0, 100.0); // 10,000mm2
+        let dense_parts = vec![NestPart { id: 0, source_id: 0, polygon: square(0.0, 0.0, 90.0), rotation: 0.0 }]; // 8,100mm2, 81%
+        let sparse_parts = vec![NestPart { id: 0, source_id: 0, polygon: square(0.0, 0.0, 10.0), rotation: 0.0 }]; // 100mm2, 1%
+
+        let dense = place_parts(&[sheet.clone()], dense_parts, &config(PlacementType::Gravity), &NfpCache::new(), &|| false, &|_, _| {}, &|_, _, _| {}).unwrap();
+        let sparse = place_parts(&[sheet], sparse_parts, &config(PlacementType::Gravity), &NfpCache::new(), &|| false, &|_, _| {}, &|_, _, _| {}).unwrap();
+
+        assert_eq!(dense.unplaced_count, 0);
+        assert_eq!(sparse.unplaced_count, 0);
+        assert_eq!(dense.placements.len(), 1, "sanity: both single-part jobs should use exactly one sheet");
+        assert_eq!(sparse.placements.len(), 1);
+        assert!(
+            dense.fitness < sparse.fitness,
+            "a sheet left mostly full (81%) should score a better (lower) fitness than one left mostly empty (1%): dense={}, sparse={}",
+            dense.fitness,
+            sparse.fitness
+        );
+        // Both share the identical `sheet_area` per-sheet term (same 100x100
+        // sheet, same sheet count) - the gap between them must come from
+        // somewhere else, i.e. actually be attributable to the leftover-area
+        // term rather than incidental noise elsewhere in the formula.
+        assert!(
+            (sparse.fitness - dense.fitness - (0.99 - 0.19)).abs() < 1e-6,
+            "expected the fitness gap to match the leftover-area term's own (leftover/sheet_area) computation exactly: dense={}, sparse={}",
+            dense.fitness,
+            sparse.fitness
+        );
+    }
+
     #[test]
     fn oversized_part_is_left_unplaced_with_a_fitness_penalty() {
         let sheet = square(0.0, 0.0, 10.0);
         let parts = vec![NestPart { id: 0, source_id: 0, polygon: square(0.0, 0.0, 20.0), rotation: 0.0 }];
 
-        let result = place_parts(&[sheet], parts, &config(PlacementType::Gravity), &NfpCache::new(), &|| false, &|_, _| {}).unwrap();
+        let result = place_parts(&[sheet], parts, &config(PlacementType::Gravity), &NfpCache::new(), &|| false, &|_, _| {}, &|_, _, _| {}).unwrap();
 
         assert_eq!(result.unplaced_count, 1);
         assert!(result.placements.is_empty());
@@ -1438,7 +1752,7 @@ mod tests {
             NestPart { id: 1, source_id: 1, polygon: square(0.0, 0.0, 5.0), rotation: 0.0 },
         ];
 
-        let result = place_parts(&[sheet.clone(), sheet], parts, &config(PlacementType::Gravity), &NfpCache::new(), &|| false, &|_, _| {}).unwrap();
+        let result = place_parts(&[sheet.clone(), sheet], parts, &config(PlacementType::Gravity), &NfpCache::new(), &|| false, &|_, _| {}, &|_, _, _| {}).unwrap();
 
         assert_eq!(result.unplaced_count, 0);
         assert_eq!(result.placements.len(), 2);
@@ -1456,7 +1770,7 @@ mod tests {
                 NestPart { id: 1, source_id: 1, polygon: square(0.0, 0.0, 20.0), rotation: 0.0 },
             ];
 
-            let result = place_parts(&[sheet], parts, &config(placement_type), &NfpCache::new(), &|| false, &|_, _| {}).unwrap();
+            let result = place_parts(&[sheet], parts, &config(placement_type), &NfpCache::new(), &|| false, &|_, _| {}, &|_, _, _| {}).unwrap();
             assert_eq!(result.unplaced_count, 0, "placement_type {:?}", placement_type);
             assert_eq!(result.placements[0].parts.len(), 2, "placement_type {:?}", placement_type);
         }
@@ -1478,7 +1792,7 @@ mod tests {
 
         let attempts = std::sync::atomic::AtomicUsize::new(0);
         let result =
-            place_parts(&[sheet], parts, &config(PlacementType::Gravity), &cache, &|| attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 3, &|_, _| {});
+            place_parts(&[sheet], parts, &config(PlacementType::Gravity), &cache, &|| attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 3, &|_, _| {}, &|_, _, _| {});
 
         assert!(result.is_none(), "a cancellation partway through must discard the whole attempt, not return a partial result");
     }
@@ -1512,11 +1826,11 @@ mod tests {
             PlacedObstacle { polygon: obstacle_left, id: 1, source_id: 1, rotation: 0.0, placement: Placement { x: 0.0, y: 0.0 } },
         ];
 
-        let gravity_outcome = try_place_part_on_sheet(&part, 2, 0.0, &sheet_nfp, &sheet, &placed, &config(PlacementType::Gravity), &NfpCache::new());
+        let gravity_outcome = try_place_part_on_sheet(&part, 2, 0.0, &sheet_nfp, &sheet, &placed, &config(PlacementType::Gravity), &NfpCache::new(), &|_| {});
         let PlaceOnSheetOutcome::Placed(gravity) = gravity_outcome else { panic!("gravity should place: {gravity_outcome:?}") };
         assert_eq!((gravity.position.x, gravity.position.y), (60.0, 30.0), "test's own assumption about Gravity's answer changed");
 
-        let tight_outcome = try_place_part_on_sheet(&part, 2, 0.0, &sheet_nfp, &sheet, &placed, &config(PlacementType::TightFit), &NfpCache::new());
+        let tight_outcome = try_place_part_on_sheet(&part, 2, 0.0, &sheet_nfp, &sheet, &placed, &config(PlacementType::TightFit), &NfpCache::new(), &|_| {});
         let PlaceOnSheetOutcome::Placed(tight) = tight_outcome else { panic!("tight fit should place: {tight_outcome:?}") };
 
         let high_contact_positions = [(0.0, 0.0), (0.0, 180.0), (180.0, 0.0), (180.0, 180.0), (60.0, 10.0)];
@@ -1540,7 +1854,7 @@ mod tests {
         // L-corner contact instead of Gravity's own plain x-position
         // tiebreak (which has no preference between x=60 candidates at
         // different y at all, since x doesn't differ).
-        let hybrid_outcome = try_place_part_on_sheet(&part, 2, 0.0, &sheet_nfp, &sheet, &placed, &config(PlacementType::GravityTightFit), &NfpCache::new());
+        let hybrid_outcome = try_place_part_on_sheet(&part, 2, 0.0, &sheet_nfp, &sheet, &placed, &config(PlacementType::GravityTightFit), &NfpCache::new(), &|_| {});
         let PlaceOnSheetOutcome::Placed(hybrid) = hybrid_outcome else { panic!("hybrid should place: {hybrid_outcome:?}") };
         assert_eq!(
             (hybrid.position.x, hybrid.position.y),
@@ -1566,10 +1880,10 @@ mod tests {
         let sheet_nfp = inner_nfp(&sheet, &part, 0.3).expect("part fits the empty sheet");
         let placed = vec![PlacedObstacle { polygon: obstacle, id: 0, source_id: 0, rotation: 0.0, placement: Placement { x: 0.0, y: 0.0 } }];
 
-        let gravity_outcome = try_place_part_on_sheet(&part, 1, 0.0, &sheet_nfp, &sheet, &placed, &config(PlacementType::Gravity), &NfpCache::new());
+        let gravity_outcome = try_place_part_on_sheet(&part, 1, 0.0, &sheet_nfp, &sheet, &placed, &config(PlacementType::Gravity), &NfpCache::new(), &|_| {});
         let PlaceOnSheetOutcome::Placed(gravity) = gravity_outcome else { panic!("gravity should place: {gravity_outcome:?}") };
 
-        let tight_outcome = try_place_part_on_sheet(&part, 1, 0.0, &sheet_nfp, &sheet, &placed, &config(PlacementType::TightFit), &NfpCache::new());
+        let tight_outcome = try_place_part_on_sheet(&part, 1, 0.0, &sheet_nfp, &sheet, &placed, &config(PlacementType::TightFit), &NfpCache::new(), &|_| {});
         let PlaceOnSheetOutcome::Placed(tight) = tight_outcome else { panic!("tight fit should place: {tight_outcome:?}") };
 
         assert_ne!(
@@ -1579,7 +1893,7 @@ mod tests {
         );
 
         let corrective_outcome =
-            try_place_part_on_sheet(&part, 1, 0.0, &sheet_nfp, &sheet, &placed, &config(PlacementType::GravityCorrective), &NfpCache::new());
+            try_place_part_on_sheet(&part, 1, 0.0, &sheet_nfp, &sheet, &placed, &config(PlacementType::GravityCorrective), &NfpCache::new(), &|_| {});
         let PlaceOnSheetOutcome::Placed(corrective) = corrective_outcome else { panic!("gravity-corrective should place: {corrective_outcome:?}") };
 
         assert_eq!(
@@ -1610,11 +1924,11 @@ mod tests {
             PlacedObstacle { polygon: obstacle_left, id: 1, source_id: 1, rotation: 0.0, placement: Placement { x: 0.0, y: 0.0 } },
         ];
 
-        let tight_outcome = try_place_part_on_sheet(&part, 2, 0.0, &sheet_nfp, &sheet, &placed, &config(PlacementType::TightFit), &NfpCache::new());
+        let tight_outcome = try_place_part_on_sheet(&part, 2, 0.0, &sheet_nfp, &sheet, &placed, &config(PlacementType::TightFit), &NfpCache::new(), &|_| {});
         let PlaceOnSheetOutcome::Placed(tight) = tight_outcome else { panic!("tight fit should place: {tight_outcome:?}") };
 
         let corrective_outcome =
-            try_place_part_on_sheet(&part, 2, 0.0, &sheet_nfp, &sheet, &placed, &config(PlacementType::GravityCorrective), &NfpCache::new());
+            try_place_part_on_sheet(&part, 2, 0.0, &sheet_nfp, &sheet, &placed, &config(PlacementType::GravityCorrective), &NfpCache::new(), &|_| {});
         let PlaceOnSheetOutcome::Placed(corrective) = corrective_outcome else { panic!("gravity-corrective should place: {corrective_outcome:?}") };
 
         assert_eq!(
@@ -1660,7 +1974,7 @@ mod tests {
         let mut cfg = config(PlacementType::GravityCorrective);
         cfg.rotations = 4;
 
-        let result = place_parts(&[sheet], parts, &cfg, &NfpCache::new(), &|| false, &|_, _| {}).unwrap();
+        let result = place_parts(&[sheet], parts, &cfg, &NfpCache::new(), &|| false, &|_, _| {}, &|_, _, _| {}).unwrap();
 
         assert_eq!(result.unplaced_count, 0, "filler plus both copies of the shape should all fit on the one generously-tall sheet");
         let mut rotation_by_id: HashMap<usize, f64> = HashMap::new();
@@ -1719,7 +2033,7 @@ mod tests {
             let mut cfg = config(placement_type);
             cfg.rotations = 4;
 
-            let result = place_parts(&[sheet], parts, &cfg, &NfpCache::new(), &|| false, &|_, _| {}).unwrap();
+            let result = place_parts(&[sheet], parts, &cfg, &NfpCache::new(), &|| false, &|_, _| {}, &|_, _, _| {}).unwrap();
 
             assert_eq!(result.unplaced_count, 0, "{placement_type:?}");
             let placed = result.placements[0].parts[0];
@@ -1729,6 +2043,51 @@ mod tests {
                 placed.rotation
             );
         }
+    }
+
+    /// Regression test for the 2nd+ part rotation search: before it existed,
+    /// `try_place_part_on_sheet` (as called for any part after a sheet's
+    /// first) only ever saw one fixed rotation - whichever happened to fit
+    /// the bare sheet region first - with nothing to compare it against.
+    /// This checks the actual scoring signal the new per-rotation loop in
+    /// `place_parts` relies on: a long, flat obstacle already on the sheet,
+    /// and an asymmetric (non-square) candidate part scored at two
+    /// different rotations against it. Lying flat (its long edge against
+    /// the obstacle's long edge) must score strictly more contact than
+    /// standing on its narrow edge (only its short edge available to touch)
+    /// - if rotation genuinely didn't change the score, this new loop would
+    /// have nothing real to select between.
+    #[test]
+    fn tight_fit_scores_more_contact_for_a_flush_long_edge_than_a_narrow_one() {
+        let sheet = square(0.0, 0.0, 200.0);
+        let obstacle = rect(0.0, 0.0, 50.0, 5.0); // long, flat obstacle along the bottom
+        let placed = vec![PlacedObstacle { polygon: obstacle, id: 0, source_id: 0, rotation: 0.0, placement: Placement { x: 0.0, y: 0.0 } }];
+        let cfg = config(PlacementType::TightFit);
+
+        // Same rectangle, two rotations: lying flat (20 wide x 4 tall) can
+        // rest its full 20mm-long edge against the obstacle's 50mm-long top
+        // edge; standing up (4 wide x 20 tall, rotation_layered_polygon(_, 90))
+        // only ever has its 4mm-wide edge available to touch it with.
+        let flat = rect(0.0, 0.0, 20.0, 4.0);
+        let standing = rotate_layered_polygon(&flat, 90.0);
+
+        let sheet_nfp_flat = inner_nfp(&sheet, &flat, 0.3).expect("flat rectangle fits the empty sheet");
+        let flat_outcome = try_place_part_on_sheet(&flat, 1, 0.0, &sheet_nfp_flat, &sheet, &placed, &cfg, &NfpCache::new(), &|_| {});
+        let PlaceOnSheetOutcome::Placed(flat_result) = flat_outcome else { panic!("flat rectangle should place: {flat_outcome:?}") };
+
+        let sheet_nfp_standing = inner_nfp(&sheet, &standing, 0.3).expect("standing rectangle fits the empty sheet");
+        let standing_outcome = try_place_part_on_sheet(&standing, 1, 90.0, &sheet_nfp_standing, &sheet, &placed, &cfg, &NfpCache::new(), &|_| {});
+        let PlaceOnSheetOutcome::Placed(standing_result) = standing_outcome else { panic!("standing rectangle should place: {standing_outcome:?}") };
+
+        // TightFit's score is negated contact area (more contact = more
+        // negative, see `CandidateScore::TightFit`'s own doc comment) - so
+        // "more contact" means a strictly *smaller* (more negative) `minarea`.
+        assert!(
+            flat_result.minarea < standing_result.minarea,
+            "lying flat against the long obstacle edge should score strictly more contact (smaller minarea) than standing on the narrow edge: flat={}, standing={}",
+            flat_result.minarea,
+            standing_result.minarea
+        );
     }
 
     /// Regression test: `try_place_part_on_sheet` must not panic when
@@ -1746,7 +2105,7 @@ mod tests {
         let sheet_nfp = inner_nfp(&sheet, &part, 0.3).expect("part fits the empty sheet");
 
         for placement_type in [PlacementType::Gravity, PlacementType::Box, PlacementType::ConvexHull, PlacementType::TightFit] {
-            let result = try_place_part_on_sheet(&part, 0, 0.0, &sheet_nfp, &sheet, &[], &config(placement_type), &NfpCache::new());
+            let result = try_place_part_on_sheet(&part, 0, 0.0, &sheet_nfp, &sheet, &[], &config(placement_type), &NfpCache::new(), &|_| {});
             assert!(matches!(result, PlaceOnSheetOutcome::Placed(_)), "placement_type {:?}", placement_type);
         }
     }
@@ -1763,7 +2122,7 @@ mod tests {
             NestPart { id: 0, source_id: 0, polygon: square(0.0, 0.0, 30.0), rotation: 0.0 },
         ];
 
-        let result = place_parts(&[sheet.clone(), sheet], parts, &config(PlacementType::Gravity), &NfpCache::new(), &|| false, &|_, _| {}).unwrap();
+        let result = place_parts(&[sheet.clone(), sheet], parts, &config(PlacementType::Gravity), &NfpCache::new(), &|| false, &|_, _| {}, &|_, _, _| {}).unwrap();
 
         assert_eq!(result.unplaced_count, 0);
         assert_eq!(result.placements.len(), 2, "expected one part per sheet, got {:?}", result.placements);
@@ -1787,7 +2146,7 @@ mod tests {
             NestPart { id: 2, source_id: 2, polygon: square(0.0, 0.0, 4.0), rotation: 0.0 },
         ];
 
-        let result = place_parts(&[square(0.0, 0.0, 100.0)], parts, &config(PlacementType::Gravity), &NfpCache::new(), &|| false, &|_, _| {}).unwrap();
+        let result = place_parts(&[square(0.0, 0.0, 100.0)], parts, &config(PlacementType::Gravity), &NfpCache::new(), &|| false, &|_, _| {}, &|_, _, _| {}).unwrap();
 
         assert_eq!(result.unplaced_count, 0, "all 3 parts should fit on one 100x100 sheet: {:?}", result.placements);
         assert_eq!(result.placements.len(), 1);
