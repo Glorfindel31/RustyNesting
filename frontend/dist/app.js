@@ -1,16 +1,28 @@
-// Minimal Phase 6 UI: talks directly to the Rust engine via Tauri's
+// Minimal UI: talks directly to the Rust engine via Tauri's
 // import_dxf_command/run_nest_command. Deliberately not an adaptation of
 // the legacy Ractive UI (frontend/deepnest.js, frontend/ui/**) - that code
 // assumes a Node-integrated Electron renderer (require("electron"),
 // require("@electron/remote"), require("axios"), etc.) that doesn't exist
 // in Tauri's webview, and much of it (SVG import, a remote DXF-conversion
 // service) targets features this project's DXF-only scope already dropped.
-// Kept as reference, not wired up. See docs/PORT_STATUS.md's Phase 6 table.
+// Kept as reference, not wired up.
+
+import { boundsOf, toSvgPoints, pointsToPath, rotatedTranslatedPoints, colorForLayer, renderShapeSvg, UNPLACED_COLOR } from "./render.js";
+import { t, getLang, setLang, applyStaticTranslations } from "./i18n.js";
+import { getAccent, getScaleName, setAccent, setScale, applySavedPrefs } from "./prefs.js";
 
 const invoke = window.__TAURI__.core.invoke;
 
-/** @type {{layer: string, points: {x:number,y:number}[], is_circle: unknown, children: unknown[]}[]} */
+/** @type {{layer: string, points: {x:number,y:number}[], is_circle: unknown, children: unknown[], _uiId: number}[]} */
 let importedShapes = [];
+
+// Stable per-shape identity for table rows, independent of array position -
+// `renderShapesTable` only ever appends rows (never rebuilds, so a role/qty
+// the user already set survives a later import), so removing a shape from
+// the middle of `importedShapes` must not shift what `data-role`/`data-qty`
+// on every *other* row's `<select>`/`<input>` refers to. A plain array index
+// would do exactly that; this counter never gets reused or reassigned.
+let nextShapeUiId = 0;
 
 // Remembered across a run so a later action (picking a different history
 // entry, exporting) doesn't need to re-invoke the engine - it's all
@@ -31,21 +43,18 @@ let lastPartsById = null;
 // count, only run_nest_command's own request did.
 let currentGenerations = 0;
 
-// Live preview - commented out (2026), never worked reliably; not deleted
-// so it's easy to pick back up later. See index.html's matching commented-
-// out #cfg-live-viz/#live-preview-section and src-tauri's
-// NestConfigDto::live_visualization/run_nest_with_progress.
-/*
-let liveViewActive = false;
-let liveShapesById = {};
-let liveSheetEls = {};
-let liveQueue = [];
-let liveTicking = false;
-*/
-
 const el = (id) => document.getElementById(id);
 
 function setStatus(id, message, isError) {
+  // Errors next to RUN NEST specifically go to the console instead of the
+  // inline status text - that strip is small and easy to miss/overwrite
+  // with the next status update, while the console keeps a scrollable
+  // history of what actually went wrong.
+  if (isError && id === "run-status") {
+    el(id).textContent = "";
+    logLine(message, "error");
+    return;
+  }
   const node = el(id);
   node.textContent = message;
   node.classList.toggle("error", Boolean(isError));
@@ -55,15 +64,21 @@ function setBusy(spinnerId, busy) {
   el(spinnerId).hidden = !busy;
 }
 
-// A running log of what the app is doing, like the old Electron UI's
-// console - import/run start, success, failure, and (via the
-// "nest-progress" event below) live per-generation stats while a run is in
+// A running log of what the app is doing - import/run start, success,
+// failure, and (via the "nest-progress"/"nest-run-start"/"nest-run-complete"
+// events below) live per-generation and per-run stats while a run is in
 // progress, instead of the UI just going quiet until the whole run returns.
-function logLine(message) {
+// `kind` picks a color (see app.css's `.log-*` rules): "run" for a new
+// escalating attempt starting, "best" for one that just beat every attempt
+// before it, unset for plain informational lines.
+function logLine(message, kind) {
   const node = el("console-log");
   const time = new Date().toLocaleTimeString();
   const line = `[${time}] ${message}`;
-  node.textContent += line + "\n";
+  const entry = document.createElement("div");
+  entry.className = kind ? `log-line log-${kind}` : "log-line";
+  entry.textContent = line;
+  node.appendChild(entry);
   node.scrollTop = node.scrollHeight;
   // Fire-and-forget: also append to the on-disk log
   // (<app_log_dir>/rustynesting.log) so this history survives past the
@@ -79,58 +94,10 @@ function logLine(message) {
 // confusing on its own).
 function setControlsLocked(locked) {
   const selector =
-    "#panel-import input, #panel-import select, #panel-import button, #panel-shapes input, #panel-shapes select, #panel-shapes button, #panel-config input, #panel-config select, #panel-config button:not(#btn-run):not(#btn-stop)";
+    "#panel-import input, #panel-import select, #panel-import button, #panel-shapes input, #panel-shapes select, #panel-shapes button, #panel-config input, #panel-config select, #panel-config button";
   document.querySelectorAll(selector).forEach((node) => {
     node.disabled = locked;
   });
-}
-
-function boundsOf(points) {
-  const xs = points.map((p) => p.x);
-  const ys = points.map((p) => p.y);
-  const minx = Math.min(...xs);
-  const miny = Math.min(...ys);
-  return { minx, miny, w: Math.max(...xs) - minx, h: Math.max(...ys) - miny };
-}
-
-// DXF/CAD coordinates are y-up; SVG coordinates are y-down. Rendering raw
-// points would mirror the layout vertically compared to how it looks in a
-// CAD viewer - flip within the sheet's own bounding box instead.
-function toSvgPoints(points, sheetBounds) {
-  return points.map((p) => ({ x: p.x - sheetBounds.minx, y: sheetBounds.h - (p.y - sheetBounds.miny) }));
-}
-
-// Real DXF layers are arbitrary user-given names (cut/etch/drill/whatever a
-// given job uses), so there's no fixed palette to draw from - hash the name
-// to a hue instead. Same layer name always gets the same color, in both the
-// shape thumbnails and the nested result, without needing a legend or any
-// per-job configuration.
-function colorForLayer(layer) {
-  let hash = 0;
-  for (let i = 0; i < layer.length; i++) hash = (hash * 31 + layer.charCodeAt(i)) >>> 0;
-  return `hsl(${hash % 360}, 85%, 65%)`;
-}
-
-// Recursively draws a shape and every nested child (holes, interior
-// features on other layers) - a DXF part is a tree, not just its outer
-// boundary, and dropping the children was silently discarding layer
-// identity the app is supposed to preserve end to end. `transformPoints`
-// does whatever coordinate mapping the caller needs (thumbnail-local bounds,
-// or rotate+translate+sheet-relative for a placed part) - every node in the
-// tree shares the same rigid transform since children are defined relative
-// to the same local origin as their parent.
-const UNPLACED_COLOR = "#ff5a4a"; // matches --error in app.css
-
-// `strokeOverride`, when given, replaces colorForLayer for every node in the
-// tree - used to render an unplaced part entirely in the "error" color
-// regardless of its real layer, so it reads as "this one's a problem" at a
-// glance rather than blending in with normally-colored parts.
-function renderShapeSvg(shape, transformPoints, isRoot = true, strokeOverride = null) {
-  const pts = transformPoints(shape.points);
-  const stroke = strokeOverride ?? colorForLayer(shape.layer);
-  let markup = `<polygon points="${pointsToPath(pts)}" fill="none" stroke="${stroke}" stroke-width="${isRoot ? 1.4 : 1}" vector-effect="non-scaling-stroke" />`;
-  for (const child of shape.children ?? []) markup += renderShapeSvg(child, transformPoints, false, strokeOverride);
-  return markup;
 }
 
 function shapeThumbnailSvg(shape, strokeOverride = null) {
@@ -147,11 +114,20 @@ function shapeThumbnailSvg(shape, strokeOverride = null) {
 // was already imported, so multiple files/drops accumulate into one part
 // pool instead of each import replacing the last. A failure on one file is
 // logged and skipped rather than aborting the rest of the batch.
+// Strips directory and extension from an import path, e.g.
+// "C:\foo\bar\Untitled.dxf" -> "Untitled" - used to build each row's
+// [filename-{number}] NAME column so a part can be told apart from same-
+// named parts in a different file at a glance.
+function fileBaseName(path) {
+  const base = path.split(/[\\/]/).pop() ?? path;
+  return base.replace(/\.[^.]+$/, "");
+}
+
 async function importPaths(paths) {
   if (paths.length === 0) return;
   const tolerance = Number(el("import-tolerance").value);
 
-  setStatus("import-status", `importing ${paths.length} file(s)...`, false);
+  setStatus("import-status", t("import_importing", { n: paths.length }), false);
   el("btn-import").disabled = true;
   setBusy("import-spinner", true);
   let imported = 0;
@@ -159,6 +135,11 @@ async function importPaths(paths) {
     logLine(`import: ${path} (tolerance ${tolerance})`);
     try {
       const shapes = await invoke("import_dxf_command", { path, curve_tolerance: tolerance });
+      const fileName = fileBaseName(path);
+      for (const shape of shapes) {
+        shape._uiId = nextShapeUiId++;
+        shape._file = fileName;
+      }
       importedShapes = importedShapes.concat(shapes);
       imported += shapes.length;
       logLine(`import ok: ${shapes.length} shape(s) from ${path}`);
@@ -170,13 +151,34 @@ async function importPaths(paths) {
   setBusy("import-spinner", false);
 
   if (imported > 0) {
-    setStatus("import-status", `${imported} shape(s) imported (${importedShapes.length} total)`, false);
+    setStatus("import-status", t("import_status_ok", { n: imported, total: importedShapes.length }), false);
     renderShapesTable();
     el("panel-shapes").hidden = false;
     el("panel-config").hidden = false;
   } else {
-    setStatus("import-status", "no shapes imported - see console", true);
+    setStatus("import-status", t("import_status_none"), true);
   }
+}
+
+// Bulk role assignment - sets every imported shape's ROLE select in one
+// click instead of needing one click per row, the real friction point on a
+// DXF with many separate profiles. Reuses the same delegated "change"
+// listener's effect (`updateDominantIndicators`) since setting `.value`
+// directly on a `<select>` doesn't fire a native "change" event on its own.
+function markAllRoles(role) {
+  document.querySelectorAll("#shapes-body [data-role]").forEach((select) => {
+    select.value = role;
+  });
+  updateDominantIndicators();
+}
+
+// Builds the settings-bar label's markup rather than plain text, so the
+// "03" step number can stay accent-colored (`.settings-bar .step-num`)
+// independently of the language-varying text next to it - the same split
+// `.panel h2` uses for the other three step headings, just built in JS
+// since this one's label also toggles between a collapsed/expanded arrow.
+function renderSettingsBarLabel(collapsed) {
+  return `<span class="step-num">03</span> / ${t("settings_bar_text")} ${collapsed ? "▾" : "▴"}`;
 }
 
 function handleToggleShapes() {
@@ -184,7 +186,47 @@ function handleToggleShapes() {
   const button = el("btn-toggle-shapes");
   const collapsed = !body.hidden;
   body.hidden = collapsed;
-  button.textContent = collapsed ? "EXPAND" : "COLLAPSE";
+  button.textContent = collapsed ? "▸" : "▾";
+}
+
+// Forces every collapsible section shut - called right as a nest run
+// starts (see handleRunNest below). `setControlsLocked` already disables
+// every field inside these while a run is in progress, so there's nothing
+// left to look at in them mid-run anyway; collapsing keeps the console and
+// progress bar - the only things actually worth watching - from competing
+// for space with panels nobody can act on right now.
+function collapseAllPanels() {
+  el("shapes-collapsible").hidden = true;
+  el("btn-toggle-shapes").textContent = "▸";
+  el("advanced-collapsible").hidden = true;
+  el("btn-toggle-advanced").textContent = t("btn_advanced_collapsed");
+  el("settings-collapsible").hidden = true;
+  el("settings-bar-label").innerHTML = renderSettingsBarLabel(true);
+}
+
+// Advanced settings (placement type, rotations/population/generations
+// starting points, dominant area, threads, seed) start collapsed - the
+// friction-free default only needs MARGIN/SPACING/RUNS above, see RUNS'
+// own tooltip and commands.rs's escalation loop.
+function handleToggleAdvanced() {
+  const body = el("advanced-collapsible");
+  const button = el("btn-toggle-advanced");
+  const collapsed = !body.hidden;
+  body.hidden = collapsed;
+  button.textContent = collapsed ? t("btn_advanced_collapsed") : t("btn_advanced_expanded");
+}
+
+// The bottom bar's own drawer toggle - MARGIN/SPACING/RUNS and (nested
+// inside) Advanced Settings collapse together behind this one handle, so
+// the bar stays a slim accent strip (RUN/STOP live in their own #run-float
+// button, unaffected by this toggle) until you actually want to change
+// something.
+function handleToggleSettings() {
+  const body = el("settings-collapsible");
+  const label = el("settings-bar-label");
+  const collapsed = !body.hidden;
+  body.hidden = collapsed;
+  label.innerHTML = renderSettingsBarLabel(collapsed);
 }
 
 async function handleBrowse() {
@@ -208,21 +250,22 @@ function renderShapesTable() {
     const shape = importedShapes[i];
     const { w, h } = boundsOf(shape.points);
     const row = document.createElement("tr");
+    row.dataset.row = shape._uiId;
     row.innerHTML = `
-      <td>${i}</td>
-      <td>${shape.layer}</td>
-      <td>${shape.points.length}</td>
+      <td><input type="checkbox" data-select="${shape._uiId}" /></td>
+      <td>${i + 1}</td>
+      <td>${shape._file}-${i + 1}</td>
       <td>${w.toFixed(1)} × ${h.toFixed(1)}</td>
       <td>${shapeThumbnailSvg(shape)}</td>
       <td>
-        <select data-role="${i}">
-          <option value="part">PART</option>
-          <option value="sheet">SHEET</option>
-          <option value="skip">SKIP</option>
+        <select data-role="${shape._uiId}">
+          <option value="part">${t("role_part")}</option>
+          <option value="sheet">${t("role_sheet")}</option>
+          <option value="skip">${t("role_skip")}</option>
         </select>
       </td>
-      <td><input type="number" data-qty="${i}" value="1" min="0" step="1" /></td>
-      <td><span class="dominant-flag" data-dominant="${i}"></span></td>
+      <td><input type="number" class="qty-input" data-qty="${shape._uiId}" value="1" min="0" step="1" /></td>
+      <td><span class="dominant-flag" data-dominant="${shape._uiId}"></span></td>
     `;
     body.appendChild(row);
   }
@@ -256,19 +299,19 @@ function updateDominantIndicators() {
   const threshold = Number(dominantInput.value);
 
   let maxSheetArea = 0;
-  importedShapes.forEach((shape, i) => {
-    const roleEl = document.querySelector(`[data-role="${i}"]`);
+  importedShapes.forEach((shape) => {
+    const roleEl = document.querySelector(`[data-role="${shape._uiId}"]`);
     if (roleEl?.value === "sheet") {
       maxSheetArea = Math.max(maxSheetArea, polygonArea(shape.points));
     }
   });
 
-  importedShapes.forEach((shape, i) => {
-    const cell = document.querySelector(`[data-dominant="${i}"]`);
+  importedShapes.forEach((shape) => {
+    const cell = document.querySelector(`[data-dominant="${shape._uiId}"]`);
     if (!cell) return;
-    const roleEl = document.querySelector(`[data-role="${i}"]`);
+    const roleEl = document.querySelector(`[data-role="${shape._uiId}"]`);
     const isDominant = roleEl?.value === "part" && maxSheetArea > 0 && polygonArea(shape.points) >= threshold * maxSheetArea;
-    cell.textContent = isDominant ? "CLOSES SHEET" : "";
+    cell.textContent = isDominant ? t("dominant_closes_sheet") : "";
   });
 }
 
@@ -281,7 +324,7 @@ function handleAddRectangle() {
   const height = Number(el("rect-height").value);
   const layer = el("rect-layer").value.trim() || "CUSTOM";
   if (!(width > 0) || !(height > 0)) {
-    setStatus("import-status", "width and height must both be greater than 0", true);
+    setStatus("import-status", t("rect_invalid_size"), true);
     return;
   }
 
@@ -295,6 +338,8 @@ function handleAddRectangle() {
     ],
     is_circle: null,
     children: [],
+    _uiId: nextShapeUiId++,
+    _file: layer,
   });
   logLine(`added custom rectangle: ${width} x ${height} (layer "${layer}")`);
   renderShapesTable();
@@ -310,9 +355,9 @@ function buildRequest() {
   const sheets = [];
   const parts = [];
 
-  importedShapes.forEach((shape, i) => {
-    const role = document.querySelector(`[data-role="${i}"]`).value;
-    const qty = Number(document.querySelector(`[data-qty="${i}"]`).value);
+  importedShapes.forEach((shape) => {
+    const role = document.querySelector(`[data-role="${shape._uiId}"]`).value;
+    const qty = Number(document.querySelector(`[data-qty="${shape._uiId}"]`).value);
     if (role === "sheet") {
       for (let n = 0; n < Math.max(qty, 1); n++) sheets.push(shapeToPolygonDto(shape));
     } else if (role === "part" && qty > 0) {
@@ -332,7 +377,8 @@ function buildRequest() {
     spacing: Number(el("cfg-spacing").value),
     max_threads: Number(el("cfg-max-threads").value),
     seed: Number(el("cfg-seed").value),
-    // live_visualization: el("cfg-live-viz").checked, // live preview, commented out - see index.html
+    runs: Number(el("cfg-runs").value),
+    cleanup_threshold_percent: el("cfg-cleanup-threshold").value === "" ? null : Number(el("cfg-cleanup-threshold").value),
   };
 
   return { sheets, parts, config };
@@ -341,44 +387,34 @@ function buildRequest() {
 async function handleRunNest() {
   const request = buildRequest();
   if (request.sheets.length === 0) {
-    setStatus("run-status", "mark at least one shape as SHEET", true);
+    setStatus("run-status", t("run_need_sheet"), true);
     return;
   }
   if (request.parts.length === 0) {
-    setStatus("run-status", "mark at least one shape as PART with quantity > 0", true);
+    setStatus("run-status", t("run_need_part"), true);
     return;
   }
 
   const partInstances = request.parts.reduce((n, p) => n + p.quantity, 0);
   currentGenerations = request.config.generations;
-  setStatus("run-status", "nesting...", false);
-  logLine(
-    request.config.live_visualization
-      ? `live preview: ${request.sheets.length} sheet(s), ${partInstances} part instance(s), one placement pass`
-      : `nest: ${request.sheets.length} sheet(s), ${partInstances} part instance(s), ${request.config.generations} generation(s)`
-  );
+  setStatus("run-status", t("run_status_running"), false);
+  logLine(`nest: ${request.sheets.length} sheet(s), ${partInstances} part instance(s), ${request.config.runs} run(s)`);
   invoke("save_config_command", { config: request.config }).catch((err) => logLine(`could not save config: ${err}`));
   el("btn-run").disabled = true;
   el("btn-stop").hidden = false;
   el("btn-stop").disabled = false;
   setControlsLocked(true);
+  collapseAllPanels();
   setBusy("run-spinner", true);
   el("run-progress").hidden = false;
   el("run-progress-fill").style.width = "0%";
 
   lastNestRequest = request;
-  /* Live preview - commented out, see index.html/app.js's other commented-out live-preview blocks.
-  liveViewActive = request.config.live_visualization;
-  liveShapesById = {};
-  liveSheetEls = {};
-  liveQueue.length = 0; // discard anything still queued/animating from a previous live run
-  syncLivePreviewSectionVisibility();
-  el("live-sheets").innerHTML = "";
-  */
 
   try {
     const response = await invoke("run_nest_command", { request });
-    setStatus("run-status", response.cancelled ? "stopped early" : "done", false);
+    setStatus("run-status", response.cancelled ? t("run_status_stopped") : t("run_status_done"), false);
+    // Console narration stays English regardless of UI language - see i18n.js's own doc comment.
     logLine(
       `nest ${response.cancelled ? "stopped early" : "done"}: fitness=${response.fitness.toFixed(1)} sheets=${response.placements.length} unplaced=${response.unplaced_count} util=${response.utilisation.toFixed(1)}%`
     );
@@ -388,10 +424,8 @@ async function handleRunNest() {
     renderResult(response, request);
     el("panel-result").hidden = false;
   } catch (err) {
-    setStatus("run-status", String(err), true);
-    logLine(`nest failed: ${err}`);
+    setStatus("run-status", t("run_status_failed", { err }), true);
   } finally {
-    // liveViewActive = false; // live preview, commented out
     el("btn-run").disabled = false;
     el("btn-stop").hidden = true;
     setControlsLocked(false);
@@ -416,17 +450,6 @@ async function handleStopNest() {
   }
 }
 
-function rotatedTranslatedPoints(points, rotationDeg, dx, dy) {
-  const rad = (rotationDeg * Math.PI) / 180;
-  const cos = Math.cos(rad);
-  const sin = Math.sin(rad);
-  return points.map((p) => ({ x: p.x * cos - p.y * sin + dx, y: p.x * sin + p.y * cos + dy }));
-}
-
-function pointsToPath(points) {
-  return points.map((p) => `${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(" ");
-}
-
 // A rough, honest guess at *why* a part didn't place - the engine itself
 // doesn't produce a structured reason, just "didn't fit in the best attempt
 // found". The one thing we CAN check independently is whether the part's
@@ -439,9 +462,24 @@ function unplacedReason(shape, request) {
     const sb = boundsOf(sheetDto.points);
     return (w <= sb.w && h <= sb.h) || (w <= sb.h && h <= sb.w);
   });
+  // `label` is short enough to sit visibly under the thumbnail at all times;
+  // `detail` (the full explanation) still goes in `title` for anyone who
+  // hovers - but the label alone is enough to tell "too big, don't bother
+  // retrying" apart from "just needs another attempt" without hovering.
   return fitsSomeSheet
-    ? "Didn't find room in this run - try more generations, a smaller margin/spacing, or fewer competing parts."
-    : "Too large to fit on any available sheet at all (checked its own width/height against every sheet's), even by itself.";
+    ? { label: t("unplaced_label_no_room"), detail: t("unplaced_detail_no_room") }
+    : { label: t("unplaced_label_too_large"), detail: t("unplaced_detail_too_large") };
+}
+
+// Keeps 03/CONFIGURE's own heading-row summary in sync with whatever the
+// current best result actually is - unlike `run-status` (a transient
+// "nesting.../done" message inside the collapsible drawer), this lives in
+// the always-visible strip, so it stays legible even with the bar
+// collapsed and the result panel scrolled out of view. Updated both from a
+// live "nest-run-complete" event (see below) and from `renderSnapshot`
+// (a picked VIEW ATTEMPT, or a recovered previous-session result).
+function updateBottomBarSummary(sheetsUsed, unplacedCount, utilisation) {
+  el("bottom-bar-summary").textContent = t("bottom_bar_summary", { sheets: sheetsUsed, unplaced: unplacedCount, util: utilisation.toFixed(1) });
 }
 
 // Renders one candidate nest (either the final response's own top-level
@@ -450,13 +488,14 @@ function unplacedReason(shape, request) {
 // one renderer covers whichever the user picks in the VIEW ATTEMPT select.
 function renderSnapshot(snapshot, request) {
   currentSnapshot = snapshot;
+  updateBottomBarSummary(snapshot.placements.length, snapshot.unplaced_count, snapshot.utilisation);
 
   const stats = el("result-stats");
   stats.innerHTML = `
-    <div><dt>FITNESS</dt><dd>${snapshot.fitness.toFixed(1)}</dd></div>
-    <div><dt>UTILISATION</dt><dd>${snapshot.utilisation.toFixed(1)}%</dd></div>
-    <div><dt>UNPLACED</dt><dd>${snapshot.unplaced_count}</dd></div>
-    <div><dt>SHEETS USED</dt><dd>${snapshot.placements.length}</dd></div>
+    <div><dt>${t("stat_fitness")}</dt><dd>${snapshot.fitness.toFixed(1)}</dd></div>
+    <div><dt>${t("stat_utilisation")}</dt><dd>${snapshot.utilisation.toFixed(1)}%</dd></div>
+    <div><dt>${t("stat_unplaced")}</dt><dd>${snapshot.unplaced_count}</dd></div>
+    <div><dt>${t("stat_sheets_used")}</dt><dd>${snapshot.placements.length}</dd></div>
   `;
 
   const unplacedSection = el("unplaced-section");
@@ -467,10 +506,11 @@ function renderSnapshot(snapshot, request) {
   for (const id of unplacedIds) {
     const shape = lastPartsById[id];
     if (!shape) continue;
+    const reason = unplacedReason(shape, request);
     const item = document.createElement("div");
     item.className = "unplaced-item";
-    item.title = unplacedReason(shape, request);
-    item.innerHTML = `${shapeThumbnailSvg(shape, UNPLACED_COLOR)}<span>#${id} ${shape.layer}</span>`;
+    item.title = reason.detail;
+    item.innerHTML = `${shapeThumbnailSvg(shape, UNPLACED_COLOR)}<span>#${id} ${shape.layer}</span><span class="unplaced-reason">${reason.label}</span>`;
     unplacedList.appendChild(item);
   }
 
@@ -484,7 +524,20 @@ function renderSnapshot(snapshot, request) {
     const scale = Math.min(700 / Math.max(w, 1), 500 / Math.max(h, 1));
 
     const wrapper = document.createElement("div");
-    wrapper.className = "sheet";
+    // A quick visual scan cue across many sheets - which ones are packed
+    // tight vs. which are mostly empty - without having to eyeball each
+    // SVG's whitespace individually. Raw polygon area (not "usable" area
+    // net of margin/spacing, which only the Rust side tracks) is close
+    // enough for a color band; the exact number is right there in the
+    // caption for anyone who wants it precisely.
+    const sheetArea = polygonArea(sheetDto.points);
+    const usedArea = placement.parts.reduce((sum, p) => {
+      const shape = lastPartsById[p.id];
+      return shape ? sum + polygonArea(shape.points) : sum;
+    }, 0);
+    const sheetUtilisation = sheetArea > 0 ? (usedArea / sheetArea) * 100 : 0;
+    const utilClass = sheetUtilisation >= 75 ? "sheet-util-high" : sheetUtilisation >= 45 ? "sheet-util-mid" : "sheet-util-low";
+    wrapper.className = `sheet ${utilClass}`;
 
     const svgParts = placement.parts
       .map((p) => {
@@ -500,9 +553,43 @@ function renderSnapshot(snapshot, request) {
         <polygon points="${pointsToPath(toSvgPoints(sheetDto.points, sheetBounds))}" fill="none" stroke="#8a8a8a" stroke-width="${1 / scale}" />
         ${svgParts}
       </svg>
-      <div class="caption">SHEET ${placement.sheet_index} — ${placement.parts.length} part(s)</div>
+      <div class="caption">${t("sheet_caption", { n: placement.sheet_index + 1, parts: placement.parts.length, util: sheetUtilisation.toFixed(1) })}
+        <button type="button" class="small btn-repack" title="${t("repack_tooltip")}">${t("repack_button")}</button>
+      </div>
     `;
+    wrapper.querySelector(".btn-repack").addEventListener("click", () => handleRepackSheet(placement.sheet_index));
     sheetsEl.appendChild(wrapper);
+  }
+}
+
+// Manual, click-a-sheet counterpart to the CLEANUP THRESHOLD config option -
+// both call the same nesting::repack::repack_sheet on the backend. Always
+// available regardless of the sheet's own utilisation (unlike the automatic
+// pass, which only touches sheets under the configured threshold).
+async function handleRepackSheet(sheetIndex) {
+  if (!currentSnapshot || !lastNestRequest || !lastPartsById) return;
+  const idx = currentSnapshot.placements.findIndex((p) => p.sheet_index === sheetIndex);
+  if (idx === -1) return;
+  const placement = currentSnapshot.placements[idx];
+  const partsById = {};
+  for (const p of placement.parts) partsById[p.id] = lastPartsById[p.id];
+
+  const displayIndex = sheetIndex + 1; // matches the SHEET N label on the card itself, not the internal 0-based index
+  setStatus("run-status", t("repack_status_running", { n: displayIndex }), false);
+  try {
+    const response = await invoke("repack_sheet_command", {
+      request: { sheet: lastNestRequest.sheets[sheetIndex], placement, parts_by_id: partsById, config: lastNestRequest.config },
+    });
+    currentSnapshot.placements[idx] = response.placement;
+    renderSnapshot(currentSnapshot, lastNestRequest);
+    setStatus(
+      "run-status",
+      response.improved ? t("repack_status_improved", { n: displayIndex, util: response.utilisation.toFixed(1) }) : t("repack_status_no_improvement", { n: displayIndex }),
+      false
+    );
+    logLine(`repack sheet ${displayIndex}: ${response.improved ? "improved" : "no improvement found"}`);
+  } catch (err) {
+    setStatus("run-status", t("repack_status_failed", { n: displayIndex, err }), true);
   }
 }
 
@@ -522,7 +609,7 @@ function renderResult(response, request) {
   select.innerHTML = history
     .map((h, i) => {
       const isLast = i === history.length - 1;
-      const label = `#${i + 1} gen ${h.generation ?? "-"}${isLast ? " (best)" : ""} - fitness ${h.fitness.toFixed(0)}, ${h.unplaced_count} unplaced`;
+      const label = t("history_option", { i: i + 1, gen: h.generation ?? "-", best: isLast ? t("history_best_suffix") : "", fitness: h.fitness.toFixed(0), unplaced: h.unplaced_count });
       return `<option value="${i}">${label}</option>`;
     })
     .join("");
@@ -537,7 +624,7 @@ async function handleExport() {
 
   const sheetSpacing = Number(el("export-spacing").value);
   if (!(sheetSpacing >= 0)) {
-    setStatus("export-status", "sheet spacing must be 0 or more", true);
+    setStatus("export-status", t("export_invalid_spacing"), true);
     return;
   }
   const includeSheetOutline = el("export-outline").checked;
@@ -560,12 +647,12 @@ async function handleExport() {
     include_sheet_outline: includeSheetOutline,
   };
 
-  setStatus("export-status", "exporting...", false);
+  setStatus("export-status", t("export_status_running"), false);
   logLine(`export: ${path} (sheet spacing ${sheetSpacing}mm, sheet outline ${includeSheetOutline ? "on" : "off"})`);
   el("btn-export").disabled = true;
   try {
     await invoke("export_dxf_command", { path, request });
-    setStatus("export-status", "exported", false);
+    setStatus("export-status", t("export_status_done"), false);
     logLine(`export ok: ${path}`);
   } catch (err) {
     setStatus("export-status", String(err), true);
@@ -575,11 +662,125 @@ async function handleExport() {
   }
 }
 
+// Applies every saved display preference (language, accent color, text
+// scale) up front, then keeps the header controls and already-rendered
+// dynamic content (dominant flags, the current result view if one's
+// showing, the settings-bar label) in sync on every change.
+// ponytail: the shapes table's ROLE dropdown options (PART/SHEET/SKIP) are
+// only translated at row-creation time, not retroactively - switching
+// language after importing leaves already-listed rows' dropdown wording in
+// the old language (the underlying part/sheet/skip value is unaffected,
+// it's cosmetic only). Re-importing or restarting picks up the new
+// language. Fixing this needs the table to always rebuild from stored
+// per-row state rather than only append, which isn't done here.
+applySavedPrefs();
+el("lang-switch").value = getLang();
+applyStaticTranslations();
+el("settings-bar-label").innerHTML = renderSettingsBarLabel(true);
+
+el("lang-switch").addEventListener("change", (event) => {
+  setLang(event.target.value);
+  el("help-lang-switch").value = event.target.value;
+  updateDominantIndicators();
+  if (currentSnapshot && lastNestRequest) renderSnapshot(currentSnapshot, lastNestRequest);
+});
+
+// First-run help modal - shown once automatically (unless previously
+// dismissed with its own checkbox ticked), reopenable anytime via the
+// header's "?" button. Its own language switch is a second <select> wired
+// to the exact same setLang(), not a separate mechanism - picking a
+// language here changes the whole app, not just the modal, and the gear
+// menu's switch stays in sync with whichever one was used last.
+const HELP_DISMISSED_KEY = "rustynesting-help-dismissed";
+
+function openHelp() {
+  el("help-lang-switch").value = getLang();
+  el("help-overlay").hidden = false;
+}
+
+function closeHelp() {
+  el("help-overlay").hidden = true;
+  if (el("help-dont-show").checked) {
+    localStorage.setItem(HELP_DISMISSED_KEY, "1");
+  }
+}
+
+el("btn-help").addEventListener("click", openHelp);
+el("btn-help-close").addEventListener("click", closeHelp);
+el("help-overlay").addEventListener("click", (event) => {
+  if (event.target === el("help-overlay")) closeHelp();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !el("help-overlay").hidden) closeHelp();
+});
+el("help-lang-switch").addEventListener("change", (event) => {
+  setLang(event.target.value);
+  el("lang-switch").value = event.target.value;
+  updateDominantIndicators();
+  if (currentSnapshot && lastNestRequest) renderSnapshot(currentSnapshot, lastNestRequest);
+});
+
+if (!localStorage.getItem(HELP_DISMISSED_KEY)) {
+  openHelp();
+}
+
+el("scale-switch").value = getScaleName();
+el("scale-switch").addEventListener("change", (event) => setScale(event.target.value));
+
+// Gear-menu toggle - a dropdown anchored under the button (`.app-settings`'s
+// own `position: relative` in app.css), not a modal, so it reads as a
+// lightweight preference panel rather than interrupting the page. Closes on
+// any click outside itself; the gear button's own click is excluded from
+// that check (stopPropagation) so pressing it doesn't immediately re-close
+// what it just opened.
+const appSettingsMenu = el("app-settings-menu");
+el("btn-app-settings").addEventListener("click", (event) => {
+  event.stopPropagation();
+  appSettingsMenu.hidden = !appSettingsMenu.hidden;
+});
+document.addEventListener("click", (event) => {
+  if (!appSettingsMenu.hidden && !appSettingsMenu.contains(event.target)) {
+    appSettingsMenu.hidden = true;
+  }
+});
+
+// Swatches and the hex field both drive the same accent - each one syncs
+// the other's displayed state so neither goes stale after the other is used.
+function markSelectedSwatch(color) {
+  document.querySelectorAll("#accent-swatches .swatch").forEach((s) => s.classList.toggle("selected", s.dataset.accent.toLowerCase() === color.toLowerCase()));
+}
+
+const accentHexInput = el("accent-hex");
+const currentAccent = getAccent();
+accentHexInput.value = currentAccent;
+markSelectedSwatch(currentAccent);
+
+document.querySelectorAll("#accent-swatches .swatch").forEach((swatch) => {
+  swatch.addEventListener("click", () => {
+    setAccent(swatch.dataset.accent);
+    accentHexInput.value = swatch.dataset.accent;
+    markSelectedSwatch(swatch.dataset.accent);
+  });
+});
+
+// Live as you type, but only once the code is a complete, valid hex value -
+// an in-progress "#ffc" simply doesn't apply yet rather than erroring.
+accentHexInput.addEventListener("input", () => {
+  const value = accentHexInput.value.trim();
+  if (!/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(value)) return;
+  setAccent(value);
+  markSelectedSwatch(value);
+});
+
 el("btn-import").addEventListener("click", handleBrowse);
 el("btn-add-rect").addEventListener("click", handleAddRectangle);
 el("btn-run").addEventListener("click", handleRunNest);
 el("btn-stop").addEventListener("click", handleStopNest);
 el("btn-toggle-shapes").addEventListener("click", handleToggleShapes);
+el("btn-mark-all-parts").addEventListener("click", () => markAllRoles("part"));
+el("btn-mark-all-sheets").addEventListener("click", () => markAllRoles("sheet"));
+el("btn-toggle-advanced").addEventListener("click", handleToggleAdvanced);
+el("btn-toggle-settings").addEventListener("click", handleToggleSettings);
 el("btn-export").addEventListener("click", handleExport);
 
 // Live percentage readout + dominant-part re-check on every slider move.
@@ -588,16 +789,6 @@ el("cfg-dominant").addEventListener("input", () => {
   updateDominantIndicators();
 });
 
-/* Live preview - commented out, see index.html/app.js's other commented-out live-preview blocks.
-el("cfg-live-viz-speed").addEventListener("input", () => {
-  el("cfg-live-viz-speed-value").textContent = `${el("cfg-live-viz-speed").value}ms`;
-});
-
-function syncLivePreviewSectionVisibility() {
-  el("live-preview-section").hidden = !el("cfg-live-viz").checked;
-}
-el("cfg-live-viz").addEventListener("change", syncLivePreviewSectionVisibility);
-*/
 
 // Delegated (not per-row) since rows are added dynamically after this
 // listener is wired - a shape's ROLE changes which shapes count as "sheet"
@@ -606,6 +797,36 @@ el("shapes-body").addEventListener("change", (event) => {
   if (event.target.matches("[data-role]")) {
     updateDominantIndicators();
   }
+});
+
+// Permanently deletes every ticked shape from the import list in one go -
+// distinct from the existing ROLE=SKIP option, which only excludes a shape
+// from the next run without ever removing it (reversible, no confirmation
+// needed). Deletion isn't reversible, so it's gated behind a single native
+// confirm dialog covering the whole batch.
+async function handleRemoveSelected() {
+  const ids = Array.from(document.querySelectorAll("#shapes-body [data-select]:checked")).map((cb) => Number(cb.dataset.select));
+  if (ids.length === 0) return;
+
+  const confirmed = await window.__TAURI__.dialog.confirm(t("confirm_remove_message", { n: ids.length }), {
+    title: t("confirm_remove_title"),
+    kind: "warning",
+  });
+  if (!confirmed) return;
+
+  importedShapes = importedShapes.filter((s) => !ids.includes(s._uiId));
+  ids.forEach((uiId) => el("shapes-body").querySelector(`tr[data-row="${uiId}"]`)?.remove());
+  el("select-all-shapes").checked = false;
+  updateDominantIndicators();
+  logLine(`removed ${ids.length} shape(s) (${importedShapes.length} remaining)`);
+}
+
+el("btn-remove-selected").addEventListener("click", handleRemoveSelected);
+
+el("select-all-shapes").addEventListener("change", (event) => {
+  document.querySelectorAll("#shapes-body [data-select]").forEach((cb) => {
+    cb.checked = event.target.checked;
+  });
 });
 
 // Restores the config panel to whatever was last saved
@@ -633,8 +854,8 @@ async function loadSavedConfig() {
   el("cfg-spacing").value = saved.spacing;
   el("cfg-max-threads").value = saved.max_threads;
   el("cfg-seed").value = saved.seed ?? 0;
-  // el("cfg-live-viz").checked = Boolean(saved.live_visualization); // live preview, commented out
-  // syncLivePreviewSectionVisibility();
+  el("cfg-runs").value = saved.runs ?? 6;
+  el("cfg-cleanup-threshold").value = saved.cleanup_threshold_percent ?? "";
   el("import-tolerance").value = saved.curve_tolerance;
   updateDominantIndicators();
   logLine("restored config from last session");
@@ -658,10 +879,10 @@ async function tryRecoverBestResult() {
   }
   if (!best) return;
 
-  const recover = await window.__TAURI__.dialog.ask(
-    `A saved nest result from a previous session exists (${best.placements.length} sheet(s), ${best.utilisation.toFixed(1)}% utilisation). Recover it?`,
-    { title: "Recover last session?", kind: "info" },
-  );
+  const recover = await window.__TAURI__.dialog.ask(t("recover_message", { sheets: best.placements.length, util: best.utilisation.toFixed(1) }), {
+    title: t("recover_title"),
+    kind: "info",
+  });
 
   if (!recover) {
     try {
@@ -682,12 +903,45 @@ async function tryRecoverBestResult() {
 }
 tryRecoverBestResult();
 
+// Narrates the auto-escalating "Runs" loop (see commands.rs's
+// run_nest_with_progress) - one line per attempt starting, then one when it
+// finishes, so the console reads as a story ("trying more rotations now...
+// that was better, keep going") instead of just a wall of per-generation
+// numbers with no sense of which attempt produced them.
+window.__TAURI__.event.listen("nest-run-start", (event) => {
+  const r = event.payload;
+  logLine(`run ${r.run}/${r.total_runs}: trying ${r.rotations} rotation(s), population ${r.population_size}, ${r.generations} generation(s)...`, "run");
+  // Each run has its own generation count (escalates with the run - see
+  // commands.rs's escalated_run_config), so the "nest-tick" progress-bar
+  // math below needs updating per run, not just once at request time.
+  currentGenerations = r.generations;
+});
+
+window.__TAURI__.event.listen("nest-run-complete", (event) => {
+  const r = event.payload;
+  const verdict = r.improved ? "NEW BEST" : "no improvement";
+  logLine(
+    `run ${r.run}/${r.total_runs} done: sheets=${r.sheets_used} unplaced=${r.unplaced_count} util=${r.utilisation.toFixed(1)}% -> ${verdict}`,
+    r.improved ? "best" : "run"
+  );
+  // Live update, not just at the very end of the whole escalation - the
+  // full response (and its own renderSnapshot() call) only ever lands once
+  // every configured run has finished, which for a several-run job can be
+  // a long wait with no visible sign of the best-so-far otherwise.
+  if (r.improved) {
+    updateBottomBarSummary(r.sheets_used, r.unplaced_count, r.utilisation);
+  }
+});
+
 // Live per-generation stats while a nest run is in progress, emitted by
 // run_nest_command (see src-tauri/src/commands.rs's run_nest_with_progress)
-// - the Rust-side counterpart to this UI's console panel.
+// - the Rust-side counterpart to this UI's console panel. `generations`
+// here is the *current run's* own total (resets each run - see
+// "nest-run-start" above for which attempt this belongs to), not the whole
+// escalation's.
 window.__TAURI__.event.listen("nest-progress", (event) => {
   const p = event.payload;
-  logLine(`gen ${p.generation}/${p.generations}: fitness=${p.best_fitness.toFixed(1)} sheets=${p.sheets_used} unplaced=${p.unplaced_count} util=${p.utilisation.toFixed(1)}%`);
+  logLine(`  gen ${p.generation}/${p.generations}: fitness=${p.best_fitness.toFixed(1)} sheets=${p.sheets_used} unplaced=${p.unplaced_count} util=${p.utilisation.toFixed(1)}%`);
   el("run-progress-fill").style.width = `${((100 * p.generation) / p.generations).toFixed(1)}%`;
 });
 
@@ -707,92 +961,6 @@ window.__TAURI__.event.listen("nest-tick", (event) => {
   }
 });
 
-// Live preview - commented out (2026), never worked reliably; not deleted
-// so it's easy to pick back up later. See index.html's matching commented-
-// out #cfg-live-viz/#live-preview-section and src-tauri's
-// NestConfigDto::live_visualization/run_nest_with_progress (also commented
-// out) for the backend half of this.
-/*
-window.__TAURI__.event.listen("nest-live-start", (event) => {
-  if (!liveViewActive) return; // stale event from a run that already finished/failed
-  liveShapesById = event.payload;
-  liveSheetEls = {};
-  el("live-sheets").innerHTML = "";
-  el("live-caption").textContent = "";
-  logLine(`live preview: starting (${Object.keys(liveShapesById).length} part instance(s))`);
-});
-
-function renderLivePart(sheetIndex, part) {
-  if (!lastNestRequest) return;
-  const shape = liveShapesById[part.id];
-  if (!shape) return;
-
-  let sheetEl = liveSheetEls[sheetIndex];
-  if (!sheetEl) {
-    const sheetDto = lastNestRequest.sheets[sheetIndex];
-    const sheetBounds = boundsOf(sheetDto.points);
-    const { w, h } = sheetBounds;
-    const scale = Math.min(700 / Math.max(w, 1), 500 / Math.max(h, 1));
-
-    const wrapper = document.createElement("div");
-    wrapper.className = "sheet";
-    wrapper.innerHTML = `
-      <svg viewBox="0 0 ${w} ${h}" width="${(w * scale).toFixed(0)}" height="${(h * scale).toFixed(0)}">
-        <polygon points="${pointsToPath(toSvgPoints(sheetDto.points, sheetBounds))}" fill="none" stroke="#8a8a8a" stroke-width="${1 / scale}" />
-      </svg>
-      <div class="caption">SHEET ${sheetIndex} — <span data-count>0</span> part(s)</div>
-    `;
-    el("live-sheets").appendChild(wrapper);
-    sheetEl = { svg: wrapper.querySelector("svg"), sheetBounds, count: 0, caption: wrapper.querySelector("[data-count]") };
-    liveSheetEls[sheetIndex] = sheetEl;
-  }
-
-  const transform = (points) => toSvgPoints(rotatedTranslatedPoints(points, part.rotation, part.x, part.y), sheetEl.sheetBounds);
-  sheetEl.svg.insertAdjacentHTML("beforeend", renderShapeSvg(shape, transform));
-  sheetEl.count += 1;
-  sheetEl.caption.textContent = String(sheetEl.count);
-}
-
-function tickLiveQueue() {
-  if (liveQueue.length === 0) {
-    liveTicking = false;
-    return;
-  }
-  const item = liveQueue.shift();
-  switch (item.type) {
-    case "generation-start":
-      liveSheetEls = {};
-      el("live-sheets").innerHTML = "";
-      el("live-caption").textContent =
-        `GEN ${item.generation}/${item.generations} — fitness ${item.fitness.toFixed(1)}` +
-        (item.unplaced_count > 0 ? ` — ${item.unplaced_count} unplaced` : "");
-      break;
-    case "part-placed":
-      renderLivePart(item.sheet_index, item.part);
-      break;
-  }
-  setTimeout(tickLiveQueue, Number(el("cfg-live-viz-speed").value));
-}
-
-function ensureLiveTicking() {
-  if (liveTicking) return;
-  liveTicking = true;
-  tickLiveQueue();
-}
-
-window.__TAURI__.event.listen("nest-live-generation-result", (event) => {
-  if (!liveViewActive) return;
-  const { generation, generations, fitness, unplaced_count, placements } = event.payload;
-  liveQueue.push({ type: "generation-start", generation, generations, fitness, unplaced_count });
-  for (const sheetPlacement of placements) {
-    for (const part of sheetPlacement.parts) {
-      liveQueue.push({ type: "part-placed", sheet_index: sheetPlacement.sheet_index, part });
-    }
-  }
-  ensureLiveTicking();
-});
-*/
-
 // Drag-and-drop DXF import - Tauri delivers dropped-file paths as a core
 // window event (needs `dragDropEnabled: true` in tauri.conf.json's window
 // config; not a plugin, so no extra capability beyond core:event:default).
@@ -807,3 +975,52 @@ window.__TAURI__.event.listen("tauri://drag-drop", (event) => {
   }
   importPaths(paths);
 });
+
+// Console as a small floating window instead of a fixed panel in the main
+// column - draggable by its header (pointer capture so a fast drag can't
+// outrun the element and drop the drag mid-move) and collapsible down to
+// just the header. Deliberately not closable - it's the only place errors
+// are surfaced now (see setStatus's run-status special case above), so
+// there's no "reopen" affordance to lose track of either.
+(function setupConsoleWindow() {
+  const win = el("console-window");
+  const header = el("console-header");
+  const minimizeBtn = el("btn-console-minimize");
+
+  let dragging = false;
+  let offsetX = 0;
+  let offsetY = 0;
+
+  header.addEventListener("pointerdown", (event) => {
+    if (event.target.closest(".icon-btn")) return;
+    dragging = true;
+    const rect = win.getBoundingClientRect();
+    offsetX = event.clientX - rect.left;
+    offsetY = event.clientY - rect.top;
+    // Switch from the CSS default (anchored via `top`/`right`) to an
+    // explicit `left` once dragging starts - keeping `right` set would fight
+    // the `left` this drag needs to set on every move.
+    win.style.left = `${rect.left}px`;
+    win.style.top = `${rect.top}px`;
+    win.style.right = "auto";
+    header.setPointerCapture(event.pointerId);
+  });
+
+  header.addEventListener("pointermove", (event) => {
+    if (!dragging) return;
+    const maxLeft = window.innerWidth - win.offsetWidth;
+    const maxTop = window.innerHeight - header.offsetHeight;
+    win.style.left = `${Math.min(Math.max(0, event.clientX - offsetX), Math.max(0, maxLeft))}px`;
+    win.style.top = `${Math.min(Math.max(0, event.clientY - offsetY), Math.max(0, maxTop))}px`;
+  });
+
+  header.addEventListener("pointerup", (event) => {
+    dragging = false;
+    header.releasePointerCapture(event.pointerId);
+  });
+
+  minimizeBtn.addEventListener("click", () => {
+    const collapsed = win.classList.toggle("collapsed");
+    minimizeBtn.textContent = collapsed ? "▢" : "_";
+  });
+})();

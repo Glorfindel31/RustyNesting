@@ -7,30 +7,66 @@
   </head>
   <body>
     <header>
-      <h1>RUSTYNESTING</h1>
-      <span class="sub">RUST/TAURI — PHASE 6</span>
+      <h1><span class="brand-accent">RUSTY</span>NESTING</h1>
+      <div class="header-controls">
+        <button type="button" id="btn-help" class="icon-btn" data-i18n-title="help_button_title" title="How to use this app">?</button>
+        <div class="app-settings" id="app-settings">
+          <button type="button" id="btn-app-settings" class="icon-btn" data-i18n-title="app_settings_title" title="App settings">⚙</button>
+          <div id="app-settings-menu" class="app-settings-menu" hidden>
+            <div class="app-settings-row">
+              <label for="lang-switch" data-i18n="lang_switch_label" data-i18n-title="lang_switch_title" title="Language">LANGUAGE</label>
+              <select id="lang-switch" data-i18n-title="lang_switch_title" title="Language">
+                <option value="en">English</option>
+                <option value="vi">Tiếng Việt</option>
+              </select>
+            </div>
+            <div class="app-settings-row">
+              <label for="scale-switch" data-i18n="scale_switch_label" data-i18n-title="scale_switch_title" title="Text size">TEXT SIZE</label>
+              <select id="scale-switch" data-i18n-title="scale_switch_title" title="Text size">
+                <option value="small" data-i18n="scale_small">SMALL</option>
+                <option value="normal" data-i18n="scale_normal" selected>NORMAL</option>
+                <option value="large" data-i18n="scale_large">BIG</option>
+              </select>
+            </div>
+            <div class="app-settings-row">
+              <label data-i18n="accent_switch_label" data-i18n-title="accent_switch_title" title="Accent color">ACCENT</label>
+              <div class="accent-swatches" id="accent-swatches" data-i18n-title="accent_switch_title" title="Accent color">
+                <button type="button" class="swatch" data-accent="#ffc400" style="--swatch: #ffc400" data-i18n-title="accent_yellow" title="Yellow"></button>
+                <button type="button" class="swatch" data-accent="#ff6a3d" style="--swatch: #ff6a3d" data-i18n-title="accent_orange" title="Orange"></button>
+                <button type="button" class="swatch" data-accent="#4fd15c" style="--swatch: #4fd15c" data-i18n-title="accent_green" title="Green"></button>
+                <button type="button" class="swatch" data-accent="#4fc3f7" style="--swatch: #4fc3f7" data-i18n-title="accent_cyan" title="Cyan"></button>
+                <button type="button" class="swatch" data-accent="#ff4fd8" style="--swatch: #ff4fd8" data-i18n-title="accent_magenta" title="Magenta"></button>
+              </div>
+            </div>
+            <div class="app-settings-row">
+              <label for="accent-hex" data-i18n="accent_hex_label" data-i18n-title="accent_hex_tooltip" title="Type any hex color code (e.g. #ffc400)">HEX</label>
+              <input id="accent-hex" type="text" maxlength="7" placeholder="#ffc400" spellcheck="false" data-i18n-title="accent_hex_tooltip" title="Type any hex color code (e.g. #ffc400)" />
+            </div>
+          </div>
+        </div>
+      </div>
     </header>
 
     <main>
       <section class="panel" id="panel-import">
-        <h2>01 / IMPORT DXF</h2>
+        <h2><span class="step-num">01</span> / <span data-i18n="heading_import_text">IMPORT DXF</span></h2>
         <div class="row">
-          <label for="import-tolerance" title="How closely curves (arcs/circles) are approximated with straight line segments. Lower = more accurate but more points; higher = fewer points but a coarser shape.">TOLERANCE</label>
-          <input id="import-tolerance" type="number" value="0.3" step="0.05" min="0.01" title="How closely curves (arcs/circles) are approximated with straight line segments. Lower = more accurate but more points; higher = fewer points but a coarser shape." />
-          <button id="btn-import">BROWSE...</button>
+          <label for="import-tolerance" data-i18n="tolerance_label" data-i18n-title="tolerance_tooltip" title="How closely curves (arcs/circles) are approximated with straight line segments. Lower = more accurate but more points; higher = fewer points but a coarser shape.">TOLERANCE</label>
+          <input id="import-tolerance" type="number" value="0.3" step="0.05" min="0.01" data-i18n-title="tolerance_tooltip" title="How closely curves (arcs/circles) are approximated with straight line segments. Lower = more accurate but more points; higher = fewer points but a coarser shape." />
+          <button id="btn-import" class="primary" data-i18n="btn_browse">BROWSE...</button>
           <span class="spinner" id="import-spinner" hidden></span>
         </div>
-        <div id="dropzone" class="dropzone">or drag one or more .dxf files here</div>
+        <div id="dropzone" class="dropzone" data-i18n="dropzone_text">or drag one or more .dxf files here</div>
 
-        <p class="hint">or add a rectangle directly (a stock sheet size, or a simple rectangular part) without a DXF file:</p>
+        <p class="hint" data-i18n="rect_hint">or add a rectangle directly (a stock sheet size, or a simple rectangular part) without a DXF file:</p>
         <div class="row">
-          <label for="rect-width">WIDTH (mm)</label>
+          <label for="rect-width" data-i18n="rect_width_label">WIDTH (mm)</label>
           <input id="rect-width" type="number" value="2440" min="0.1" step="1" />
-          <label for="rect-height">HEIGHT (mm)</label>
+          <label for="rect-height" data-i18n="rect_height_label">HEIGHT (mm)</label>
           <input id="rect-height" type="number" value="1220" min="0.1" step="1" />
-          <label for="rect-layer">LAYER NAME</label>
+          <label for="rect-layer" data-i18n="rect_layer_label">LAYER NAME</label>
           <input id="rect-layer" type="text" value="CUSTOM" spellcheck="false" />
-          <button id="btn-add-rect">ADD RECTANGLE</button>
+          <button id="btn-add-rect" data-i18n="btn_add_rect">ADD RECTANGLE</button>
         </div>
 
         <p class="status" id="import-status"></p>
@@ -38,22 +74,27 @@
 
       <section class="panel" id="panel-shapes" hidden>
         <div class="row panel-heading-row">
-          <h2>02 / ASSIGN ROLES</h2>
-          <button id="btn-toggle-shapes" class="small">COLLAPSE</button>
+          <h2><span class="step-num">02</span> / <span data-i18n="heading_roles_text">ASSIGN ROLES</span></h2>
+          <div class="row" style="margin-bottom: 0;">
+            <button type="button" id="btn-mark-all-parts" class="small" data-i18n="btn_mark_all_parts" data-i18n-title="btn_mark_all_parts_tooltip" title="Set every imported shape's ROLE to PART in one click, instead of picking each row's dropdown individually.">ALL PART</button>
+            <button type="button" id="btn-mark-all-sheets" class="small" data-i18n="btn_mark_all_sheets" data-i18n-title="btn_mark_all_sheets_tooltip" title="Set every imported shape's ROLE to SHEET in one click, instead of picking each row's dropdown individually.">ALL SHEET</button>
+            <button type="button" id="btn-remove-selected" class="small danger" data-i18n="btn_remove_selected" data-i18n-title="btn_remove_selected_tooltip" title="Permanently remove every ticked shape below from the import list. Cannot be undone.">REMOVE SELECTED</button>
+            <button type="button" id="btn-toggle-shapes" class="icon-btn" data-i18n-title="toggle_collapse_tooltip" title="Collapse/expand">▾</button>
+          </div>
         </div>
-        <p class="hint">Mark each imported shape as a SHEET (stock to nest onto) or a PART (thing to nest), and set a quantity.</p>
+        <p class="hint" data-i18n="roles_hint">Mark each imported shape as a SHEET (stock to nest onto) or a PART (thing to nest), and set a quantity.</p>
         <div id="shapes-collapsible">
           <table id="shapes-table">
             <thead>
               <tr>
-                <th>#</th>
-                <th>LAYER</th>
-                <th>POINTS</th>
-                <th>BBOX (W×H)</th>
-                <th>PREVIEW</th>
-                <th>ROLE</th>
-                <th>QTY</th>
-                <th title="Whether this part alone would take up enough of a sheet (per the DOMINANT AREA setting below) to close that sheet immediately after being placed - it still gets placed, just without any neighbors.">DOMINANT?</th>
+                <th><input type="checkbox" id="select-all-shapes" data-i18n-title="select_all_tooltip" title="Select all" /></th>
+                <th data-i18n="th_index">#</th>
+                <th data-i18n="th_name">NAME</th>
+                <th data-i18n="th_bbox">BBOX (W×H)</th>
+                <th data-i18n="th_preview">PREVIEW</th>
+                <th data-i18n="th_role">ROLE</th>
+                <th data-i18n="th_qty">QTY</th>
+                <th data-i18n="th_dominant" data-i18n-title="th_dominant_tooltip" title="Whether this part alone would take up enough of a sheet (per the DOMINANT AREA setting below) to close that sheet immediately after being placed - it still gets placed, just without any neighbors.">DOMINANT?</th>
               </tr>
             </thead>
             <tbody id="shapes-body"></tbody>
@@ -62,104 +103,142 @@
       </section>
 
       <section class="panel" id="panel-result" hidden>
-        <h2>04 / RESULT</h2>
+        <h2><span class="step-num">04</span> / <span data-i18n="heading_result_text">RESULT</span></h2>
         <div class="row" id="history-row" hidden>
-          <label for="history-select" title="Every attempt that beat the previous best while the GA ran, in the order it found them - not just the one it ended up keeping. Pick one to see that arrangement instead of the final winner.">VIEW ATTEMPT</label>
+          <label for="history-select" data-i18n="view_attempt_label" data-i18n-title="view_attempt_tooltip" title="Every attempt that beat the previous best while the GA ran, in the order it found them - not just the one it ended up keeping. Pick one to see that arrangement instead of the final winner.">VIEW ATTEMPT</label>
           <select id="history-select"></select>
         </div>
         <dl class="stats" id="result-stats"></dl>
         <div id="unplaced-section" hidden>
-          <p class="hint error-hint">These parts could not be placed on any sheet (outlined in red below and in the list they came from):</p>
+          <p class="hint error-hint" data-i18n="unplaced_hint">These parts could not be placed on any sheet (outlined in red below and in the list they came from):</p>
           <div id="unplaced-list"></div>
         </div>
         <div id="sheets"></div>
 
-        <!-- Live preview - commented out (2026), never worked reliably; not deleted so it's easy to pick back up later.
-        <section id="live-preview-section" hidden>
-          <p class="hint">LIVE PREVIEW — every generation that found a better arrangement, replayed part by part in order found (not every attempt - the result above still reflects the final winner once the run finishes):</p>
-          <p class="status" id="live-caption"></p>
-          <div id="live-sheets"></div>
-        </section>
-        -->
-
-        <p class="hint" style="margin-top: 16px;">Export the attempt currently shown above to a DXF file:</p>
+        <p class="hint" style="margin-top: 16px;" data-i18n="export_hint">Export the attempt currently shown above to a DXF file:</p>
         <div class="row">
-          <label for="export-spacing" title="A DXF file has no separate concept of 'sheets' - every sheet used gets written into the same drawing, laid out left to right. This is the gap kept between each one so they don't overlap.">SHEET SPACING (mm)</label>
-          <input id="export-spacing" type="number" value="20" min="0" step="1" title="A DXF file has no separate concept of 'sheets' - every sheet used gets written into the same drawing, laid out left to right. This is the gap kept between each one so they don't overlap." />
-          <label for="export-outline" title="Also write each sheet's own rectangle as a shape in the export, not just the parts placed on it.">
+          <label for="export-spacing" data-i18n="export_spacing_label" data-i18n-title="export_spacing_tooltip" title="A DXF file has no separate concept of 'sheets' - every sheet used gets written into the same drawing, laid out left to right. This is the gap kept between each one so they don't overlap.">SHEET SPACING (mm)</label>
+          <input id="export-spacing" type="number" value="20" min="0" step="1" data-i18n-title="export_spacing_tooltip" title="A DXF file has no separate concept of 'sheets' - every sheet used gets written into the same drawing, laid out left to right. This is the gap kept between each one so they don't overlap." />
+          <label for="export-outline" data-i18n-title="export_outline_tooltip" title="Also write each sheet's own rectangle as a shape in the export, not just the parts placed on it.">
             <input id="export-outline" type="checkbox" checked />
-            INCLUDE SHEET OUTLINE
+            <span data-i18n="export_outline_label">INCLUDE SHEET OUTLINE</span>
           </label>
-          <button id="btn-export">EXPORT DXF</button>
+          <button id="btn-export" class="primary" data-i18n="btn_export">EXPORT DXF</button>
         </div>
         <p class="status" id="export-status"></p>
       </section>
-
     </main>
 
-    <div class="floating-stack">
-      <section class="panel" id="panel-console">
-        <h2>05 / CONSOLE</h2>
-        <pre id="console-log"></pre>
-      </section>
-
+    <div id="bottom-bar">
       <section class="panel" id="panel-config" hidden>
-        <h2>03 / CONFIGURE</h2>
-        <div class="row">
-          <label for="cfg-placement-type" title="How the program judges where to slide a piece into place. GRAVITY: let pieces settle toward a corner, like Tetris. BOX: try to keep everything placed so far inside as small a rectangle as possible. CONVEX HULL: judge by the simplified outer shape wrapped around everything placed so far. TIGHT FIT: judge by how snugly a piece touches already-placed pieces or the sheet edge, not the overall shape of everything placed - better for interlocking/irregular pieces. GRAVITY + TIGHT FIT: use GRAVITY first, then break ties between equally-good spots by which one touches more - usually the best of both, at a smaller speed cost than TIGHT FIT alone. GRAVITY + CORRECTIVE: the sheet's first two pieces settle by GRAVITY, then every piece after switches outright to the exact TIGHT FIT contact measure - and a repeated piece shape reuses whichever rotation already worked for it, instead of re-searching every angle from scratch.">PLACEMENT</label>
-          <select id="cfg-placement-type" title="How the program judges where to slide a piece into place. GRAVITY: let pieces settle toward a corner, like Tetris. BOX: try to keep everything placed so far inside as small a rectangle as possible. CONVEX HULL: judge by the simplified outer shape wrapped around everything placed so far. TIGHT FIT: judge by how snugly a piece touches already-placed pieces or the sheet edge, not the overall shape of everything placed - better for interlocking/irregular pieces. GRAVITY + TIGHT FIT: use GRAVITY first, then break ties between equally-good spots by which one touches more - usually the best of both, at a smaller speed cost than TIGHT FIT alone. GRAVITY + CORRECTIVE: the sheet's first two pieces settle by GRAVITY, then every piece after switches outright to the exact TIGHT FIT contact measure - and a repeated piece shape reuses whichever rotation already worked for it, instead of re-searching every angle from scratch.">
-            <option value="gravity">GRAVITY</option>
-            <option value="box">BOX</option>
-            <option value="convexhull">CONVEX HULL</option>
-            <option value="tightfit">TIGHT FIT</option>
-            <option value="gravitytightfit">GRAVITY + TIGHT FIT</option>
-            <option value="gravitycorrective">GRAVITY + CORRECTIVE</option>
-          </select>
-          <!-- Live preview - commented out (2026), never worked reliably; not deleted so it's easy to pick back up later. See frontend/app.js's matching commented-out state/listeners and src-tauri/src/dto.rs's NestConfigDto::live_visualization.
-          <label for="cfg-live-viz" title="Watch the nest improve generation by generation as the real search runs at full speed - every time it finds a better arrangement, that whole arrangement appears below, part by part. Only genuine improvements are shown, not the many discarded random attempts in between.">
-            <input id="cfg-live-viz" type="checkbox" title="Watch the nest improve generation by generation as the real search runs at full speed - every time it finds a better arrangement, that whole arrangement appears below, part by part. Only genuine improvements are shown, not the many discarded random attempts in between." />
-            LIVE PREVIEW
-          </label>
-          <label for="cfg-live-viz-speed" title="Pause between each part appearing in the LIVE PREVIEW view below. Purely a playback speed for what you watch - the actual placement computation always runs at full speed regardless of this setting.">STEP DELAY (ms)</label>
-          <input id="cfg-live-viz-speed" type="range" value="150" min="0" max="1000" step="10" title="Pause between each part appearing in the LIVE PREVIEW view below. Purely a playback speed for what you watch - the actual placement computation always runs at full speed regardless of this setting." />
-          <output id="cfg-live-viz-speed-value" for="cfg-live-viz-speed">150ms</output>
-          -->
-          <label for="cfg-rotations" title="How many different angles the program is allowed to try for each piece before giving up on fitting it. More angles = better chance of a good fit, but slower.">ROTATIONS</label>
-          <input id="cfg-rotations" type="number" value="4" min="1" step="1" title="How many different angles the program is allowed to try for each piece before giving up on fitting it. More angles = better chance of a good fit, but slower." />
-          <label for="cfg-population" title="How many different full arrangements ('attempts') the program tries and compares side by side in every round. More attempts = better results, but each round takes longer.">POPULATION</label>
-          <input id="cfg-population" type="number" value="10" min="2" step="1" title="How many different full arrangements ('attempts') the program tries and compares side by side in every round. More attempts = better results, but each round takes longer." />
+        <div id="settings-collapsible" hidden>
+          <div class="row">
+            <label for="cfg-margin" data-i18n="margin_label" data-i18n-title="margin_tooltip" title="Minimum empty gap kept between a piece and the true edge of the sheet - e.g. so a cutting tool has room to run without going off the material. Set to 0 for jobs where the tool can safely overhang the edge (like most laser cutting).">MARGIN (mm)</label>
+            <input id="cfg-margin" type="number" value="0" min="0" step="0.1" data-i18n-title="margin_tooltip" title="Minimum empty gap kept between a piece and the true edge of the sheet - e.g. so a cutting tool has room to run without going off the material. Set to 0 for jobs where the tool can safely overhang the edge (like most laser cutting)." />
+            <label for="cfg-spacing" data-i18n="spacing_label" data-i18n-title="spacing_tooltip" title="Minimum gap kept between two pieces placed next to each other, so a cutting tool fits between them and they don't touch. Set to 0 if pieces can be placed edge-to-edge with no gap at all.">SPACING (mm)</label>
+            <input id="cfg-spacing" type="number" value="0" min="0" step="0.1" data-i18n-title="spacing_tooltip" title="Minimum gap kept between two pieces placed next to each other, so a cutting tool fits between them and they don't touch. Set to 0 if pieces can be placed edge-to-edge with no gap at all." />
+            <label for="cfg-runs" data-i18n="runs_label" data-i18n-title="runs_tooltip" title="How many increasingly thorough attempts to try automatically. The first attempt is cheap and quick; each one after tries one more rotation angle plus a bigger search budget than the last, and whichever attempt actually nests best is what you get - you don't need to know anything about rotations/population/generations for this to work well. More runs = better results, but takes longer. Advanced Settings below let you change where the escalation starts, if you want to.">RUNS</label>
+            <input id="cfg-runs" type="number" value="6" min="1" step="1" data-i18n-title="runs_tooltip" title="How many increasingly thorough attempts to try automatically. The first attempt is cheap and quick; each one after tries one more rotation angle plus a bigger search budget than the last, and whichever attempt actually nests best is what you get - you don't need to know anything about rotations/population/generations for this to work well. More runs = better results, but takes longer. Advanced Settings below let you change where the escalation starts, if you want to." />
+          </div>
+          <div class="row">
+            <label for="cfg-cleanup-threshold" data-i18n="cleanup_label" data-i18n-title="cleanup_tooltip" title="After a run finishes, any sheet whose own utilisation ends up below this gets re-packed in place - same settings, that sheet's parts only, never pulling parts from other sheets. Leave blank to turn this off. You can also REPACK a single sheet manually from the RESULT view regardless of this setting.">CLEANUP THRESHOLD (%, blank = off)</label>
+            <input id="cfg-cleanup-threshold" type="number" min="0" max="100" step="1" placeholder="e.g. 60" data-i18n-placeholder="cleanup_placeholder" data-i18n-title="cleanup_tooltip" title="After a run finishes, any sheet whose own utilisation ends up below this gets re-packed in place - same settings, that sheet's parts only, never pulling parts from other sheets. Leave blank to turn this off. You can also REPACK a single sheet manually from the RESULT view regardless of this setting." />
+          </div>
+          <p class="hint" data-i18n="cleanup_hint">Sheets under this utilisation get auto-repacked in place after a run (same parts, tighter arrangement) - blank turns it off. You can also REPACK any single sheet manually from the RESULT view regardless.</p>
+          <div class="row panel-heading-row">
+            <button type="button" id="btn-toggle-advanced" class="small" data-i18n="btn_advanced_collapsed">ADVANCED SETTINGS ▾</button>
+          </div>
+          <div id="advanced-collapsible" hidden>
+            <div class="row">
+              <label for="cfg-placement-type" data-i18n="placement_label" data-i18n-title="placement_tooltip" title="How the program judges where to slide a piece into place. TIGHT FIT (recommended): judges purely by how snugly a piece touches already-placed pieces or the sheet edge - the one that benchmarked best against a real interlocking-tile stress test, and never worse than the alternatives on a typical mixed-shape job either. The remaining options are kept for comparison/fallback. GRAVITY + CORRECTIVE: the sheet's first two pieces settle by GRAVITY, then every piece after switches to TIGHT FIT's contact measure. GRAVITY: let pieces settle toward a corner, like Tetris. BOX: try to keep everything placed so far inside as small a rectangle as possible. CONVEX HULL: judge by the simplified outer shape wrapped around everything placed so far. GRAVITY + TIGHT FIT: use GRAVITY first, then break ties between equally-good spots by which one touches more.">PLACEMENT</label>
+              <select id="cfg-placement-type" data-i18n-title="placement_tooltip" title="How the program judges where to slide a piece into place. TIGHT FIT (recommended): judges purely by how snugly a piece touches already-placed pieces or the sheet edge - the one that benchmarked best against a real interlocking-tile stress test, and never worse than the alternatives on a typical mixed-shape job either. The remaining options are kept for comparison/fallback. GRAVITY + CORRECTIVE: the sheet's first two pieces settle by GRAVITY, then every piece after switches to TIGHT FIT's contact measure. GRAVITY: let pieces settle toward a corner, like Tetris. BOX: try to keep everything placed so far inside as small a rectangle as possible. CONVEX HULL: judge by the simplified outer shape wrapped around everything placed so far. GRAVITY + TIGHT FIT: use GRAVITY first, then break ties between equally-good spots by which one touches more.">
+                <option value="tightfit" data-i18n="placement_opt_tightfit">TIGHT FIT (RECOMMENDED)</option>
+                <option value="gravitycorrective" data-i18n="placement_opt_gravitycorrective">GRAVITY + CORRECTIVE</option>
+                <option value="gravitytightfit" data-i18n="placement_opt_gravitytightfit">GRAVITY + TIGHT FIT</option>
+                <option value="gravity" data-i18n="placement_opt_gravity">GRAVITY</option>
+                <option value="box" data-i18n="placement_opt_box">BOX</option>
+                <option value="convexhull" data-i18n="placement_opt_convexhull">CONVEX HULL</option>
+              </select>
+              <label for="cfg-rotations" data-i18n="rotations_label" data-i18n-title="rotations_tooltip" title="The starting number of angles the first RUN tries for each piece - each RUN after the first tries one more angle than the last (see RUNS above), so this only matters as a starting point, not a fixed limit.">STARTING ROTATIONS</label>
+              <input id="cfg-rotations" type="number" value="2" min="1" step="1" data-i18n-title="rotations_tooltip" title="The starting number of angles the first RUN tries for each piece - each RUN after the first tries one more angle than the last (see RUNS above), so this only matters as a starting point, not a fixed limit." />
+            </div>
+            <p class="hint" data-i18n="placement_hint">TIGHT FIT (recommended) scores by how snugly a piece touches its neighbors - best for irregular/interlocking shapes. GRAVITY settles pieces like Tetris; BOX/CONVEX HULL score by the overall shape placed so far and plateau earlier on irregular parts. GRAVITY + CORRECTIVE/TIGHT FIT are hybrids. Hover PLACEMENT for the full comparison.</p>
+            <div class="row">
+              <label for="cfg-population" data-i18n="population_label" data-i18n-title="population_tooltip" title="The starting number of full arrangements ('attempts') compared side by side in the first RUN's rounds - later RUNs use a proportionally bigger population to search their wider rotation grid.">STARTING POPULATION</label>
+              <input id="cfg-population" type="number" value="6" min="2" step="1" data-i18n-title="population_tooltip" title="The starting number of full arrangements ('attempts') compared side by side in the first RUN's rounds - later RUNs use a proportionally bigger population to search their wider rotation grid." />
+              <label for="cfg-mutation" data-i18n="mutation_label" data-i18n-title="mutation_tooltip" title="The chance that a small random change (swap two pieces' order, or reroll one piece's rotation) gets made when mixing two good attempts together to make a new one. Keeps the search from getting stuck repeating itself. Stays the same across every RUN.">MUTATION %</label>
+              <input id="cfg-mutation" type="number" value="10" min="0" max="100" step="1" data-i18n-title="mutation_tooltip" title="The chance that a small random change (swap two pieces' order, or reroll one piece's rotation) gets made when mixing two good attempts together to make a new one. Keeps the search from getting stuck repeating itself. Stays the same across every RUN." />
+            </div>
+            <p class="hint" data-i18n="mutation_hint">MUTATION %: chance of a random tweak (reordering parts or rerolling a rotation) when breeding two good attempts together - keeps the search from stalling on one arrangement.</p>
+            <div class="row">
+              <label for="cfg-generations" data-i18n="generations_label" data-i18n-title="generations_tooltip" title="The starting number of rounds ('try a bunch of attempts, keep the best, breed a new batch, repeat') the first RUN does - later RUNs use proportionally more rounds to search their wider rotation grid.">STARTING GENERATIONS</label>
+              <input id="cfg-generations" type="number" value="5" min="1" step="1" data-i18n-title="generations_tooltip" title="The starting number of rounds ('try a bunch of attempts, keep the best, breed a new batch, repeat') the first RUN does - later RUNs use proportionally more rounds to search their wider rotation grid." />
+              <label for="cfg-dominant" data-i18n="dominant_label" data-i18n-title="dominant_tooltip" title="If one piece alone takes up more than this fraction of a sheet (0.9 = 90%), the program stops trying to fit more onto that sheet and starts a fresh one, since there's basically no room left anyway. It still gets placed - it just gets a sheet to itself instead of sharing.">DOMINANT AREA</label>
+              <input id="cfg-dominant" type="range" value="0.9" min="0.01" max="1" step="0.01" data-i18n-title="dominant_tooltip" title="If one piece alone takes up more than this fraction of a sheet (0.9 = 90%), the program stops trying to fit more onto that sheet and starts a fresh one, since there's basically no room left anyway. It still gets placed - it just gets a sheet to itself instead of sharing." />
+              <output id="cfg-dominant-value" for="cfg-dominant">90%</output>
+            </div>
+            <p class="hint" data-i18n="dominant_hint">DOMINANT AREA: a part alone taking up more than this share of a sheet gets that sheet to itself instead of sharing (still placed) - flagged live as CLOSES SHEET in the shapes table above.</p>
+            <div class="row">
+              <label for="cfg-max-threads" data-i18n="max_threads_label" data-i18n-title="max_threads_tooltip" title="How many CPU cores the program is allowed to use at once while it searches for a good packing. 0 = use every core your computer has (fastest). Set a lower number to leave some CPU free for other programs while it runs.">MAX CPU THREADS</label>
+              <input id="cfg-max-threads" type="number" value="0" min="0" step="1" data-i18n-title="max_threads_tooltip" title="How many CPU cores the program is allowed to use at once while it searches for a good packing. 0 = use every core your computer has (fastest). Set a lower number to leave some CPU free for other programs while it runs." />
+              <label for="cfg-seed" data-i18n="seed_label" data-i18n-title="seed_tooltip" title="Starting point for the search's randomness (initial attempt order/rotations, every mutation/breeding choice across every round). The same seed with the same everything else always reproduces the exact same result - change it to sample a different random starting point, keep it fixed to compare other settings fairly.">SEED</label>
+              <input id="cfg-seed" type="number" value="0" min="0" step="1" data-i18n-title="seed_tooltip" title="Starting point for the search's randomness (initial attempt order/rotations, every mutation/breeding choice across every round). The same seed with the same everything else always reproduces the exact same result - change it to sample a different random starting point, keep it fixed to compare other settings fairly." />
+            </div>
+          </div>
         </div>
-        <div class="row">
-          <label for="cfg-mutation" title="The chance that a small random change (swap two pieces' order, or reroll one piece's rotation) gets made when mixing two good attempts together to make a new one. Keeps the search from getting stuck repeating itself.">MUTATION %</label>
-          <input id="cfg-mutation" type="number" value="10" min="0" max="100" step="1" title="The chance that a small random change (swap two pieces' order, or reroll one piece's rotation) gets made when mixing two good attempts together to make a new one. Keeps the search from getting stuck repeating itself." />
-          <label for="cfg-generations" title="How many rounds of 'try a bunch of attempts, keep the best, breed a new batch, repeat' to run. More rounds = better packing, but takes longer.">GENERATIONS</label>
-          <input id="cfg-generations" type="number" value="5" min="1" step="1" title="How many rounds of 'try a bunch of attempts, keep the best, breed a new batch, repeat' to run. More rounds = better packing, but takes longer." />
-          <label for="cfg-dominant" title="If one piece alone takes up more than this fraction of a sheet (0.9 = 90%), the program stops trying to fit more onto that sheet and starts a fresh one, since there's basically no room left anyway. It still gets placed - it just gets a sheet to itself instead of sharing.">DOMINANT AREA</label>
-          <input id="cfg-dominant" type="range" value="0.9" min="0.01" max="1" step="0.01" title="If one piece alone takes up more than this fraction of a sheet (0.9 = 90%), the program stops trying to fit more onto that sheet and starts a fresh one, since there's basically no room left anyway. It still gets placed - it just gets a sheet to itself instead of sharing." />
-          <output id="cfg-dominant-value" for="cfg-dominant">90%</output>
-        </div>
-        <div class="row">
-          <label for="cfg-margin" title="Minimum empty gap kept between a piece and the true edge of the sheet - e.g. so a cutting tool has room to run without going off the material. Set to 0 for jobs where the tool can safely overhang the edge (like most laser cutting).">MARGIN (mm)</label>
-          <input id="cfg-margin" type="number" value="0" min="0" step="0.1" title="Minimum empty gap kept between a piece and the true edge of the sheet - e.g. so a cutting tool has room to run without going off the material. Set to 0 for jobs where the tool can safely overhang the edge (like most laser cutting)." />
-          <label for="cfg-spacing" title="Minimum gap kept between two pieces placed next to each other, so a cutting tool fits between them and they don't touch. Set to 0 if pieces can be placed edge-to-edge with no gap at all.">SPACING (mm)</label>
-          <input id="cfg-spacing" type="number" value="0" min="0" step="0.1" title="Minimum gap kept between two pieces placed next to each other, so a cutting tool fits between them and they don't touch. Set to 0 if pieces can be placed edge-to-edge with no gap at all." />
-        </div>
-        <div class="row">
-          <label for="cfg-max-threads" title="How many CPU cores the program is allowed to use at once while it searches for a good packing. 0 = use every core your computer has (fastest). Set a lower number to leave some CPU free for other programs while it runs.">MAX CPU THREADS</label>
-          <input id="cfg-max-threads" type="number" value="0" min="0" step="1" title="How many CPU cores the program is allowed to use at once while it searches for a good packing. 0 = use every core your computer has (fastest). Set a lower number to leave some CPU free for other programs while it runs." />
-          <label for="cfg-seed" title="Starting point for the search's randomness (initial attempt order/rotations, every mutation/breeding choice across every round). The same seed with the same everything else always reproduces the exact same result - change it to sample a different random starting point, keep it fixed to compare other settings fairly.">SEED</label>
-          <input id="cfg-seed" type="number" value="0" min="0" step="1" title="Starting point for the search's randomness (initial attempt order/rotations, every mutation/breeding choice across every round). The same seed with the same everything else always reproduces the exact same result - change it to sample a different random starting point, keep it fixed to compare other settings fairly." />
-        </div>
-        <div class="row">
-          <button id="btn-run" class="primary">RUN NEST</button>
-          <button id="btn-stop" hidden>STOP</button>
-          <span class="spinner" id="run-spinner" hidden></span>
-          <span class="status" id="run-status"></span>
-        </div>
-        <div class="progress" id="run-progress" hidden>
-          <div class="progress-fill" id="run-progress-fill"></div>
-        </div>
+
+        <button type="button" id="btn-toggle-settings" class="settings-bar">
+          <span id="settings-bar-label"><span class="step-num">03</span> / CONFIGURE — SETTINGS ▾</span>
+          <span class="status" id="bottom-bar-summary" data-i18n-title="bottom_bar_summary_tooltip" title="Sheets used / parts unplaced / material utilisation for the current best result - stays visible even while this bar is collapsed."></span>
+        </button>
       </section>
+    </div>
+
+    <div id="run-float">
+      <button id="btn-run" class="primary" data-i18n="btn_run">RUN NEST</button>
+      <button id="btn-stop" class="danger" hidden data-i18n="btn_stop">STOP</button>
+      <span class="spinner" id="run-spinner" hidden></span>
+      <span class="status" id="run-status"></span>
+      <div class="progress" id="run-progress" hidden>
+        <div class="progress-fill" id="run-progress-fill"></div>
+      </div>
+    </div>
+
+    <div class="floating-window" id="console-window">
+      <div class="floating-header" id="console-header">
+        <span data-i18n="console_title">CONSOLE</span>
+        <div class="floating-controls">
+          <button type="button" id="btn-console-minimize" class="icon-btn" data-i18n-title="toggle_collapse_tooltip" title="Expand/collapse">_</button>
+        </div>
+      </div>
+      <div id="console-log"></div>
+    </div>
+
+    <div class="modal-overlay" id="help-overlay" hidden>
+      <div class="modal" id="help-modal" role="dialog" aria-modal="true">
+        <div class="modal-header">
+          <h2 data-i18n="help_title">HOW TO USE RUSTYNESTING</h2>
+          <select id="help-lang-switch" data-i18n-title="lang_switch_title" title="Language">
+            <option value="en">English</option>
+            <option value="vi">Tiếng Việt</option>
+          </select>
+        </div>
+        <p data-i18n="help_intro">RustyNesting nests parts onto stock sheets before cutting.</p>
+        <ul class="help-steps">
+          <li data-i18n="help_step_import">01 IMPORT — load DXF file(s), or add a rectangle by hand.</li>
+          <li data-i18n="help_step_roles">02 ASSIGN ROLES — mark each shape SHEET (stock) or PART (to cut), set quantities.</li>
+          <li data-i18n="help_step_configure">03 CONFIGURE — adjust margin/spacing etc. at the bottom if needed (optional).</li>
+          <li data-i18n="help_step_run">RUN NEST — then review and EXPORT the result.</li>
+        </ul>
+        <p class="hint" data-i18n="help_tip">Hover any label for more detail.</p>
+        <div class="modal-footer">
+          <label class="modal-checkbox">
+            <input type="checkbox" id="help-dont-show" />
+            <span data-i18n="help_dont_show">Don't show this again</span>
+          </label>
+          <button type="button" id="btn-help-close" class="primary" data-i18n="help_close">GOT IT</button>
+        </div>
+      </div>
     </div>
 
     <script type="module" src="app.js"></script>
