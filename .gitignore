@@ -21,3 +21,5 @@ node_modules/
 
 # Claude Code project-local tooling config - not part of the shipped project
 /.claude/
+CLAUDE.md
+/docs/

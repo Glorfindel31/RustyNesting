@@ -79,9 +79,7 @@ docs/           PORT_STATUS.md - the living tracking doc
 
 `geometry` and `nesting` are plain library crates with no Tauri/UI
 dependency, so the entire engine is unit-testable and reusable outside the
-desktop shell. See [`CLAUDE.md`](CLAUDE.md) for the detailed module-by-module
-breakdown and the load-bearing quirks preserved from the original
-implementation on purpose.
+desktop shell. 
 
 ## Reference
 
@@ -89,7 +87,6 @@ implementation on purpose.
   for this rewrite: scope, phases, and the decisions already made (Rust +
   Tauri, no GPU, Clipper2 for boolean ops, rayon for concurrency)
 - [`docs/PORT_STATUS.md`](docs/PORT_STATUS.md) — phase-by-phase status
-- [`CLAUDE.md`](CLAUDE.md) — guidance for AI coding assistants working in
   this repo; also doubles as detailed architecture documentation for humans
 
 ## License
