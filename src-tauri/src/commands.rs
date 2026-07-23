@@ -275,15 +275,7 @@ pub fn repack_sheet(request: RepackSheetRequest) -> Result<RepackSheetResponse, 
     if request.placement.parts.is_empty() {
         return Err("sheet has no parts to repack".into());
     }
-    if request.config.rotations == 0 {
-        return Err("rotations must be at least 1".into());
-    }
-    if request.config.population_size < 2 {
-        return Err("population_size must be at least 2".into());
-    }
-    if request.config.generations == 0 {
-        return Err("generations must be at least 1".into());
-    }
+    validate_nest_config(&request.config)?;
     let margin = request.config.margin;
     let spacing = request.config.spacing;
 
@@ -339,17 +331,40 @@ pub fn repack_sheet(request: RepackSheetRequest) -> Result<RepackSheetResponse, 
     // the user's real config, only the scoring strategy changes.
     let repack_placement_config = PlacementConfig { placement_type: PlacementType::Gravity, ..request.config.placement_config() };
 
-    match repack::repack_sheet(
-        &sheet,
-        &current,
-        &parts_by_id,
-        &shape_ids,
-        &request.config.ga_config(),
-        &repack_placement_config,
-        request.config.generations,
-        request.config.seed,
-        &|| false,
-    ) {
+    // Same "0 means uncapped, otherwise a scoped pool for this call" pattern
+    // run_nest_with_progress uses for the main escalation loop - without
+    // this, request.config.max_threads was silently ignored here (this
+    // command never read it at all), since repack::repack_sheet's own
+    // dispatch::run dispatches its GA generations via rayon::par_iter,
+    // which runs on rayon's uncapped global pool absent an explicit scope.
+    let pool = if request.config.max_threads > 0 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(request.config.max_threads)
+                .build()
+                .map_err(|e| format!("couldn't build a {}-thread pool: {e}", request.config.max_threads))?,
+        )
+    } else {
+        None
+    };
+    let run_repack = || {
+        repack::repack_sheet(
+            &sheet,
+            &current,
+            &parts_by_id,
+            &shape_ids,
+            &request.config.ga_config(),
+            &repack_placement_config,
+            request.config.generations,
+            request.config.seed,
+            &|| false,
+        )
+    };
+
+    match match &pool {
+        Some(p) => p.install(run_repack),
+        None => run_repack(),
+    } {
         Some(mut repacked) => {
             let totals = recompute_totals(std::slice::from_ref(&repacked), &parts_by_id, std::slice::from_ref(&sheet));
             repacked.sheet_index = real_sheet_index;
@@ -392,6 +407,56 @@ struct PreparedNestInputs {
     placement_config: nesting::placement::PlacementConfig,
 }
 
+/// Checks shared by every entry point that builds a `GaConfig`/
+/// `PlacementConfig` from a `NestConfigDto` and feeds padded geometry to
+/// `geometry::clearance` - both the main escalating run
+/// (`prepare_nest_inputs`) and a single-sheet repack (`repack_sheet`).
+/// `rotations`/`population_size`/`generations` guard real panic paths
+/// (`GeneticAlgorithm::new`'s `random_angles`/first-`generation()` call);
+/// `margin`/`spacing`/`mutation_rate`/`curve_tolerance`/
+/// `dominant_part_area_threshold` don't panic but silently produce nonsense
+/// GA/placement behavior (or, for `margin`/`spacing`/`curve_tolerance`, feed
+/// an unvalidated negative value straight through the Clipper2 FFI
+/// boundary) with no feedback at all otherwise. `runs`/
+/// `cleanup_threshold_percent` are validated separately, only in
+/// `prepare_nest_inputs` - `repack_sheet` never reads either field. Upper
+/// bounds are generous, deliberately-round sanity ceilings (not tuned
+/// limits) - just enough to stop a fat-fingered config from pinning a CPU
+/// core on an effectively-unkillable job before the user notices there's a
+/// Stop button to press.
+fn validate_nest_config(config: &NestConfigDto) -> Result<(), String> {
+    if config.rotations == 0 || config.rotations > 360 {
+        return Err("rotations must be between 1 and 360".into());
+    }
+    if !(2..=1000).contains(&config.population_size) {
+        return Err("population_size must be between 2 and 1000".into());
+    }
+    if config.generations == 0 || config.generations > 10_000 {
+        return Err("generations must be between 1 and 10000".into());
+    }
+    if config.max_threads > 256 {
+        return Err("max_threads must be 256 or less (0 means uncapped)".into());
+    }
+    if config.margin < 0.0 {
+        return Err("margin must be >= 0".into());
+    }
+    if config.spacing < 0.0 {
+        return Err("spacing must be >= 0".into());
+    }
+    // Bounds match what `index.html`'s own inputs already constrain
+    // client-side (`min`/`max` on `cfg-mutation`/`import-tolerance`/`cfg-dominant`).
+    if !(0.0..=100.0).contains(&config.mutation_rate) {
+        return Err("mutation_rate must be between 0 and 100".into());
+    }
+    if config.curve_tolerance <= 0.0 {
+        return Err("curve_tolerance must be > 0".into());
+    }
+    if !(config.dominant_part_area_threshold > 0.0 && config.dominant_part_area_threshold <= 1.0) {
+        return Err("dominant_part_area_threshold must be between 0 (exclusive) and 1".into());
+    }
+    Ok(())
+}
+
 /// Validates `request` and builds the padded sheets/parts both nest-running
 /// paths place against - see `PreparedNestInputs`'s own doc comment for why
 /// this is shared rather than duplicated. A pure extraction of what used to
@@ -403,47 +468,9 @@ fn prepare_nest_inputs(request: RunNestRequest) -> Result<PreparedNestInputs, St
     if request.parts.is_empty() {
         return Err("at least one part is required".into());
     }
-    // Both feed straight into GeneticAlgorithm::new(), which panics rather
-    // than erroring on either: rotations=0 makes random_angles's
-    // rng.gen_range(0..0) panic (empty range), and population_size 0 or 1
-    // leaves the population at size 1 (GeneticAlgorithm::new() always seeds
-    // one individual before checking population_size), which panics on the
-    // first generation() call when it tries to pick a second, distinct
-    // parent. Catch both here, at the actual trust boundary, instead of
-    // three call frames deep in the engine.
-    if request.config.rotations == 0 {
-        return Err("rotations must be at least 1".into());
-    }
-    if request.config.population_size < 2 {
-        return Err("population_size must be at least 2".into());
-    }
-    if request.config.runs == 0 {
-        return Err("runs must be at least 1".into());
-    }
-    if request.config.generations == 0 {
-        return Err("generations must be at least 1".into());
-    }
-    if request.config.margin < 0.0 {
-        return Err("margin must be >= 0".into());
-    }
-    if request.config.spacing < 0.0 {
-        return Err("spacing must be >= 0".into());
-    }
-    // These three don't have a panic path behind them the way the checks
-    // above do, but they were also entirely unvalidated - a negative
-    // curve_tolerance, an out-of-[0,100]-range mutation_rate, or a
-    // dominant_part_area_threshold outside (0, 1] silently produces
-    // nonsense GA/placement behavior with no feedback at all. Bounds match
-    // what `index.html`'s own inputs already constrain client-side
-    // (`min`/`max` on `cfg-mutation`/`import-tolerance`/`cfg-dominant`).
-    if !(0.0..=100.0).contains(&request.config.mutation_rate) {
-        return Err("mutation_rate must be between 0 and 100".into());
-    }
-    if request.config.curve_tolerance <= 0.0 {
-        return Err("curve_tolerance must be > 0".into());
-    }
-    if !(request.config.dominant_part_area_threshold > 0.0 && request.config.dominant_part_area_threshold <= 1.0) {
-        return Err("dominant_part_area_threshold must be between 0 (exclusive) and 1".into());
+    validate_nest_config(&request.config)?;
+    if request.config.runs == 0 || request.config.runs > 50 {
+        return Err("runs must be between 1 and 50".into());
     }
     if let Some(t) = request.config.cleanup_threshold_percent {
         if !(0.0..=100.0).contains(&t) {
@@ -882,27 +909,45 @@ pub fn run_nest_with_progress(
         // this one sheet" job, so both should cluster toward a corner
         // instead of reusing the main run's placement_type verbatim.
         let repack_placement_config = PlacementConfig { placement_type: PlacementType::Gravity, ..placement_config.clone() };
-        for sheet_placement in &mut best.placements {
-            if should_cancel() {
-                break;
+        // Matches repack_placement_config's rotations (the *winning* run's,
+        // possibly escalated past the request's original value), not
+        // base_ga_config's pre-escalation one - GaConfig::rotations bounds
+        // which angles a gene can mutate/randomize to (ga.rs's
+        // random_angles), so reusing the narrower base value here would
+        // under-search relative to the wider grid the layout being cleaned
+        // up was actually placed with.
+        let repack_ga_config = GaConfig { rotations: repack_placement_config.rotations, ..base_ga_config.clone() };
+        // Same scoped pool as the main escalation loop above, not rayon's
+        // uncapped global one - without this, config.max_threads is
+        // silently ignored for every repack_sheet call this pass makes
+        // (each one dispatches its own GA generations via rayon::par_iter).
+        let mut run_cleanup = || {
+            for sheet_placement in &mut best.placements {
+                if should_cancel() {
+                    break;
+                }
+                let sheet_totals = recompute_totals(std::slice::from_ref(sheet_placement), &parts_by_id, &sheets);
+                if sheet_totals.utilisation >= threshold {
+                    continue;
+                }
+                if let Some(repacked) = repack::repack_sheet(
+                    &sheets[sheet_placement.sheet_index],
+                    sheet_placement,
+                    &parts_by_id,
+                    &shape_ids,
+                    &repack_ga_config,
+                    &repack_placement_config,
+                    base_generations,
+                    seed,
+                    &should_cancel,
+                ) {
+                    *sheet_placement = repacked;
+                }
             }
-            let sheet_totals = recompute_totals(std::slice::from_ref(sheet_placement), &parts_by_id, &sheets);
-            if sheet_totals.utilisation >= threshold {
-                continue;
-            }
-            if let Some(repacked) = repack::repack_sheet(
-                &sheets[sheet_placement.sheet_index],
-                sheet_placement,
-                &parts_by_id,
-                &shape_ids,
-                &base_ga_config,
-                &repack_placement_config,
-                base_generations,
-                seed,
-                &should_cancel,
-            ) {
-                *sheet_placement = repacked;
-            }
+        };
+        match &pool {
+            Some(p) => p.install(run_cleanup),
+            None => run_cleanup(),
         }
         let totals = recompute_totals(&best.placements, &parts_by_id, &sheets);
         best.area = totals.total_placed_area;
@@ -983,11 +1028,21 @@ pub async fn run_nest_command(
     // second would silently reset the flag the first run is still reading).
     // `swap` is the check-and-set in one atomic step - two calls racing here
     // can't both observe `false`.
+    //
+    // Deliberately `swap` first, `cancel.store(false)` second, not the
+    // reverse: resetting first would run unconditionally, even on the
+    // reject path below - a rejected duplicate call would then clobber the
+    // cancel flag of whichever run is *actually* in progress, silently
+    // undoing a real pending Stop request for it. The current order has its
+    // own, much narrower gap (a cancel_nest_command for this brand-new run
+    // landing in the few-instruction window between the swap and the
+    // reset, getting clobbered by it) - but that's two back-to-back atomic
+    // ops with no `await` between them, not a window an IPC round-trip can
+    // realistically land in, versus the reject-path regression being real
+    // and always reachable. Kept as-is on purpose.
     if state.running.swap(true, Ordering::AcqRel) {
         return Err("a nest is already running".to_string());
     }
-    // Reset before starting: a stale `true` left over from a previous run's
-    // cancel would otherwise stop this new run at generation 1.
     state.cancel.store(false, Ordering::Relaxed);
     // Cloned before `request` moves into `spawn_blocking` below - a
     // recovered `BestResultDto` needs sheet geometry to render against in a
@@ -1061,27 +1116,38 @@ pub async fn run_nest_command(
             parts_by_id: response.parts_by_id.clone(),
             sheets: request_sheets,
         };
+        // Fire-and-forget by design (an I/O failure here must never fail an
+        // otherwise successful nest - see this fn's own doc comment) but the
+        // failure itself was previously discarded completely, with no
+        // diagnostic trail at all: the JoinHandle is dropped unawaited, and
+        // even the closure's own Result was never inspected. Log instead of
+        // silently swallowing - still never propagates, still never blocks.
         tauri::async_runtime::spawn_blocking(move || {
-            let path = best_result_file_path(&app_for_best)?;
-            let existing: Option<BestResultDto> = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|json| serde_json::from_str(&json).ok());
-            let should_write = match &existing {
-                None => true,
-                Some(prev) => is_better_result(
-                    candidate.unplaced_count,
-                    candidate.placements.len(),
-                    candidate.utilisation,
-                    prev.unplaced_count,
-                    prev.placements.len(),
-                    prev.utilisation,
-                ),
-            };
-            if should_write {
-                let json = serde_json::to_string_pretty(&candidate).map_err(|e| e.to_string())?;
-                std::fs::write(path, json).map_err(|e| e.to_string())?;
+            let result: Result<(), String> = (|| {
+                let path = best_result_file_path(&app_for_best)?;
+                let existing: Option<BestResultDto> = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|json| serde_json::from_str(&json).ok());
+                let should_write = match &existing {
+                    None => true,
+                    Some(prev) => is_better_result(
+                        candidate.unplaced_count,
+                        candidate.placements.len(),
+                        candidate.utilisation,
+                        prev.unplaced_count,
+                        prev.placements.len(),
+                        prev.utilisation,
+                    ),
+                };
+                if should_write {
+                    let json = serde_json::to_string_pretty(&candidate).map_err(|e| e.to_string())?;
+                    std::fs::write(path, json).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                eprintln!("could not persist best result: {e}");
             }
-            Ok::<(), String>(())
         });
     }
 
@@ -1334,6 +1400,35 @@ mod tests {
             let request =
                 RunNestRequest { sheets: vec![square_dto(100.0)], parts: vec![PartDto { polygon: square_dto(10.0), quantity: 1 }], config: cfg };
             assert!(run_nest(request).is_err(), "margin={margin} spacing={spacing} should be rejected");
+        }
+    }
+
+    /// Regression test: `repack_sheet` used to only check
+    /// `rotations`/`population_size`/`generations`, silently skipping the
+    /// same margin/spacing/mutation_rate/curve_tolerance/dominant_threshold
+    /// checks `run_nest` already applied - an unvalidated negative
+    /// margin/spacing/curve_tolerance from this specific IPC entry point
+    /// could reach `geometry::clearance`/Clipper2 unchecked. Covers one bad
+    /// value per field now shared via `validate_nest_config`.
+    #[test]
+    fn repack_sheet_rejects_the_same_bad_config_values_run_nest_does() {
+        let base_request = |cfg: NestConfigDto| RepackSheetRequest {
+            sheet: square_dto(100.0),
+            placement: SheetPlacementDto { sheet_index: 0, parts: vec![PlacedPartDto { id: 0, x: 0.0, y: 0.0, rotation: 0.0 }] },
+            parts_by_id: HashMap::from([(0, square_dto(10.0))]),
+            config: cfg,
+        };
+        for bad_cfg in [
+            { let mut c = config(1); c.margin = -1.0; c },
+            { let mut c = config(1); c.spacing = -1.0; c },
+            { let mut c = config(1); c.mutation_rate = -1.0; c },
+            { let mut c = config(1); c.curve_tolerance = 0.0; c },
+            { let mut c = config(1); c.dominant_part_area_threshold = 0.0; c },
+            { let mut c = config(1); c.rotations = 0; c },
+            { let mut c = config(1); c.population_size = 1; c },
+            config(0),
+        ] {
+            assert!(repack_sheet(base_request(bad_cfg)).is_err());
         }
     }
 
