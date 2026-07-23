@@ -31,7 +31,7 @@ use crate::point::Point;
 use crate::polygon::{almost_equal, point_in_polygon, polygon_area, within_distance};
 use crate::simplify::simplify as dp_simplify;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SimplifyConfig {
     pub curve_tolerance: f64,
     /// Matches `config.simplify` - when set, skip the whole pipeline below

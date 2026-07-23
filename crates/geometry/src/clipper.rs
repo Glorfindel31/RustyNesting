@@ -113,7 +113,6 @@ pub fn offset_bevel(polygon: &[Point], delta: f64) -> Vec<Vec<Point>> {
 /// points (Clipper2's `simplify` is the equivalent of Clipper1's
 /// `CleanPolygon`) within `0.01 * curve_tolerance`. Returns `None` if
 /// nothing is left after simplification, same as the original.
-#[must_use]
 pub fn clean_polygon(polygon: &[Point], curve_tolerance: f64) -> Option<Vec<Point>> {
     let paths: ClipperPaths = vec![to_raw_path(polygon)].into();
     let empty: ClipperPaths = Vec::<Vec<(f64, f64)>>::new().into();
@@ -190,7 +189,6 @@ pub fn xor_polygons(subject: &[Vec<Point>], clip: &[Vec<Point>], fill_rule: Fill
 /// step, largest-loop selection, and the translate-back-to-`b[0]` that the
 /// original does inline. Returns `None` for degenerate input or if Clipper2
 /// produces no solution.
-#[must_use]
 pub fn outer_nfp(a: &[Point], b: &[Point]) -> Option<Vec<Point>> {
     if a.len() < 3 || b.len() < 3 {
         return None;

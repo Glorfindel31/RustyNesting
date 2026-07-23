@@ -51,6 +51,11 @@ pub fn hull(points: &[Point]) -> Option<Vec<Point>> {
     let upper_indexes = compute_upper_hull_indexes(&sorted_points);
     let lower_indexes = compute_upper_hull_indexes(&flipped_points);
 
+    // compute_upper_hull_indexes always returns >= 2 indices: `size` starts
+    // at 2 and its inner while loop stops at `size > 1`, so every iteration
+    // of the outer `for i in 2..n` loop leaves it >= 2 after the trailing
+    // `size += 1` - and `hull`'s own `n < 3` guard above guarantees at least
+    // one such iteration runs. Never panics.
     let skip_left = lower_indexes[0] == upper_indexes[0];
     let skip_right = *lower_indexes.last().unwrap() == *upper_indexes.last().unwrap();
 

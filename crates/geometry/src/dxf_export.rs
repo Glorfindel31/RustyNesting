@@ -37,7 +37,7 @@ use crate::polygon::get_polygon_bounds;
 /// mirrors `nesting::placement::PlacedPart` but carries the actual shape
 /// (with its hole/layer tree) rather than just an id, since this module
 /// has no `parts_by_id` lookup of its own to resolve one.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PlacedShape {
     pub shape: LayeredPolygon,
     pub x: f64,
@@ -46,7 +46,7 @@ pub struct PlacedShape {
 }
 
 /// One sheet actually used by the result, plus every part placed on it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SheetLayout {
     pub sheet: LayeredPolygon,
     pub parts: Vec<PlacedShape>,

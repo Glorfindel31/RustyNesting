@@ -118,7 +118,6 @@ fn offset_clearance(polygon: &[Point], delta: f64) -> Vec<Vec<Point>> {
 /// Uses `offset_bevel`, not the plain miter-join `offset` - see its doc
 /// comment for why a clearance buffer needs a spike-free join specifically.
 /// An exact rectangle skips Clipper2 entirely - see `offset_rectangle_exact`.
-#[must_use]
 pub fn prepare_sheet(sheet: &[Point], margin: f64, spacing: f64) -> Option<Vec<Point>> {
     let delta = spacing / 2.0 - margin;
     offset_clearance(sheet, delta).into_iter().next()
@@ -141,7 +140,6 @@ pub fn prepare_sheet(sheet: &[Point], margin: f64, spacing: f64) -> Option<Vec<P
 /// comment for why bevel, not round (which has the same guarantee but at a
 /// real point-count cost this module used to pay unnecessarily). An exact
 /// rectangular part skips Clipper2 entirely - see `offset_rectangle_exact`.
-#[must_use]
 pub fn prepare_part(part_outer: &[Point], spacing: f64) -> Option<Vec<Point>> {
     offset_clearance(part_outer, spacing / 2.0).into_iter().next()
 }

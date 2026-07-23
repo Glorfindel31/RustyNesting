@@ -171,7 +171,6 @@ pub struct Bounds {
 }
 
 /// Port of `getPolygonBounds`.
-#[must_use]
 pub fn get_polygon_bounds(polygon: &[Point]) -> Option<Bounds> {
     if polygon.len() < 3 {
         return None;
@@ -206,7 +205,6 @@ pub fn get_polygon_bounds(polygon: &[Point]) -> Option<Bounds> {
 /// Port of `pointInPolygon`. `offset` is added to every polygon vertex before
 /// testing (mirrors JS's `polygon.offsetx`/`offsety`). Returns `None` if the
 /// point lies exactly on a vertex or edge (JS returns `null` there too).
-#[must_use]
 pub fn point_in_polygon(
     point: Point,
     polygon: &[Point],

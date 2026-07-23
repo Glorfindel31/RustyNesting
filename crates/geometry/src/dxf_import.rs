@@ -45,7 +45,7 @@ use crate::polygon::{get_polygon_bounds, point_in_polygon, polygon_area, Bounds}
 /// formatting beyond that (columns, background fill, text style) isn't
 /// preserved - a real simplification, not a bug, matching this module's
 /// existing "reduce to what nesting needs" approach for circles.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TextAnnotation {
     pub position: Point,
     /// Degrees. Note this is already normalized to DXF `TEXT`'s convention
@@ -60,7 +60,7 @@ pub struct TextAnnotation {
 /// A closed profile extracted from one or more DXF entities, tagged with its
 /// source layer and (for holes) nested children. Mirrors the `.children` /
 /// `.isCircle` shape `svgparser.js` produced for SVG polygons.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LayeredPolygon {
     pub points: Vec<Point>,
     pub layer: String,

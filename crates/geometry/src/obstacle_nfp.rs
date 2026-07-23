@@ -17,7 +17,7 @@ use crate::clipper::outer_nfp;
 use crate::point::Point;
 use crate::polygon::get_polygon_bounds;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ObstacleNfp {
     pub outer: Vec<Point>,
     pub children: Vec<Vec<Point>>,
