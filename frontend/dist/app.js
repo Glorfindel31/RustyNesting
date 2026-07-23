@@ -45,6 +45,17 @@ let currentGenerations = 0;
 
 const el = (id) => document.getElementById(id);
 
+// DXF layer names and import filenames are attacker-controlled text (a
+// crafted DXF's layer name, or a crafted filename, can contain arbitrary
+// HTML) that several places below interpolate into innerHTML for display.
+// Tauri's CSP is null and custom commands need no capability grant here
+// (see capabilities/default.json's own doc comment), so unescaped markup
+// here isn't just a cosmetic XSS - it's a path to calling any
+// import_dxf_command/export_dxf_command/etc. arbitrary command straight
+// from a malicious .dxf file. Every raw layer/filename string interpolated
+// into an innerHTML template must go through this first.
+const escapeHtml = (str) => String(str).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
 function setStatus(id, message, isError) {
   // Errors next to RUN NEST specifically go to the console instead of the
   // inline status text - that strip is small and easy to miss/overwrite
@@ -92,10 +103,18 @@ function logLine(message, kind) {
 // already in flight (buildRequest() already snapshotted its own copy, but
 // letting the user edit fields that look "live" while ignored was
 // confusing on its own).
+// Locks #panel-result too, not just import/shapes/config - Export and the
+// per-sheet REPACK buttons both read `lastNestRequest`/`currentSnapshot`/
+// `lastPartsById`, which get reassigned to the *new* run's request the
+// moment handleRunNest starts (before the new result actually lands) while
+// the *old* result is still what's on screen. Without this, clicking
+// Export/Repack mid-run mixes the new run's sheets with the old run's
+// placements/parts_by_id - silently wrong if sheets changed between runs.
+const CONTROLS_LOCKED_SELECTOR =
+  "#panel-import input, #panel-import select, #panel-import button, #panel-shapes input, #panel-shapes select, #panel-shapes button, #panel-config input, #panel-config select, #panel-config button, #panel-result input, #panel-result select, #panel-result button";
+
 function setControlsLocked(locked) {
-  const selector =
-    "#panel-import input, #panel-import select, #panel-import button, #panel-shapes input, #panel-shapes select, #panel-shapes button, #panel-config input, #panel-config select, #panel-config button";
-  document.querySelectorAll(selector).forEach((node) => {
+  document.querySelectorAll(CONTROLS_LOCKED_SELECTOR).forEach((node) => {
     node.disabled = locked;
   });
 }
@@ -254,7 +273,7 @@ function renderShapesTable() {
     row.innerHTML = `
       <td><input type="checkbox" data-select="${shape._uiId}" /></td>
       <td>${i + 1}</td>
-      <td>${shape._file}-${i + 1}</td>
+      <td>${escapeHtml(shape._file)}-${i + 1}</td>
       <td>${w.toFixed(1)} × ${h.toFixed(1)}</td>
       <td>${shapeThumbnailSvg(shape)}</td>
       <td>
@@ -269,7 +288,25 @@ function renderShapesTable() {
     `;
     body.appendChild(row);
   }
+  renumberShapesTable();
   updateDominantIndicators();
+}
+
+// The #/NAME columns show the shape's position in `importedShapes`, baked
+// in as text at row-creation time - fine for pure append, but stale after
+// `handleRemoveSelected` deletes from the middle: surviving rows keep their
+// original numbers, so the next appended row's freshly-computed position
+// can collide with an existing row's now-outdated one. Called after both
+// appending and removing so the displayed numbers always match current
+// array order, not creation-time order.
+function renumberShapesTable() {
+  const body = el("shapes-body");
+  importedShapes.forEach((shape, i) => {
+    const row = body.querySelector(`tr[data-row="${shape._uiId}"]`);
+    if (!row) return;
+    row.children[1].textContent = String(i + 1);
+    row.children[2].textContent = `${shape._file}-${i + 1}`;
+  });
 }
 
 // Shoelace formula - matches geometry::polygon::polygon_area exactly (only
@@ -510,7 +547,7 @@ function renderSnapshot(snapshot, request) {
     const item = document.createElement("div");
     item.className = "unplaced-item";
     item.title = reason.detail;
-    item.innerHTML = `${shapeThumbnailSvg(shape, UNPLACED_COLOR)}<span>#${id} ${shape.layer}</span><span class="unplaced-reason">${reason.label}</span>`;
+    item.innerHTML = `${shapeThumbnailSvg(shape, UNPLACED_COLOR)}<span>#${id} ${escapeHtml(shape.layer)}</span><span class="unplaced-reason">${reason.label}</span>`;
     unplacedList.appendChild(item);
   }
 
@@ -817,6 +854,7 @@ async function handleRemoveSelected() {
   importedShapes = importedShapes.filter((s) => !ids.includes(s._uiId));
   ids.forEach((uiId) => el("shapes-body").querySelector(`tr[data-row="${uiId}"]`)?.remove());
   el("select-all-shapes").checked = false;
+  renumberShapesTable();
   updateDominantIndicators();
   logLine(`removed ${ids.length} shape(s) (${importedShapes.length} remaining)`);
 }

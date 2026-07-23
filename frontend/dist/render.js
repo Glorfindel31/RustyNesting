@@ -4,12 +4,23 @@
 // inlined in app.js so the rendering math stays independently testable/
 // reusable if another view ever needs the same shape rendering.
 
+// Plain reduce, not Math.min(...xs)/Math.max(...xs) - spreading a points
+// array into a function call blows the engine's argument-count limit for
+// a real CAD file's dense arc/circle tessellation (tens of thousands of
+// points at a fine import tolerance), which every shape thumbnail, table
+// row, and sheet render calls this on with no try/catch anywhere upstream.
 export function boundsOf(points) {
-  const xs = points.map((p) => p.x);
-  const ys = points.map((p) => p.y);
-  const minx = Math.min(...xs);
-  const miny = Math.min(...ys);
-  return { minx, miny, w: Math.max(...xs) - minx, h: Math.max(...ys) - miny };
+  let minx = Infinity;
+  let miny = Infinity;
+  let maxx = -Infinity;
+  let maxy = -Infinity;
+  for (const p of points) {
+    if (p.x < minx) minx = p.x;
+    if (p.x > maxx) maxx = p.x;
+    if (p.y < miny) miny = p.y;
+    if (p.y > maxy) maxy = p.y;
+  }
+  return { minx, miny, w: maxx - minx, h: maxy - miny };
 }
 
 // DXF/CAD coordinates are y-up; SVG coordinates are y-down. Rendering raw
