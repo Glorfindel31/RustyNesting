@@ -4,12 +4,13 @@
   "version": "0.1.0",
   "identifier": "net.deepnest.rust",
   "build": {
-    "frontendDist": "../frontend"
+    "frontendDist": "../frontend/dist"
   },
   "app": {
     "withGlobalTauri": true,
     "windows": [
       {
+        "label": "main",
         "title": "RustyNesting",
         "width": 1200,
         "height": 800,

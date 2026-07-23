@@ -221,7 +221,7 @@ pub fn refine_consolidation(
                         continue;
                     }
 
-                    let Some(result) = try_place_part_on_sheet(part_geom, source_id_of(candidate.id), candidate.rotation, &sheet_nfp, target_sheet, &target_obstacles, config, cache)
+                    let Some(result) = try_place_part_on_sheet(part_geom, source_id_of(candidate.id), candidate.rotation, &sheet_nfp, target_sheet, &target_obstacles, config, cache, &|_| {})
                         .placed()
                     else {
                         continue;
@@ -339,7 +339,7 @@ mod tests {
             NestPart { id: 1, source_id: 1, polygon: square(20.0), rotation: 0.0 },
         ];
         let cache = NfpCache::new();
-        let result = place_parts(&sheets, parts, &config(), &cache, &|| false, &|_, _| {}).unwrap();
+        let result = place_parts(&sheets, parts, &config(), &cache, &|| false, &|_, _| {}, &|_, _, _| {}).unwrap();
         assert_eq!(result.placements.len(), 2, "sanity: parts start on separate sheets");
 
         let parts_by_id: HashMap<usize, LayeredPolygon> = HashMap::from([(0, square(950.0)), (1, square(20.0))]);
@@ -361,7 +361,7 @@ mod tests {
             NestPart { id: 1, source_id: 1, polygon: square(48.0), rotation: 0.0 },
         ];
         let cache = NfpCache::new();
-        let result = place_parts(&sheets, parts, &config(), &cache, &|| false, &|_, _| {}).unwrap();
+        let result = place_parts(&sheets, parts, &config(), &cache, &|| false, &|_, _| {}, &|_, _, _| {}).unwrap();
         assert_eq!(result.placements.len(), 2, "sanity: 48+48 > 50, both parts can't share one sheet");
         let parts_by_id: HashMap<usize, LayeredPolygon> = HashMap::from([(0, square(48.0)), (1, square(48.0))]);
 
@@ -379,7 +379,7 @@ mod tests {
             NestPart { id: 1, source_id: 1, polygon: square(10.0), rotation: 0.0 },
         ];
         let cache = NfpCache::new();
-        let result = place_parts(&sheets, parts, &config(), &cache, &|| false, &|_, _| {}).unwrap();
+        let result = place_parts(&sheets, parts, &config(), &cache, &|| false, &|_, _| {}, &|_, _, _| {}).unwrap();
         let parts_by_id: HashMap<usize, LayeredPolygon> = HashMap::from([(0, square(90.0)), (1, square(10.0))]);
 
         let already_past = Instant::now() - std::time::Duration::from_secs(1);

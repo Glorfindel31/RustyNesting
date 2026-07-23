@@ -144,18 +144,18 @@ fn one() -> usize {
 /// (`Number(quantity) || totalPartInstances || 1`, "0 means unlimited"), a
 /// different code path with different semantics that doesn't apply to
 /// parts.
-#[must_use]
 /// Also returns `shape_ids` (instance id -> source id): every quantity-copy
 /// of the same `PartDto` shares one source id (this loop's own index over
 /// the input `Vec<PartDto>`, before per-quantity expansion) - lets the NFP
 /// cache dedupe by shape instead of by per-instance id, restoring parity
 /// with the original app's `.source`-keyed cache (see
-/// `docs/PORT_STATUS.md`'s Phase 4 entry, and `nesting::placement::NestPart::
-/// source_id`'s doc comment for where this actually gets used). A
+/// `nesting::placement::NestPart::source_id`'s doc comment for where this
+/// actually gets used). A
 /// definition-order identity, not a content-hash one - two separate
 /// `PartDto` entries with byte-identical polygons still get different
 /// source ids; fine for "one imported shape, quantity N", not "the same
 /// shape imported twice as separate parts".
+#[must_use]
 pub fn expand_parts(parts: Vec<PartDto>) -> (Vec<usize>, HashMap<usize, LayeredPolygon>, HashMap<usize, usize>) {
     let mut parts_by_id = HashMap::new();
     let mut shape_ids = HashMap::new();
@@ -259,18 +259,35 @@ pub struct NestConfigDto {
     /// just get a luckier starting population."
     #[serde(default)]
     pub seed: u64,
-    // Live preview - commented out (2026), never worked reliably (see
-    // git history for `frontend/index.html`'s `#cfg-live-viz`/
-    // `#live-preview-section` and `frontend/app.js`'s matching listeners/
-    // queue, also commented out) - not deleted, so it's easy to pick back
-    // up later. When true, `run_nest_command` was going to stream every
-    // generation that improved on the best-so-far (full placement, not
-    // just summary stats) via a `"nest-live-generation-result"` event, for
-    // the frontend to replay part by part - see
-    // `commands::run_nest_with_progress`'s own (also commented-out)
-    // `on_generation_improved`/`on_start` hooks.
-    // #[serde(default)]
-    // pub live_visualization: bool,
+    /// How many increasingly thorough attempts to run automatically - each
+    /// one tries one more rotation angle than the last (`rotations` above is
+    /// this escalation's *starting* value, not a fixed setting - see
+    /// `commands::run_nest_with_progress`'s run loop) plus a proportionally
+    /// larger population/generation budget to actually search that wider
+    /// grid, keeping whichever attempt actually nests best. This is the one
+    /// knob the simple/default UI exposes; `rotations`/`population_size`/
+    /// `generations` are tucked under Advanced Settings as this escalation's
+    /// starting point, for anyone who wants to override where it begins.
+    /// Defaults to 1 (exactly the given settings, no escalation) for old
+    /// saved configs/API callers that predate this field - the friction-free
+    /// default of trying several escalating attempts is index.html's own
+    /// field default, not this one, so a pre-existing saved config's
+    /// behavior never silently changes underneath it.
+    #[serde(default = "default_runs")]
+    pub runs: usize,
+    /// Percent (0-100). After the main run, any sheet whose own utilisation
+    /// ends up below this gets repacked in place - same technique/config as
+    /// the main run, that sheet's current parts only (see
+    /// `nesting::repack::repack_sheet`; never pulls parts from other
+    /// sheets - that's `refine_consolidation`'s job, not this one). `None`
+    /// (the default) turns the pass off, so old saved configs keep today's
+    /// behavior unchanged.
+    #[serde(default)]
+    pub cleanup_threshold_percent: Option<f64>,
+}
+
+fn default_runs() -> usize {
+    1
 }
 
 fn default_dominant_part_area_threshold() -> f64 {
@@ -320,6 +337,32 @@ pub struct PlacedPartDto {
 pub struct SheetPlacementDto {
     pub sheet_index: usize,
     pub parts: Vec<PlacedPartDto>,
+}
+
+/// Request for the manual per-sheet "REPACK" trigger (`commands::repack_sheet`) -
+/// the click-a-sheet counterpart to the automatic
+/// `NestConfigDto::cleanup_threshold_percent` pass, both backed by the same
+/// `nesting::repack::repack_sheet`.
+#[derive(Deserialize, Clone, Debug)]
+pub struct RepackSheetRequest {
+    pub sheet: PolygonDto,
+    pub placement: SheetPlacementDto,
+    /// True, unpadded geometry for every id in `placement.parts` - just
+    /// this sheet's subset (the frontend already has all of it from
+    /// `RunNestResponse::parts_by_id`).
+    pub parts_by_id: HashMap<usize, PolygonDto>,
+    /// The same config used for the main run, reused verbatim - not a
+    /// separate "repack settings" (same rights/techniques as the first nest).
+    pub config: NestConfigDto,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct RepackSheetResponse {
+    pub placement: SheetPlacementDto,
+    /// `false` means `placement` is unchanged from the request - the
+    /// frontend uses this to show "no improvement found" vs "improved".
+    pub improved: bool,
+    pub utilisation: f64,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -444,26 +487,41 @@ pub struct NestTickDto {
     pub individuals_total: usize,
 }
 
-// Live preview - commented out, see `NestConfigDto::live_visualization`'s
-// own comment for why (not deleted, easy to restore later).
-//
-// /// Payload for the `"nest-live-generation-result"` event `run_nest_command`
-// /// emits during a `live_visualization` run, once per generation that
-// /// actually improves on the best found so far (the same trigger
-// /// `RunNestResponse::history` already uses - see
-// /// `commands::run_nest_with_progress`'s `on_generation_improved` hook).
-// /// Carries the *full* placement, not just summary stats like
-// /// `NestProgressDto` - the frontend replays it part by part client-side
-// /// (see `frontend/app.js`'s live-preview listeners), so there's no need for
-// /// the backend to stream individual part-placement events at all: only
-// /// genuinely meaningful arrangements (an improving generation's winner) are
-// /// ever shown, not the GA's many discarded random attempts in between.
-// #[derive(Serialize, Clone, Debug)]
-// pub struct LiveGenerationResultDto {
-//     pub generation: usize,
-//     pub generations: usize,
-//     pub fitness: f64,
-//     pub unplaced_count: usize,
-//     pub placements: Vec<SheetPlacementDto>,
-// }
+/// Payload for the `"nest-run-start"` event - fired once right before each
+/// escalating "Run"'s own generation loop starts (see `NestConfigDto::runs`'s
+/// own doc comment for the escalation this narrates), so the console can say
+/// what's about to be tried instead of only ever reporting after the fact.
+#[derive(Serialize, Clone, Copy, Debug)]
+pub struct NestRunStartDto {
+    /// 1-based - the Nth attempt out of `total_runs`.
+    pub run: usize,
+    pub total_runs: usize,
+    pub rotations: u32,
+    pub population_size: usize,
+    pub generations: usize,
+}
+
+/// Payload for the `"nest-run-complete"` event, fired once a "Run" finishes -
+/// except a run that never placed a single individual (`generations: 0` for
+/// that run, or a cancel landing before the first individual finished),
+/// which has no `run_best` to report and so emits no event at all; the
+/// frontend only ever sees a `"nest-run-start"` for that attempt with no
+/// matching completion. `improved` is true only if this run's result
+/// actually beat every run before it in the same escalation (via
+/// `nesting::ga::is_better_nest`), not just this run's own internal best -
+/// the frontend uses this to color-code the console line (a new overall
+/// best vs. a run that didn't pan out).
+#[derive(Serialize, Clone, Copy, Debug)]
+pub struct NestRunCompleteDto {
+    pub run: usize,
+    pub total_runs: usize,
+    pub rotations: u32,
+    pub population_size: usize,
+    pub generations: usize,
+    pub sheets_used: usize,
+    pub unplaced_count: usize,
+    pub utilisation: f64,
+    pub improved: bool,
+}
+
 

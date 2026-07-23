@@ -1,23 +1,14 @@
-//! Tauri command layer - the "redesign, not port" point in the UI layer
-//! (`docs/PORT_STATUS.md`'s Phase 6 table). The original dispatches one
-//! `background-start` IPC message per GA individual to a pool of separate
-//! worker `BrowserWindow` processes, collecting `background-response`
-//! messages back asynchronously; this collapses to a single synchronous
-//! command per nest run, since `nesting::dispatch` already parallelizes a
-//! generation in-process via rayon - there's no separate worker process to
-//! message.
-//!
-//! **First slice, not the full surface**: this wires `import_dxf` and
-//! `run_nest` - reading a DXF file and running a bounded number of GA
-//! generations - end to end against the real engine (Phases 1-5). It does
-//! **not** wire the legacy `frontend/deepnest.js`/`index.html`'s
-//! `require("electron").ipcRenderer` construction, which expects the
-//! original's exact `background-*` channel shapes; that's a separate,
-//! larger "adapt the existing Ractive UI to the new command surface" pass.
-//! Progress events, `widenRotationsIfStalled`/`refineStalledBest`
-//! (needs a run loop that persists across multiple `run_nest`-shaped calls,
-//! which this single-shot command isn't), and DXF export are also not here
-//! yet - see `docs/PORT_STATUS.md`'s Phase 6/7 tables.
+//! Tauri command layer - a redesign, not a port, of the original Electron
+//! app's IPC surface. The original dispatches one `background-start` IPC
+//! message per GA individual to a pool of separate worker `BrowserWindow`
+//! processes, collecting `background-response` messages back asynchronously;
+//! this collapses to a single command per nest run, since `nesting::dispatch`
+//! already parallelizes a generation in-process via rayon - there's no
+//! separate worker process to message. Deliberately not wired to the legacy
+//! `frontend/deepnest.js`/`ui/**` Ractive UI (kept in the tree as reference
+//! only, unreferenced) - that code assumes a Node-integrated Electron
+//! renderer (`require("electron")`/`ipcRenderer`, etc.) that doesn't exist in
+//! Tauri's webview.
 //!
 //! Every command is a thin wrapper around a plain function (`import_dxf`/
 //! `run_nest` below) that takes no Tauri types and returns a plain
@@ -35,13 +26,14 @@ use geometry::dxf_import::LayeredPolygon;
 use nesting::cache::NfpCache;
 use nesting::consolidation::{recompute_totals, refine_consolidation};
 use nesting::dispatch;
-use nesting::ga::{is_better_nest, GeneticAlgorithm};
-use nesting::placement::PlaceResult;
+use nesting::ga::{is_better_nest, GaConfig, GeneticAlgorithm};
+use nesting::placement::{PlaceResult, PlacementConfig, PlacementType};
+use nesting::repack;
 use tauri::{Emitter, Manager};
 
 use crate::dto::{
-    expand_parts, BestResultDto, ExportDxfRequest, NestConfigDto, NestProgressDto, NestSnapshotDto, NestTickDto, PlacedPartDto, PolygonDto,
-    RunNestRequest, RunNestResponse, SheetPlacementDto,
+    expand_parts, BestResultDto, ExportDxfRequest, NestConfigDto, NestProgressDto, NestRunCompleteDto, NestRunStartDto, NestSnapshotDto, NestTickDto,
+    PlacedPartDto, PolygonDto, RepackSheetRequest, RepackSheetResponse, RunNestRequest, RunNestResponse, SheetPlacementDto,
 };
 
 /// Shared per-process nest-run state, managed Tauri state
@@ -220,8 +212,8 @@ pub fn import_dxf(path: &str, curve_tolerance: f64) -> Result<Vec<PolygonDto>, S
 }
 
 /// Writes the given nest result back out to a DXF file at `path` - new
-/// scope, not a port (the original app never wrote DXF locally at all, see
-/// `docs/PORT_STATUS.md`'s Phase 7 table). Takes exactly what the frontend
+/// scope, not a port (the original app never wrote DXF locally at all).
+/// Takes exactly what the frontend
 /// already has after a `run_nest_command` call (`request.sheets` for the
 /// *true*, unpadded geometry - export never uses the internally padded
 /// shapes `run_nest` builds - `response.parts_by_id`, and that same call's
@@ -272,6 +264,101 @@ pub fn export_dxf(path: &str, request: ExportDxfRequest) -> Result<(), String> {
     drawing.save_file(path).map_err(|e| format!("couldn't write {path}: {e}"))
 }
 
+/// The manual, click-a-sheet counterpart to `run_nest_with_progress`'s
+/// automatic `cleanup_threshold_percent` pass - both backed by the same
+/// `nesting::repack::repack_sheet`. Takes just one sheet's worth of state
+/// (not a full `RunNestRequest`) since that's all a single-sheet repack
+/// needs; `request.config` is reused verbatim rather than a separate
+/// "repack settings" struct, matching the "same rights/techniques as the
+/// first nest" requirement this feature was built around.
+pub fn repack_sheet(request: RepackSheetRequest) -> Result<RepackSheetResponse, String> {
+    if request.placement.parts.is_empty() {
+        return Err("sheet has no parts to repack".into());
+    }
+    if request.config.rotations == 0 {
+        return Err("rotations must be at least 1".into());
+    }
+    if request.config.population_size < 2 {
+        return Err("population_size must be at least 2".into());
+    }
+    if request.config.generations == 0 {
+        return Err("generations must be at least 1".into());
+    }
+    let margin = request.config.margin;
+    let spacing = request.config.spacing;
+
+    let true_sheet: LayeredPolygon = request.sheet.into();
+    let sheet_points = prepare_sheet(&true_sheet.points, margin, spacing).ok_or("margin/spacing leaves the sheet with no usable area")?;
+    let sheet = LayeredPolygon { points: sheet_points, ..true_sheet };
+
+    let parts_by_id: HashMap<usize, LayeredPolygon> = request
+        .parts_by_id
+        .into_iter()
+        .map(|(id, dto)| {
+            let poly: LayeredPolygon = dto.into();
+            let points = prepare_part(&poly.points, spacing).ok_or("spacing leaves a part with no usable outline")?;
+            Ok((id, LayeredPolygon { points, ..poly }))
+        })
+        .collect::<Result<_, &str>>()?;
+
+    // A one-off manual repack has no run-wide source_id grouping to reuse -
+    // each id stands for itself (fine: repack_sheet gets a fresh NfpCache
+    // per call regardless, so there's no cross-run cache benefit being left
+    // on the table by not threading the original run's shape_ids through).
+    let shape_ids: HashMap<usize, usize> = request.placement.parts.iter().map(|p| (p.id, p.id)).collect();
+
+    // `sheet` above is always a *local*, single-sheet slice from here on
+    // (`std::slice::from_ref(&sheet)`) - `recompute_totals` indexes its
+    // `sheets` argument by `entry.sheet_index`, so `current`/`repacked` must
+    // carry index 0 for every call below, not the real (possibly large)
+    // sheet index the frontend sent. The real index is restored onto the
+    // response's `placement` right before returning - it's response
+    // metadata, never an index into anything in this function.
+    let real_sheet_index = request.placement.sheet_index;
+    let current = nesting::placement::SheetPlacement {
+        sheet_index: 0,
+        parts: request
+            .placement
+            .parts
+            .iter()
+            .map(|p| nesting::placement::PlacedPart { id: p.id, placement: nesting::placement::Placement { x: p.x, y: p.y }, rotation: p.rotation })
+            .collect(),
+    };
+
+    let original_totals = recompute_totals(std::slice::from_ref(&current), &parts_by_id, std::slice::from_ref(&sheet));
+
+    // Gravity, not whatever placement_type the main run used: a repack's
+    // whole point is tightening up a single sheet, and Gravity's
+    // settle-toward-a-corner behavior clusters parts onto one side of the
+    // sheet - the visually "tidier" result users actually expect from
+    // REPACK, more than TightFit's local snug-contact scoring (which can
+    // leave an equally valid but scattered arrangement, since utilisation
+    // alone can't tell the two apart - see nesting::repack's own module
+    // doc for why is_better_sheet exists at all). Every other config value
+    // (rotations, dominant area, tolerance, GA params) still comes from
+    // the user's real config, only the scoring strategy changes.
+    let repack_placement_config = PlacementConfig { placement_type: PlacementType::Gravity, ..request.config.placement_config() };
+
+    match repack::repack_sheet(
+        &sheet,
+        &current,
+        &parts_by_id,
+        &shape_ids,
+        &request.config.ga_config(),
+        &repack_placement_config,
+        request.config.generations,
+        request.config.seed,
+        &|| false,
+    ) {
+        Some(mut repacked) => {
+            let totals = recompute_totals(std::slice::from_ref(&repacked), &parts_by_id, std::slice::from_ref(&sheet));
+            repacked.sheet_index = real_sheet_index;
+            Ok(RepackSheetResponse { placement: to_placements_dto(vec![repacked]).remove(0), improved: true, utilisation: totals.utilisation })
+        }
+        None => Ok(RepackSheetResponse { placement: request.placement, improved: false, utilisation: original_totals.utilisation }),
+    }
+}
+
 /// Runs `request.config.generations` GA generations against
 /// `request.sheets`/`request.parts` and returns the best result found
 /// (`nesting::ga::is_better_nest`, not raw fitness - see its doc comment for
@@ -284,7 +371,7 @@ pub fn export_dxf(path: &str, request: ExportDxfRequest) -> Result<(), String> {
 // test builds instead of carrying an unused production entry point.
 #[cfg(test)]
 pub fn run_nest(request: RunNestRequest) -> Result<RunNestResponse, String> {
-    run_nest_with_progress(request, |_, _, _| {}, || false, |_, _, _| {})
+    run_nest_with_progress(request, |_, _, _| {}, || false, |_, _, _| {}, |_| {}, |_| {})
 }
 
 /// Everything `run_nest_with_progress` and `run_nest_live_preview` both need
@@ -330,6 +417,12 @@ fn prepare_nest_inputs(request: RunNestRequest) -> Result<PreparedNestInputs, St
     if request.config.population_size < 2 {
         return Err("population_size must be at least 2".into());
     }
+    if request.config.runs == 0 {
+        return Err("runs must be at least 1".into());
+    }
+    if request.config.generations == 0 {
+        return Err("generations must be at least 1".into());
+    }
     if request.config.margin < 0.0 {
         return Err("margin must be >= 0".into());
     }
@@ -351,6 +444,11 @@ fn prepare_nest_inputs(request: RunNestRequest) -> Result<PreparedNestInputs, St
     }
     if !(request.config.dominant_part_area_threshold > 0.0 && request.config.dominant_part_area_threshold <= 1.0) {
         return Err("dominant_part_area_threshold must be between 0 (exclusive) and 1".into());
+    }
+    if let Some(t) = request.config.cleanup_threshold_percent {
+        if !(0.0..=100.0).contains(&t) {
+            return Err("cleanup_threshold_percent must be between 0 and 100".into());
+        }
     }
     let margin = request.config.margin;
     let spacing = request.config.spacing;
@@ -405,20 +503,59 @@ fn to_placements_dto(placements: Vec<nesting::placement::SheetPlacement>) -> Vec
         .collect()
 }
 
+/// Auto-escalation step sizes for the "Runs" loop (see `NestConfigDto::runs`'s
+/// own doc comment for the user-facing framing): each successive run tries
+/// one more rotation angle than the last, plus a proportionally larger
+/// population/generation budget so it can actually search that wider grid,
+/// not just try more angles once with the same shallow search. Plain linear
+/// growth, not anything self-tuning - simple and predictable beats clever
+/// here; revisit with real multi-job benchmark data if it proves too
+/// aggressive/conservative in practice.
+const RUN_POPULATION_STEP: usize = 4;
+const RUN_GENERATIONS_STEP: usize = 5;
+
+/// This run's rotations/population_size/generations, escalated from
+/// `request.config`'s own values (this escalation's *starting* point,
+/// 0-indexed `run_index` away) per `RUN_POPULATION_STEP`/`RUN_GENERATIONS_STEP`
+/// above.
+fn escalated_run_config(base_ga_config: &GaConfig, base_generations: usize, run_index: usize) -> (GaConfig, usize) {
+    let rotations = base_ga_config.rotations + run_index as u32;
+    let ga_config = GaConfig {
+        population_size: base_ga_config.population_size + run_index * RUN_POPULATION_STEP,
+        mutation_rate: base_ga_config.mutation_rate,
+        rotations,
+    };
+    let generations = base_generations + run_index * RUN_GENERATIONS_STEP;
+    (ga_config, generations)
+}
+
 /// Same as `run_nest`, but calls `on_progress(generation, total_generations,
 /// best_so_far)` after every completed generation - the hook the
 /// `run_nest_command` Tauri wrapper uses to `emit` a live "nest-progress"
 /// event per generation, so the UI can show what's happening instead of
 /// blocking silently until the whole run finishes. Plain `run_nest` (used by
-/// every test below and any caller that doesn't care) is just this with a
-/// no-op hook and a `should_cancel` that never fires.
+/// every test below and any caller that doesn't care) is just this with
+/// no-op hooks and a `should_cancel` that never fires.
 ///
-/// `should_cancel` is checked once per generation (`run_nest_command` wires
-/// it to `NestCancelFlag`, set by `cancel_nest_command`); when it returns
-/// true the loop stops after whatever generation just finished and the
-/// response reports `cancelled: true` with the best result found so far,
-/// rather than erroring - a user-requested stop is a normal outcome, not a
-/// failure.
+/// Runs `request.config.runs` escalating attempts (see
+/// `NestConfigDto::runs`'s own doc comment and `escalated_run_config` above),
+/// keeping whichever one actually nests best across the whole sequence
+/// (`nesting::ga::is_better_nest`, the same comparison a single run's own
+/// generations already use) - not just the last one tried. `on_run_start`/
+/// `on_run_complete` fire once per attempt (before/after its own generation
+/// loop) so the UI can narrate the escalation instead of only ever seeing
+/// per-generation detail with no sense of which attempt produced it.
+/// `generation`/`history` numbering is a running counter across the *whole*
+/// escalation, not reset to 1 each run - so `RunNestResponse::history`'s
+/// entries stay uniquely labeled instead of colliding across runs.
+///
+/// `should_cancel` is checked once per generation and once between runs
+/// (`run_nest_command` wires it to `NestCancelFlag`, set by
+/// `cancel_nest_command`); when it returns true the whole escalation stops
+/// after whatever generation just finished and the response reports
+/// `cancelled: true` with the best result found so far across every attempt
+/// up to that point, rather than erroring - a user-requested stop is a
+/// normal outcome, not a failure.
 ///
 /// `on_individual_placed(generation, done, total)` forwards
 /// `nesting::dispatch::run_generation`'s own per-individual progress hook
@@ -434,65 +571,61 @@ fn to_placements_dto(placements: Vec<nesting::placement::SheetPlacement>) -> Vec
 /// rather than adding a callback parameter to that function - `dispatch`'s
 /// own doc comment already calls progress plumbing out as "left to whatever
 /// wraps this loop", so this is that wrapper, not a fork of engine logic.
-///
-// Live preview - `on_generation_improved`/`on_start` params commented out
-// here (see `NestConfigDto::live_visualization`'s own comment for why, not
-// deleted, easy to restore later). They fired at the exact same trigger
-// `RunNestResponse::history` already uses (whenever a result beats the
-// current best - not once per generation regardless of whether anything
-// changed) and once right after validation with the true/unpadded id ->
-// shape map, respectively - `run_nest_command`'s `live_visualization` path
-// used them to stream the *full* winning placement to the frontend for a
-// live, generation-by-generation replay.
+#[allow(clippy::too_many_arguments)]
 pub fn run_nest_with_progress(
     request: RunNestRequest,
     mut on_progress: impl FnMut(usize, usize, &PlaceResult) + Send,
     should_cancel: impl Fn() -> bool + Sync + Send,
     on_individual_placed: impl Fn(usize, usize, usize) + Sync + Send,
-    // mut on_generation_improved: impl FnMut(usize, usize, &PlaceResult) + Send,
-    // on_start: impl FnOnce(&HashMap<usize, PolygonDto>),
+    mut on_run_start: impl FnMut(&NestRunStartDto) + Send,
+    mut on_run_complete: impl FnMut(&NestRunCompleteDto) + Send,
 ) -> Result<RunNestResponse, String> {
     // Read before `prepare_nest_inputs` consumes `request` - none of these
-    // four are needed by the shared validation/padding logic, only by the
-    // GA loop below.
+    // are needed by the shared validation/padding logic, only by the runs/GA
+    // loop below.
     let max_threads = request.config.max_threads;
-    let ga_config = request.config.ga_config();
-    let generations = request.config.generations;
+    let base_ga_config = request.config.ga_config();
+    let base_generations = request.config.generations;
     let seed = request.config.seed;
+    let total_runs = request.config.runs;
+    let cleanup_threshold = request.config.cleanup_threshold_percent;
 
     let PreparedNestInputs { sheets, parts_by_id, parts_by_id_dto, shape_ids, adam, placement_config } = prepare_nest_inputs(request)?;
-    // on_start(&parts_by_id_dto);
 
-    let mut ga = GeneticAlgorithm::new(adam, ga_config, Vec::new(), seed);
-    // One cache for the whole run - every individual, every generation -
-    // not a fresh one per generation/individual. That's what turns the same
-    // (part id, part id, rotation, rotation) NFP recurring across the GA's
-    // many individuals into a cache hit instead of a recompute; see
-    // `nesting::placement::place_parts`'s own doc comment.
+    // One cache for the *whole* escalation - every run, every individual,
+    // every generation - not a fresh one per run/generation/individual.
+    // Different runs use different (and, for `rotations`, overlapping)
+    // angle grids, so the same (part id, part id, rotation, rotation) NFP
+    // recurring across runs is still a cache hit instead of a recompute;
+    // see `nesting::placement::place_parts`'s own doc comment.
     let cache = NfpCache::new();
-
-    // Captured by reference, not moved, into the `move` closure below - all
-    // four (`sheets`, `parts_by_id`, `shape_ids`, `cache`) are needed again
-    // afterward, to run consolidation against the same cache the GA run
-    // already populated. `placement_config` isn't captured this way: the
-    // closure needs to mutate its *own* copy over the run (see
-    // `widenRotationsIfStalled` below) and hand back whatever it ends up
-    // at, for consolidation to use afterward too - a plain `&` wouldn't let
-    // it do that.
     let sheets_ref = &sheets;
     let parts_by_id_ref = &parts_by_id;
     let shape_ids_ref = &shape_ids;
     let cache_ref = &cache;
-    let initial_placement_config = placement_config.clone();
 
-    // Port of `widenRotationsIfStalled`: if the best result hasn't improved
-    // in a while, the search is more likely stuck on a rotation grid too
-    // coarse to find a better fit than it is to benefit from trying more of
-    // the same angles again - widen it. Doubling (not resizing to an
+    // 0 (the default) means "no cap" - just use rayon's own global pool. A
+    // cap builds one scoped pool for the *whole* escalation (not one per
+    // run - rayon's global pool can only be configured once per process via
+    // `build_global()`, which is exactly why this can't just be threads=0's
+    // shared pool, but a fresh `ThreadPoolBuilder` still only needs building
+    // once here, reused by every run's `pool.install` below).
+    let pool = if max_threads > 0 {
+        Some(rayon::ThreadPoolBuilder::new().num_threads(max_threads).build().map_err(|e| format!("couldn't build a {max_threads}-thread pool: {e}"))?)
+    } else {
+        None
+    };
+
+    // Port of `widenRotationsIfStalled`: if a single run's best hasn't
+    // improved in a while, the search is more likely stuck on a rotation
+    // grid too coarse to find a better fit than it is to benefit from trying
+    // more of the same angles again - widen it. Doubling (not resizing to an
     // arbitrary count) is what keeps this safe alongside the shared
     // `NfpCache`: {0,90,180,270} is an exact subset of {0,45,90,...,315}, so
     // widening never invalidates NFPs already cached for the coarser
-    // angles, only adds new ones to compute.
+    // angles, only adds new ones to compute. Independent of (and reset
+    // every) run - the outer runs loop already escalates rotations between
+    // attempts; this only rescues one attempt that's stalled internally.
     //
     // `ROTATION_STAGNATION_LIMIT` no longer matches the original's constant
     // (was 10): a real benchmark session (24-combination grid sweep against
@@ -510,90 +643,184 @@ pub fn run_nest_with_progress(
     const ROTATION_STAGNATION_LIMIT: usize = 60;
     const ROTATION_CAP: u32 = 32;
 
-    let run_generations = move || {
-        let mut placement_config = initial_placement_config;
-        let mut best: Option<PlaceResult> = None;
-        // Every time `best` actually improves, keep a copy - not just the
-        // final one - so the frontend can show "the other nests it tried"
-        // (`RunNestResponse::history`), not only the winner. Bounded by how
-        // often a genuinely better individual turns up, which in practice
-        // is far less than once per generation once the GA converges - not
-        // one full snapshot per generation regardless of `generations`.
-        let mut history: Vec<(usize, PlaceResult)> = Vec::new();
-        let mut cancelled = false;
-        let mut generations_since_improvement: usize = 0;
-        for generation in 1..=generations {
-            if should_cancel() {
-                cancelled = true;
-                break;
-            }
-            // `should_cancel` is also passed down into `run_generation`
-            // itself (not just checked here, between generations) - a
-            // generation is a parallel per-individual placement pass that
-            // can take a long time on its own, and without an interior
-            // check a stop request would only ever take effect at the
-            // boundary between whole generations.
-            let results = dispatch::run_generation(&mut ga, sheets_ref, parts_by_id_ref, shape_ids_ref, &placement_config, &should_cancel, &|done, total| {
-                on_individual_placed(generation, done, total)
-            }, cache_ref);
-            let mut improved_this_generation = false;
-            for result in results {
-                if best.as_ref().is_none_or(|b| is_better_nest(&result, b)) {
-                    best = Some(result.clone());
-                    // on_generation_improved(generation, generations, &result); // live preview, commented out - see NestConfigDto::live_visualization
-                    history.push((generation, result));
-                    improved_this_generation = true;
-                }
-            }
-            if let Some(so_far) = &best {
-                on_progress(generation, generations, so_far);
-            }
-            // Re-checked after the generation too: `run_generation` may have
-            // been cut short mid-population by the same flag, in which case
-            // this loop must stop here rather than starting another
-            // generation on a population `run_generation` deliberately left
-            // half-evaluated (see its own doc comment).
-            if should_cancel() {
-                cancelled = true;
-                break;
-            }
+    let mut overall_best: Option<PlaceResult> = None;
+    let mut overall_history: Vec<(usize, PlaceResult)> = Vec::new();
+    let mut overall_cancelled = false;
+    let mut final_placement_config = placement_config.clone();
+    // Cumulative *generations actually run* across the whole escalation, not
+    // `overall_history.len()` (a real bug this replaced: that was the count
+    // of recorded *improvements*, which undercounts as soon as any run goes
+    // more than one generation without a new best - the normal case once a
+    // GA starts converging - producing colliding, non-monotonic labels).
+    let mut generations_elapsed: usize = 0;
 
-            if improved_this_generation {
-                generations_since_improvement = 0;
-            } else {
-                generations_since_improvement += 1;
-                if generations_since_improvement >= ROTATION_STAGNATION_LIMIT && placement_config.rotations < ROTATION_CAP {
-                    placement_config.rotations = (placement_config.rotations * 2).min(ROTATION_CAP);
-                    ga.set_rotations(placement_config.rotations);
-                    generations_since_improvement = 0;
+    'runs: for run_index in 0..total_runs {
+        if should_cancel() {
+            overall_cancelled = true;
+            break;
+        }
+        let (run_ga_config, generations_for_run) = escalated_run_config(&base_ga_config, base_generations, run_index);
+        let mut run_placement_config = placement_config.clone();
+        run_placement_config.rotations = run_ga_config.rotations;
+
+        on_run_start(&NestRunStartDto {
+            run: run_index + 1,
+            total_runs,
+            rotations: run_ga_config.rotations,
+            population_size: run_ga_config.population_size,
+            generations: generations_for_run,
+        });
+
+        let mut ga = GeneticAlgorithm::new(adam.clone(), run_ga_config.clone(), Vec::new(), seed);
+
+        // Deliberately not a `move` closure: `on_progress`/`on_individual_placed`
+        // (mutable/shared borrows of the outer function's own parameters) need
+        // to be reusable across every run's closure, not consumed by the
+        // first one - Rust's per-capture inference already picks the right
+        // mode for each variable individually (`ga`/`run_placement_config` by
+        // reference/move as their own usage below requires), `move` would
+        // just force everything into an owned copy unnecessarily.
+        let mut run_once = || {
+            let mut placement_config = run_placement_config.clone();
+            let mut best: Option<PlaceResult> = None;
+            let mut history: Vec<(usize, PlaceResult)> = Vec::new();
+            let mut cancelled = false;
+            let mut generations_since_improvement: usize = 0;
+            for generation_in_run in 1..=generations_for_run {
+                if should_cancel() {
+                    cancelled = true;
+                    break;
                 }
+                // `should_cancel` is also passed down into `run_generation`
+                // itself (not just checked here, between generations) - a
+                // generation is a parallel per-individual placement pass
+                // that can take a long time on its own, and without an
+                // interior check a stop request would only ever take effect
+                // at the boundary between whole generations.
+                let results = dispatch::run_generation(&mut ga, sheets_ref, parts_by_id_ref, shape_ids_ref, &placement_config, &should_cancel, &|done, total| {
+                    on_individual_placed(generation_in_run, done, total)
+                }, cache_ref);
+                let mut improved_this_generation = false;
+                for evaluated in results {
+                    if best.as_ref().is_none_or(|b| is_better_nest(&evaluated.result, b)) {
+                        best = Some(evaluated.result.clone());
+                        history.push((generation_in_run, evaluated.result));
+                        improved_this_generation = true;
+                    }
+                }
+                // Live per-generation progress, relative to *this* run
+                // (resets each run) - simple and immediate, same shape the
+                // single-run version always had. `on_run_start`/
+                // `on_run_complete` (fired around this closure, not inside
+                // it) are what tell the console which attempt this progress
+                // belongs to.
+                if let Some(so_far) = &best {
+                    on_progress(generation_in_run, generations_for_run, so_far);
+                }
+                // Re-checked after the generation too: `run_generation` may
+                // have been cut short mid-population by the same flag, in
+                // which case this loop must stop here rather than starting
+                // another generation on a population `run_generation`
+                // deliberately left half-evaluated (see its own doc
+                // comment).
+                if should_cancel() {
+                    cancelled = true;
+                    break;
+                }
+
+                if improved_this_generation {
+                    generations_since_improvement = 0;
+                } else {
+                    generations_since_improvement += 1;
+                    if generations_since_improvement >= ROTATION_STAGNATION_LIMIT && placement_config.rotations < ROTATION_CAP {
+                        placement_config.rotations = (placement_config.rotations * 2).min(ROTATION_CAP);
+                        ga.set_rotations(placement_config.rotations);
+                        generations_since_improvement = 0;
+                    }
+                }
+            }
+            (best, history, cancelled, placement_config)
+        };
+
+        let (run_best, run_history, run_cancelled, run_final_placement_config) = match &pool {
+            Some(p) => p.install(run_once),
+            None => run_once(),
+        };
+
+        // Whether *this run's own best* ends up beating every run before it -
+        // computed against a snapshot of `overall_best` from before this
+        // run's history is folded in, not re-derived from loop side effects
+        // below (simpler to get right: `run_best`, if any, is always
+        // `run_history`'s last/best entry by construction, so this is the
+        // one comparison that matters for the "did this attempt pay off"
+        // question `on_run_complete` reports).
+        let improved = match (&run_best, &overall_best) {
+            (Some(rb), Some(prev)) => is_better_nest(rb, prev),
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+
+        // History labels are a running count across the *whole* escalation
+        // (not reset to 1 each run), so `RunNestResponse::history`'s entries
+        // stay uniquely identified in the "VIEW ATTEMPT" dropdown instead of
+        // colliding with an earlier run's same-numbered generation. Offset by
+        // generations *elapsed*, not `overall_history.len()` - a run's own
+        // `generation_in_run` numbering already runs 1..=generations_for_run
+        // regardless of how many of those generations actually improved on
+        // the running best, so the offset for the next run has to match that
+        // same full count, not just how many entries got recorded.
+        // Only entries that actually beat the *overall* best get pushed into
+        // `overall_history` - a real bug this replaced: `run_history`'s own
+        // entries are each other's local best (`run_once`'s `best` starts
+        // fresh at `None` every run), which is not the same thing as
+        // beating what an *earlier* run already achieved. Pushing every
+        // local-history entry unconditionally meant a later run's first
+        // individual - genuinely worse than an earlier run's result, but
+        // still "an improvement" relative to that run's own fresh-starting
+        // `None` baseline - showed up in `RunNestResponse::history` (the
+        // "VIEW ATTEMPT" dropdown) looking like a legitimate later attempt,
+        // even though it never should have counted as one.
+        let generation_offset = generations_elapsed;
+        for (generation_in_run, result) in run_history {
+            if overall_best.as_ref().is_none_or(|b| is_better_nest(&result, b)) {
+                overall_best = Some(result.clone());
+                final_placement_config = run_final_placement_config.clone();
+                overall_history.push((generation_offset + generation_in_run, result));
             }
         }
-        (best, history, cancelled, placement_config)
-    };
+        generations_elapsed += generations_for_run;
 
-    // 0 (the default) means "no cap" - just use rayon's own global pool, no
-    // need to spin up a second one. A cap builds a fresh scoped pool for
-    // this call only, since rayon's global pool can only be configured once
-    // per process (a second `build_global()` call would panic) and
-    // different calls may want different caps.
-    let (best, history, cancelled, placement_config) = if max_threads > 0 {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(max_threads)
-            .build()
-            .map_err(|e| format!("couldn't build a {max_threads}-thread pool: {e}"))?;
-        pool.install(run_generations)
-    } else {
-        run_generations()
-    };
-    // `best` is only ever `None` if no individual was ever placed - either
-    // `generations == 0` (the loop body never runs) or a cancel that landed
-    // before the very first individual finished. The latter is a normal
-    // outcome (see this function's own doc comment: "a user-requested stop
-    // is a normal outcome, not a failure"), not an error - report it as a
-    // zero result (nothing placed, everything still unplaced) rather than
-    // failing the whole call.
-    let best = match best {
+        if let Some(run_best) = &run_best {
+            on_run_complete(&NestRunCompleteDto {
+                run: run_index + 1,
+                total_runs,
+                rotations: run_ga_config.rotations,
+                population_size: run_ga_config.population_size,
+                generations: generations_for_run,
+                sheets_used: run_best.placements.len(),
+                unplaced_count: run_best.unplaced_count,
+                utilisation: run_best.utilisation,
+                improved,
+            });
+        }
+
+        if run_cancelled {
+            overall_cancelled = true;
+            break 'runs;
+        }
+    }
+
+    let placement_config = final_placement_config;
+    let history = overall_history;
+    let cancelled = overall_cancelled;
+    // `overall_best` is only ever `None` if no individual was ever placed in
+    // any run - either every run's own `generations` was 0 (each loop body
+    // never ran) or a cancel that landed before the very first individual
+    // finished. The latter is a normal outcome (see this function's own doc
+    // comment: "a user-requested stop is a normal outcome, not a failure"),
+    // not an error - report it as a zero result (nothing placed, everything
+    // still unplaced) rather than failing the whole call.
+    let best = match overall_best {
         Some(b) => b,
         None if cancelled => {
             let mut unplaced_ids: Vec<usize> = parts_by_id_dto.keys().copied().collect();
@@ -640,6 +867,48 @@ pub fn run_nest_with_progress(
             PlaceResult { placements: refined.allplacements, ..best }
         }
     };
+
+    // Post-nest cleaning pass: any sheet under `cleanup_threshold` gets
+    // repacked in place (nesting::repack::repack_sheet - same technique/
+    // config as the main run, that sheet's own parts only). Runs after
+    // refine_consolidation, on top of the already-defragmented layout.
+    // Never changes unplaced_count/unplaced_ids or which parts ended up on
+    // which sheet - repack_sheet only ever keeps or replaces an already-
+    // fully-placed sheet's arrangement, it never un-places anything.
+    let mut best = best;
+    if let Some(threshold) = cleanup_threshold {
+        // Same Gravity override as the manual REPACK command (commands::repack_sheet)
+        // - both call nesting::repack::repack_sheet for the same "tighten up
+        // this one sheet" job, so both should cluster toward a corner
+        // instead of reusing the main run's placement_type verbatim.
+        let repack_placement_config = PlacementConfig { placement_type: PlacementType::Gravity, ..placement_config.clone() };
+        for sheet_placement in &mut best.placements {
+            if should_cancel() {
+                break;
+            }
+            let sheet_totals = recompute_totals(std::slice::from_ref(sheet_placement), &parts_by_id, &sheets);
+            if sheet_totals.utilisation >= threshold {
+                continue;
+            }
+            if let Some(repacked) = repack::repack_sheet(
+                &sheets[sheet_placement.sheet_index],
+                sheet_placement,
+                &parts_by_id,
+                &shape_ids,
+                &base_ga_config,
+                &repack_placement_config,
+                base_generations,
+                seed,
+                &should_cancel,
+            ) {
+                *sheet_placement = repacked;
+            }
+        }
+        let totals = recompute_totals(&best.placements, &parts_by_id, &sheets);
+        best.area = totals.total_placed_area;
+        best.total_area = totals.total_usable_sheet_area;
+        best.utilisation = totals.utilisation;
+    }
 
     Ok(RunNestResponse {
         history: history
@@ -694,12 +963,21 @@ pub async fn export_dxf_command(path: String, request: ExportDxfRequest) -> Resu
         .map_err(|e| format!("export task panicked: {e}"))?
 }
 
+#[tauri::command(rename_all = "snake_case")]
+pub async fn repack_sheet_command(request: RepackSheetRequest) -> Result<RepackSheetResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || repack_sheet(request)).await.map_err(|e| format!("repack task panicked: {e}"))?
+}
+
 // `app: tauri::AppHandle` is one of Tauri's special injected command
 // parameters - it's resolved from the running app, not sent by the JS
 // caller, so `invoke("run_nest_command", { request })` on the frontend is
 // unaffected by adding it here.
 #[tauri::command(rename_all = "snake_case")]
-pub async fn run_nest_command(app: tauri::AppHandle, state: tauri::State<'_, NestCancelFlag>, request: RunNestRequest) -> Result<RunNestResponse, String> {
+pub async fn run_nest_command(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, NestCancelFlag>,
+    request: RunNestRequest,
+) -> Result<RunNestResponse, String> {
     // Backend-enforced single-flight: reject a second run outright rather
     // than sharing `cancel` between two in-flight runs (whichever cancelled
     // second would silently reset the flag the first run is still reading).
@@ -715,17 +993,14 @@ pub async fn run_nest_command(app: tauri::AppHandle, state: tauri::State<'_, Nes
     // recovered `BestResultDto` needs sheet geometry to render against in a
     // later session, and `request` itself won't survive past this call.
     let request_sheets = request.sheets.clone();
-    // Live preview - commented out (see `NestConfigDto::live_visualization`'s
-    // own comment for why), so `run_nest_with_progress` only ever gets
-    // called the one way below now, not branched on a `live_visualization`
-    // flag.
-    // let live_visualization = request.config.live_visualization;
     // Cloned once here so the post-run persistence step below can own one -
     // `AppHandle` is cheap to clone (an `Arc` internally).
     let app_for_best = app.clone();
     let cancel_flag = state.cancel.clone();
     let app_for_progress = app.clone();
-    let app_for_tick = app;
+    let app_for_tick = app.clone();
+    let app_for_run_start = app.clone();
+    let app_for_run_complete = app;
     let result = tauri::async_runtime::spawn_blocking(move || {
         run_nest_with_progress(
             request,
@@ -756,30 +1031,12 @@ pub async fn run_nest_command(app: tauri::AppHandle, state: tauri::State<'_, Nes
             move |generation, done, total| {
                 let _ = app_for_tick.emit("nest-tick", NestTickDto { generation, individuals_done: done, individuals_total: total });
             },
-            // Live preview args, commented out along with the params
-            // themselves in `run_nest_with_progress` - see that function's
-            // own comment.
-            // move |generation, generations, result: &PlaceResult| {
-            //     if !live_visualization {
-            //         return;
-            //     }
-            //     let _ = app_for_live_result.emit(
-            //         "nest-live-generation-result",
-            //         LiveGenerationResultDto {
-            //             generation,
-            //             generations,
-            //             fitness: result.fitness,
-            //             unplaced_count: result.unplaced_count,
-            //             placements: to_placements_dto(result.placements.clone()),
-            //         },
-            //     );
-            // },
-            // move |parts_by_id| {
-            //     if !live_visualization {
-            //         return;
-            //     }
-            //     let _ = app_for_live_start.emit("nest-live-start", parts_by_id);
-            // },
+            move |run_start| {
+                let _ = app_for_run_start.emit("nest-run-start", *run_start);
+            },
+            move |run_complete| {
+                let _ = app_for_run_complete.emit("nest-run-complete", *run_complete);
+            },
         )
     })
     .await
@@ -851,6 +1108,21 @@ mod tests {
         }
     }
 
+    fn rect_dto(w: f64, h: f64) -> PolygonDto {
+        PolygonDto {
+            points: vec![
+                PointDto { x: 0.0, y: 0.0 },
+                PointDto { x: w, y: 0.0 },
+                PointDto { x: w, y: h },
+                PointDto { x: 0.0, y: h },
+            ],
+            layer: "0".into(),
+            is_circle: None,
+            children: Vec::new(),
+            texts: Vec::new(),
+        }
+    }
+
     fn config(generations: usize) -> NestConfigDto {
         NestConfigDto {
             placement_type: PlacementTypeDto::Gravity,
@@ -864,6 +1136,8 @@ mod tests {
             spacing: 0.0,
             max_threads: 0,
             seed: 0,
+            runs: 1,
+            cleanup_threshold_percent: None,
         }
     }
 
@@ -908,6 +1182,43 @@ mod tests {
         assert_eq!(response.unplaced_count, 0);
         assert_eq!(response.placements.len(), 1, "consolidation should have drained the second sheet, leaving both parts on one");
         assert_eq!(response.placements[0].parts.len(), 2);
+    }
+
+    #[test]
+    fn run_nest_with_cleanup_threshold_never_loses_parts_or_regresses_utilisation() {
+        // `cleanup_threshold_percent: Some(100.0)` forces every sheet through
+        // the post-nest repack pass (nothing can ever be >=100% "used" for a
+        // job with real slack), so this exercises the pass being wired into
+        // `run_nest_with_progress` at all, not just built in isolation
+        // (`nesting::repack`'s own unit tests already cover the repack
+        // mechanism itself finding a real improvement). Utilisation is
+        // provably invariant to how a *fixed* set of parts is arranged on a
+        // *fixed* sheet (same total part area either way - see
+        // `nesting::repack`'s own module doc comment), so a request run
+        // twice, once with cleanup off and once forced on, must report
+        // identical unplaced_count/sheet count/utilisation - the only thing
+        // cleanup is allowed to change is the parts' x/y/rotation.
+        let mut request = RunNestRequest {
+            sheets: vec![square_dto(300.0), square_dto(300.0)],
+            parts: vec![
+                PartDto { polygon: rect_dto(120.0, 40.0), quantity: 1 },
+                PartDto { polygon: rect_dto(90.0, 70.0), quantity: 1 },
+                PartDto { polygon: rect_dto(50.0, 50.0), quantity: 1 },
+                PartDto { polygon: rect_dto(30.0, 90.0), quantity: 1 },
+            ],
+            config: config(3),
+        };
+
+        let baseline = run_nest(request.clone()).expect("baseline run should nest successfully");
+        request.config.cleanup_threshold_percent = Some(100.0);
+        let cleaned = run_nest(request).expect("cleanup-forced run should nest successfully");
+
+        assert_eq!(cleaned.unplaced_count, 0);
+        assert_eq!(cleaned.unplaced_count, baseline.unplaced_count);
+        assert_eq!(cleaned.placements.len(), baseline.placements.len(), "cleanup must never open or close a sheet");
+        let total_parts = |r: &RunNestResponse| r.placements.iter().map(|p| p.parts.len()).sum::<usize>();
+        assert_eq!(total_parts(&cleaned), total_parts(&baseline), "cleanup must never drop or duplicate a part");
+        assert!((cleaned.utilisation - baseline.utilisation).abs() < 1e-9, "utilisation must be unchanged: {} vs {}", cleaned.utilisation, baseline.utilisation);
     }
 
     #[test]
@@ -1133,12 +1444,164 @@ mod tests {
             },
             || false,
             |_, _, _| {},
+            |_| {},
+            |_| {},
         )
         .expect("should nest successfully");
 
         assert_eq!(seen_generations, vec![1, 2, 3, 4]);
         assert_eq!(response.unplaced_count, 0);
         assert!(!response.cancelled);
+    }
+
+    #[test]
+    fn run_nest_with_progress_escalates_rotations_population_and_generations_across_runs() {
+        let mut cfg = config(8);
+        cfg.runs = 3;
+        cfg.rotations = 2;
+        cfg.population_size = 2;
+        cfg.mutation_rate = 90.0;
+        // Rectangles (not squares - a square's rotation genes are inert,
+        // since every rotation produces the identical shape, and identical-
+        // size parts make ordering genes inert too, since every arrangement
+        // packs identically regardless of which gene produced it) of mixed,
+        // asymmetric sizes, totaling enough area (~16,000mm2) to need
+        // multiple 100x100 (10,000mm2) sheets. Both properties matter here:
+        // a discrete "fewer sheets used" signal is a much more reliable way
+        // to get the GA to keep improving across several generations of a
+        // run than hoping a same-sheet-count utilisation nudge happens to
+        // occur, and genuinely rotation/order-sensitive geometry is what
+        // makes that improvement possible at all - an earlier version of
+        // this test used identical squares and was flaky (every run
+        // recording exactly one improvement, at generation 1, regardless of
+        // the extra generations configured), for exactly this reason. That
+        // distinction matters here: `generation_offset` undercounting
+        // relative to generations *actually elapsed* only produces an
+        // observably wrong (colliding or non-monotonic) label once some run
+        // records more than one improving generation - see the assertions
+        // below.
+        let request = RunNestRequest {
+            sheets: (0..4).map(|_| square_dto(100.0)).collect(),
+            parts: vec![
+                PartDto { polygon: rect_dto(35.0, 12.0), quantity: 10 },
+                PartDto { polygon: rect_dto(18.0, 27.0), quantity: 8 },
+                PartDto { polygon: rect_dto(9.0, 41.0), quantity: 6 },
+            ],
+            config: cfg,
+        };
+
+        let starts = std::sync::Mutex::new(Vec::new());
+        let completes = std::sync::Mutex::new(Vec::new());
+        let response = run_nest_with_progress(
+            request,
+            |_, _, _| {},
+            || false,
+            |_, _, _| {},
+            |start| starts.lock().unwrap().push(*start),
+            |complete| completes.lock().unwrap().push(*complete),
+        )
+        .expect("should nest successfully");
+
+        let starts = starts.into_inner().unwrap();
+        let completes = completes.into_inner().unwrap();
+
+        // 3 runs configured: rotations 2,3,4 / population 2,6,10 /
+        // generations 8,13,18 - each escalating by RUN_POPULATION_STEP/
+        // RUN_GENERATIONS_STEP per run, matching `escalated_run_config`.
+        assert_eq!(starts.len(), 3);
+        assert_eq!(completes.len(), 3);
+        for (i, start) in starts.iter().enumerate() {
+            assert_eq!(start.run, i + 1);
+            assert_eq!(start.total_runs, 3);
+            assert_eq!(start.rotations, 2 + i as u32);
+            assert_eq!(start.population_size, 2 + i * 4);
+            assert_eq!(start.generations, 8 + i * 5);
+        }
+        for (i, complete) in completes.iter().enumerate() {
+            assert_eq!(complete.run, i + 1);
+            assert_eq!(complete.rotations, 2 + i as u32);
+        }
+
+        assert_eq!(response.unplaced_count, 0, "40 small squares should all fit within the 4 available 100x100 sheets regardless of which run placed them");
+        // history spans every run, not just the last one, with labels that
+        // are not just unique but strictly increasing across the whole
+        // escalation - regression coverage for a real bug this test caught:
+        // `generation_offset` was computed from `overall_history.len()`
+        // (the count of *recorded improvements* so far) instead of
+        // generations actually elapsed, which only produces an observably
+        // wrong (colliding or non-monotonic) label once some run records
+        // more than one improving generation - a harder job (mixed
+        // rectangles across multiple sheets, vs. 3 trivially-placed
+        // squares) makes that the likely case instead of an unlikely one.
+        // Only entries that are a genuine *overall* improvement land in
+        // `history` at all now (see `run_nest_with_progress`'s own comment
+        // on why an earlier version of this bundled a second real bug -
+        // unconditionally pushing every run-local entry regardless of
+        // whether it beat prior runs), so this no longer asserts a raw
+        // count - just that whatever's there is honestly ordered.
+        assert!(!response.history.is_empty(), "at least the first placed individual, in some run, should count as an improvement");
+        let generations_seen: Vec<usize> = response.history.iter().map(|h| h.generation).collect();
+        for pair in generations_seen.windows(2) {
+            assert!(pair[0] < pair[1], "history generation labels must be strictly increasing across the whole escalation, got {:?}", generations_seen);
+        }
+    }
+
+    /// Regression test for a real bug: `overall_history` used to push every
+    /// run-local history entry unconditionally, including entries that were
+    /// only "an improvement" relative to that *run's own* fresh-starting
+    /// `None` baseline, not the actual best found across every run so far.
+    /// A later run's early, genuinely-worse-than-an-earlier-run individual
+    /// could then show up in `RunNestResponse::history` (the frontend's
+    /// "VIEW ATTEMPT" dropdown) looking like a legitimate later attempt.
+    /// Forces the scenario directly: run 1 gets a generous budget (likely to
+    /// find a good arrangement), run 2 gets a single, tiny generation/
+    /// population budget (likely to do *worse* than run 1) - if the bug
+    /// were reintroduced, `history`'s last entry would be run 2's inferior
+    /// result instead of matching the top-level (genuinely best) fields.
+    #[test]
+    fn history_never_contains_an_entry_worse_than_an_earlier_run_already_achieved() {
+        let mut cfg = config(10);
+        cfg.runs = 2;
+        cfg.rotations = 2;
+        cfg.population_size = 10;
+        cfg.mutation_rate = 50.0;
+        let request = RunNestRequest {
+            sheets: (0..4).map(|_| square_dto(100.0)).collect(),
+            parts: vec![
+                PartDto { polygon: rect_dto(35.0, 12.0), quantity: 10 },
+                PartDto { polygon: rect_dto(18.0, 27.0), quantity: 8 },
+                PartDto { polygon: rect_dto(9.0, 41.0), quantity: 6 },
+            ],
+            config: cfg,
+        };
+
+        let response = run_nest(request).expect("should nest successfully");
+
+        assert!(!response.history.is_empty(), "at least the first placed individual should count as an improvement");
+        let last = response.history.last().unwrap();
+        assert_eq!(last.fitness, response.fitness, "history's last entry must be the same result reported at the top level, even across multiple escalating runs");
+        assert_eq!(last.unplaced_count, response.unplaced_count);
+        assert_eq!(last.placements.len(), response.placements.len());
+        // Every entry must be a genuine improvement over every entry before
+        // it, not just over its own run's local starting point - the exact
+        // property the unconditional-push bug violated.
+        for pair in response.history.windows(2) {
+            let (earlier, later) = (&pair[0], &pair[1]);
+            assert!(
+                later.unplaced_count < earlier.unplaced_count
+                    || (later.unplaced_count == earlier.unplaced_count && later.placements.len() < earlier.placements.len())
+                    || (later.unplaced_count == earlier.unplaced_count && later.placements.len() == earlier.placements.len() && later.utilisation > earlier.utilisation),
+                "history entry at generation {} is not actually better than the one before it at generation {} (unplaced {} vs {}, sheets {} vs {}, util {} vs {})",
+                later.generation,
+                earlier.generation,
+                later.unplaced_count,
+                earlier.unplaced_count,
+                later.placements.len(),
+                earlier.placements.len(),
+                later.utilisation,
+                earlier.utilisation
+            );
+        }
     }
 
     #[test]
@@ -1154,7 +1617,7 @@ mod tests {
         // generation), so this needs a thread-safe counter, not a plain
         // captured `let mut`.
         let checks = std::sync::atomic::AtomicUsize::new(0);
-        let response = run_nest_with_progress(request, |_, _, _| {}, || checks.fetch_add(1, Ordering::Relaxed) >= 2, |_, _, _| {})
+        let response = run_nest_with_progress(request, |_, _, _| {}, || checks.fetch_add(1, Ordering::Relaxed) >= 2, |_, _, _| {}, |_| {}, |_| {})
             .expect("should still return the best result found so far");
 
         assert!(response.cancelled);
@@ -1171,7 +1634,7 @@ mod tests {
         let ticks = std::sync::Mutex::new(Vec::new());
         let response = run_nest_with_progress(request, |_, _, _| {}, || false, |generation, done, total| {
             ticks.lock().unwrap().push((generation, done, total));
-        })
+        }, |_| {}, |_| {})
         .expect("should nest successfully");
 
         let ticks = ticks.into_inner().unwrap();
@@ -1199,8 +1662,8 @@ mod tests {
             config: config(20),
         };
 
-        let response =
-            run_nest_with_progress(request, |_, _, _| {}, || true, |_, _, _| {}).expect("an immediate cancel must still succeed gracefully");
+        let response = run_nest_with_progress(request, |_, _, _| {}, || true, |_, _, _| {}, |_| {}, |_| {})
+            .expect("an immediate cancel must still succeed gracefully");
 
         assert!(response.cancelled);
         assert_eq!(response.placements.len(), 0);
@@ -1353,6 +1816,186 @@ mod tests {
         assert!(!polygons.is_empty());
     }
 
+    /// Regression test for a real low-density job clustering in an
+    /// arbitrary sheet corner instead of the origin - see
+    /// `nesting::placement`'s `FIRST_PART_CONTACT_TOLERANCE` doc comment for
+    /// the root cause (the sheet's first part, under a TightFit-family
+    /// placement type, used to pick whichever rotation/corner had the
+    /// single highest raw border-contact score, with no origin preference
+    /// unless two candidates tied exactly). 20 real, irregular parts on a
+    /// 500x500 sheet - before the fix, this fixture's whole cluster landed
+    /// at x=[328,500]/y=[304,500], nowhere near the origin.
+    ///
+    /// This fixture draws the sheet AND all 20 parts already positioned
+    /// inside the sheet's own outline (a reference layout for comparison,
+    /// not a "here are 21 separate shapes, assign roles yourself" import) -
+    /// import_dxf's containment-based tree-building (build_polygon_tree)
+    /// would treat every part as a *hole* of the sheet polygon since each
+    /// one is geometrically inside it, collapsing "1 sheet + 20 parts" down
+    /// to a single polygon with 20 children. Bypassed here by reading the
+    /// flat, pre-tree entity list directly instead - this test cares about
+    /// placement quality, not import behavior.
+    #[test]
+    fn run_nest_anchors_a_low_density_job_near_the_sheet_origin() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/supernesting 20part 500x500.dxf");
+        let drawing = dxf::Drawing::load_file(path).expect("fixture should parse");
+        let flat = geometry::dxf_import::entities_to_polygons(drawing.entities(), 0.3);
+
+        let area = |pts: &[geometry::point::Point]| -> f64 {
+            let mut a = 0.0;
+            for j in 0..pts.len() {
+                let k = (j + 1) % pts.len();
+                a += pts[j].x * pts[k].y - pts[k].x * pts[j].y;
+            }
+            a.abs() / 2.0
+        };
+        let (sheet_idx, _) = flat.iter().enumerate().max_by(|(_, a), (_, b)| area(&a.points).total_cmp(&area(&b.points))).unwrap();
+        let sheet = PolygonDto::from(&flat[sheet_idx]);
+        let parts: Vec<PartDto> = flat
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != sheet_idx)
+            .map(|(_, p)| PartDto { polygon: PolygonDto::from(p), quantity: 1 })
+            .collect();
+
+        let mut cfg = config(5);
+        cfg.population_size = 10;
+        cfg.rotations = 4;
+        cfg.seed = 1;
+        cfg.placement_type = PlacementTypeDto::GravityCorrective; // the GUI's actual default
+        let request = RunNestRequest { sheets: vec![sheet], parts, config: cfg };
+
+        let response = run_nest(request).expect("should nest");
+        assert_eq!(response.unplaced_count, 0);
+
+        // id `k` in placements maps back to flat[k] (parts was built by
+        // enumerating flat, skipping sheet_idx, quantity 1 each - so
+        // expand_parts's sequential id assignment lines up 1:1 with flat's
+        // own index order).
+        let min_x = response.placements[0]
+            .parts
+            .iter()
+            .flat_map(|p| {
+                let rad = p.rotation.to_radians();
+                let (cos, sin) = (rad.cos(), rad.sin());
+                flat[p.id].points.iter().map(move |pt| pt.x * cos - pt.y * sin + p.x)
+            })
+            .fold(f64::MAX, f64::min);
+        let min_y = response.placements[0]
+            .parts
+            .iter()
+            .flat_map(|p| {
+                let rad = p.rotation.to_radians();
+                let (cos, sin) = (rad.cos(), rad.sin());
+                flat[p.id].points.iter().map(move |pt| pt.x * sin + pt.y * cos + p.y)
+            })
+            .fold(f64::MAX, f64::min);
+        assert!(min_x < 10.0, "pack should start near the sheet's left edge, min_x was {min_x:.1}");
+        assert!(min_y < 10.0, "pack should start near the sheet's top edge, min_y was {min_y:.1}");
+    }
+
+    /// Not a test - a one-off generator, run manually (`cargo test -p
+    /// deepnest-tauri --bin deepnest-tauri generate_importable_supernesting_fixture
+    /// -- --ignored --nocapture`), for a version of "supernesting 20part
+    /// 500x500.dxf" that actually imports as 21 separate shapes instead of
+    /// 1 shape with 20 holes - see `debug_real_import_of_supernesting_fixture`
+    /// below for why the original doesn't: it draws every part already
+    /// positioned *inside* the sheet's own outline, which the importer's
+    /// (correct, for real drilled-hole parts) containment-based tree-
+    /// building treats as holes of the sheet. Moves the same 20 part
+    /// shapes into a grid well clear of the sheet instead, so BROWSE...
+    /// produces a normal "assign SHEET/PART roles yourself" import.
+    #[test]
+    #[ignore]
+    fn generate_importable_supernesting_fixture() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/supernesting 20part 500x500.dxf");
+        let drawing = dxf::Drawing::load_file(path).expect("fixture should parse");
+        let flat = geometry::dxf_import::entities_to_polygons(drawing.entities(), 0.3);
+
+        let area = |pts: &[geometry::point::Point]| -> f64 {
+            let mut a = 0.0;
+            for j in 0..pts.len() {
+                let k = (j + 1) % pts.len();
+                a += pts[j].x * pts[k].y - pts[k].x * pts[j].y;
+            }
+            a.abs() / 2.0
+        };
+        let (sheet_idx, _) = flat.iter().enumerate().max_by(|(_, a), (_, b)| area(&a.points).total_cmp(&area(&b.points))).unwrap();
+
+        let mut out = dxf::Drawing::new();
+        out.header.version = dxf::enums::AcadVersion::R2000;
+
+        let add_polyline = |out: &mut dxf::Drawing, layer: &str, points: &[(f64, f64)]| {
+            let mut poly = dxf::entities::LwPolyline {
+                vertices: points.iter().map(|&(x, y)| dxf::LwPolylineVertex { x, y, bulge: 0.0, ..Default::default() }).collect(),
+                ..Default::default()
+            };
+            poly.set_is_closed(true);
+            out.add_entity(dxf::entities::Entity {
+                common: dxf::entities::EntityCommon { layer: layer.to_string(), ..Default::default() },
+                specific: dxf::entities::EntityType::LwPolyline(poly),
+            });
+        };
+
+        // The sheet, untouched.
+        let sheet_points: Vec<(f64, f64)> = flat[sheet_idx].points.iter().map(|p| (p.x, p.y)).collect();
+        add_polyline(&mut out, &flat[sheet_idx].layer, &sheet_points);
+
+        // Every part, translated into a grid starting well clear of the
+        // sheet's own [0,500]x[0,500] footprint (each part's own local
+        // bounding box is roughly 33x45, so an 80x80 grid cell leaves
+        // generous clearance).
+        const COLS: usize = 5;
+        const CELL: f64 = 80.0;
+        const START_X: f64 = 600.0;
+        let mut col = 0usize;
+        let mut row = 0usize;
+        for (i, p) in flat.iter().enumerate() {
+            if i == sheet_idx {
+                continue;
+            }
+            let bounds = geometry::polygon::get_polygon_bounds(&p.points).expect("part always has points");
+            let dx = START_X + (col as f64) * CELL - bounds.x;
+            let dy = (row as f64) * CELL - bounds.y;
+            let points: Vec<(f64, f64)> = p.points.iter().map(|pt| (pt.x + dx, pt.y + dy)).collect();
+            add_polyline(&mut out, &p.layer, &points);
+            col += 1;
+            if col >= COLS {
+                col = 0;
+                row += 1;
+            }
+        }
+
+        let out_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/supernesting 20part 500x500 - importable.dxf");
+        out.save_file(out_path).expect("should write fixture");
+        eprintln!("wrote {out_path}");
+
+        // Round-trip check: this must import as 21 separate top-level
+        // shapes with no children, unlike the original.
+        let reimported = import_dxf(out_path, 0.3).expect("generated fixture should parse");
+        eprintln!("re-imported as {} top-level shape(s)", reimported.len());
+        assert_eq!(reimported.len(), 21, "should be 1 sheet + 20 parts, all separate");
+        assert!(reimported.iter().all(|p| p.children.is_empty()), "none of these should have been swallowed as holes");
+    }
+
+    /// Documents real, correct-but-surprising behavior: "supernesting
+    /// 20part 500x500.dxf" (a reference/comparison layout, parts drawn
+    /// already positioned *inside* the sheet's own outline) imports as a
+    /// *single* shape with 20 children, not 21 separate shapes -
+    /// `build_polygon_tree`'s containment-based hole detection is exactly
+    /// what real drilled-hole parts need, and can't distinguish "this
+    /// contained shape is a manufacturing hole" from "this contained shape
+    /// is actually a separate part that happens to be drawn overlapping the
+    /// sheet." See `generate_importable_supernesting_fixture` above for a
+    /// version of this same geometry that imports as 21 separate shapes.
+    #[test]
+    fn import_dxf_treats_parts_drawn_inside_the_sheet_outline_as_its_holes() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/supernesting 20part 500x500.dxf");
+        let polygons = import_dxf(path, 0.3).expect("fixture should parse");
+        assert_eq!(polygons.len(), 1, "the 20 parts should have collapsed into the sheet's own children, not stayed separate");
+        assert_eq!(polygons[0].children.len(), 20);
+    }
+
     #[test]
     fn import_dxf_reports_a_missing_file_as_an_error_not_a_panic() {
         assert!(import_dxf("does-not-exist.dxf", 0.3).is_err());
@@ -1425,57 +2068,4 @@ mod tests {
         assert!(!is_better_result(0, 3, 90.0, 0, 3, 90.0));
     }
 
-    // Live preview - commented out along with `run_nest_with_progress`'s
-    // `on_generation_improved`/`on_start` params themselves (see
-    // `NestConfigDto::live_visualization`'s own comment for why), since
-    // this test exercised exactly those two hooks.
-    //
-    // /// `on_generation_improved`/`on_start` are what `run_nest_command`'s
-    // /// `live_visualization` path relies on: `on_start` must fire exactly
-    // /// once, before anything else, with the true id->shape map; `on_generation_improved`
-    // /// must fire at the *same* trigger `RunNestResponse::history` already
-    // /// uses (not once per generation regardless of whether anything
-    // /// changed), always carrying a full, non-empty placement, and the
-    // /// number of calls must exactly match `history.len()`.
-    // #[test]
-    // fn run_nest_with_progress_reports_full_placements_only_on_genuine_improvements() {
-    //     let request = RunNestRequest {
-    //         sheets: vec![square_dto(100.0)],
-    //         parts: vec![PartDto { polygon: square_dto(10.0), quantity: 3 }],
-    //         config: config(5),
-    //     };
-    //
-    //     let mut start_seen = 0;
-    //     let improvements = std::sync::Mutex::new(Vec::new());
-    //     let response = run_nest_with_progress(
-    //         request,
-    //         |_, _, _| {},
-    //         || false,
-    //         |_, _, _| {},
-    //         |generation, generations, result: &PlaceResult| {
-    //             assert_eq!(generations, 5);
-    //             assert!(!result.placements.is_empty(), "every reported improvement should carry a real, non-empty placement");
-    //             improvements.lock().unwrap().push((generation, result.fitness, result.unplaced_count));
-    //         },
-    //         |parts_by_id| {
-    //             start_seen += 1;
-    //             assert_eq!(parts_by_id.len(), 3, "on_start's map should cover every part instance, not just shapes");
-    //         },
-    //     )
-    //     .expect("should nest successfully");
-    //
-    //     assert_eq!(start_seen, 1, "on_start should fire exactly once, before any placement");
-    //     assert_eq!(response.unplaced_count, 0);
-    //
-    //     let improvements = improvements.into_inner().unwrap();
-    //     assert_eq!(improvements.len(), response.history.len(), "on_generation_improved should fire exactly once per history entry, no more");
-    //     assert!(!improvements.is_empty(), "at least the first placed individual should count as an improvement");
-    //     let (last_generation, last_fitness, last_unplaced) = *improvements.last().unwrap();
-    //     assert_eq!(last_fitness, response.fitness, "the last reported improvement should be the same result reported at the top level");
-    //     assert_eq!(last_unplaced, response.unplaced_count);
-    //     assert_eq!(last_generation, response.history.last().unwrap().generation);
-    //     for pair in improvements.windows(2) {
-    //         assert!(pair[0].0 <= pair[1].0, "generations should be non-decreasing across reported improvements");
-    //     }
-    // }
 }

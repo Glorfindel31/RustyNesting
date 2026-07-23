@@ -34,6 +34,23 @@ use crate::cache::NfpCache;
 use crate::ga::{is_better_nest, GeneticAlgorithm};
 use crate::placement::{place_parts, NestPart, PlaceResult, PlacementConfig};
 
+/// One individual's genes (`placement`/`rotation`, the same shape
+/// `ga::Individual` carries) alongside the `PlaceResult` they produced -
+/// `run_generation` returns these instead of bare `PlaceResult`s because
+/// `GeneticAlgorithm::generation()` (called at the end of this same
+/// function, once every individual has a fitness) replaces `ga.population`
+/// with the *next* generation before returning, so a caller can't look a
+/// gene back up from `ga.population` afterward. A caller that wants to
+/// replay exactly how a particular result was built (e.g. re-running
+/// `place_parts` a second time with tracing hooks live) needs the gene
+/// captured here, at evaluation time, or not at all.
+#[derive(Clone, Debug)]
+pub struct EvaluatedIndividual {
+    pub placement: Vec<usize>,
+    pub rotation: Vec<f64>,
+    pub result: PlaceResult,
+}
+
 /// Evaluates every individual in the current generation's population in
 /// parallel, assigns each one's `fitness`, then advances the GA
 /// (`GeneticAlgorithm::generation()`) - unless `should_cancel` cut this
@@ -95,12 +112,12 @@ pub fn run_generation(
     should_cancel: &(impl Fn() -> bool + Sync),
     on_individual_placed: &(impl Fn(usize, usize) + Sync),
     cache: &NfpCache,
-) -> Vec<PlaceResult> {
+) -> Vec<EvaluatedIndividual> {
     let total = ga.population.iter().filter(|ind| ind.fitness.is_none()).count();
     on_individual_placed(0, total);
     let completed = AtomicUsize::new(0);
 
-    let evaluated: Vec<(usize, PlaceResult)> = ga
+    let evaluated: Vec<(usize, EvaluatedIndividual)> = ga
         .population
         .par_iter()
         .enumerate()
@@ -128,18 +145,18 @@ pub fn run_generation(
             // hadn't started yet: `place_parts` itself bails out of its
             // per-part loop within a fraction of a second of the flag
             // flipping, instead of running to completion regardless.
-            let result = place_parts(sheets, nest_parts, placement_config, cache, should_cancel, &|_, _| {})?;
+            let result = place_parts(sheets, nest_parts, placement_config, cache, should_cancel, &|_, _| {}, &|_, _, _| {})?;
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             on_individual_placed(done, total);
-            Some((idx, result))
+            Some((idx, EvaluatedIndividual { placement: individual.placement.clone(), rotation: individual.rotation.clone(), result }))
         })
         .collect();
 
-    for (idx, result) in &evaluated {
-        ga.population[*idx].fitness = Some(result.fitness);
+    for (idx, evaluated) in &evaluated {
+        ga.population[*idx].fitness = Some(evaluated.result.fitness);
     }
 
-    let results: Vec<PlaceResult> = evaluated.into_iter().map(|(_, result)| result).collect();
+    let results: Vec<EvaluatedIndividual> = evaluated.into_iter().map(|(_, evaluated)| evaluated).collect();
     if ga.population.iter().all(|ind| ind.fitness.is_some()) {
         ga.generation();
     }
@@ -181,9 +198,9 @@ pub fn run(
             break;
         }
         let results = run_generation(ga, sheets, parts_by_id, shape_ids, placement_config, should_cancel, on_individual_placed, &cache);
-        for result in results {
-            if best.as_ref().is_none_or(|b| is_better_nest(&result, b)) {
-                best = Some(result);
+        for evaluated in results {
+            if best.as_ref().is_none_or(|b| is_better_nest(&evaluated.result, b)) {
+                best = Some(evaluated.result);
             }
         }
         // `run_generation` may have been cut short mid-population by the
@@ -245,8 +262,8 @@ mod tests {
         let cache = NfpCache::new();
         let results = run_generation(&mut ga, &sheets, &parts_by_id, &HashMap::new(), &cfg, &|| false, &|_, _| {}, &cache);
         assert_eq!(results.len(), 6);
-        for result in &results {
-            assert_eq!(result.unplaced_count, 0, "4 small squares should all fit on one 100x100 sheet");
+        for evaluated in &results {
+            assert_eq!(evaluated.result.unplaced_count, 0, "4 small squares should all fit on one 100x100 sheet");
         }
 
         // generation() already replaced ga.population with the next

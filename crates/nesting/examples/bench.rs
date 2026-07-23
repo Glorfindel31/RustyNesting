@@ -229,7 +229,8 @@ fn main() {
             generation += 1;
             gen_times_ms.push(gen_ms);
 
-            for r in &results {
+            for evaluated in &results {
+                let r = &evaluated.result;
                 if r.fitness < best_fitness {
                     best_fitness = r.fitness;
                     best_unplaced = r.unplaced_count;
@@ -347,7 +348,8 @@ fn run_grid() {
                         let results = dispatch::run_generation(&mut ga, &sheets, &parts_by_id, &HashMap::new(), &placement_config, &|| false, &|_, _| {}, &cache);
                         gen_times_ms.push(gen_start.elapsed().as_millis());
 
-                        for r in &results {
+                        for evaluated in &results {
+                            let r = &evaluated.result;
                             if r.fitness < best_fitness {
                                 best_fitness = r.fitness;
                                 best_unplaced = r.unplaced_count;

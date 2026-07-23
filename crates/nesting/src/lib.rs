@@ -8,3 +8,4 @@ pub mod consolidation;
 pub mod dispatch;
 pub mod ga;
 pub mod placement;
+pub mod repack;

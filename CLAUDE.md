@@ -42,7 +42,7 @@ generations, replacing the original's per-individual `background-start`/
 no separate worker process to message - `nesting::dispatch` already
 parallelizes a generation in-process via rayon). **The frontend is now
 wired too, but via a new minimal UI, not an adaptation of the legacy
-one** - `frontend/index.html`/`app.js`/`app.css` were rewritten from
+one** - `frontend/dist/index.html`/`app.js`/`app.css` were rewritten from
 scratch (dark grey/brutalist, no framework) to call
 `import_dxf_command`/`run_nest_command` directly; the legacy
 `frontend/deepnest.js`/`ui/**` (~4700 lines, all Node/Electron-integrated)
@@ -84,14 +84,15 @@ cargo run -p deepnest-tauri        # launch the Tauri shell (plain cargo run wor
 
 `tauri-cli` is installed (`cargo install tauri-cli`) for later use
 (`cargo tauri build`/`cargo tauri icon`), but isn't required for `dev` —
-the frontend has no bundler, so a plain `cargo run` embeds `frontend/` as-is.
+the frontend has no bundler, so a plain `cargo run` embeds `frontend/dist/`
+as-is.
 
 **Resolved by replacement, not adaptation**: `frontend/index.html` used to
 be the Electron app's original file (inline module script calling
 `require("electron")`, which throws in the Tauri webview - no `require`
 global there). It's now a small **new** hand-written UI
-(`index.html`/`app.js`/`app.css`, dark grey/brutalist/no framework) that
-calls `import_dxf_command`/`run_nest_command` directly via
+(`index.html`/`app.js`/`app.css`/`render.js`, dark grey/brutalist/no
+framework) that calls `import_dxf_command`/`run_nest_command` directly via
 `window.__TAURI__.core.invoke`. This was a deliberate choice, not a
 default: adapting the legacy Ractive UI (`frontend/deepnest.js`,
 `frontend/ui/**`, ~4700 lines) turned out to need far more than fixing one
@@ -101,6 +102,18 @@ default: adapting the legacy Ractive UI (`frontend/deepnest.js`,
 is for a feature the DXF-only scope change already dropped. Those legacy
 files are kept in the tree, unreferenced, as reference only - see
 `docs/PORT_STATUS.md`'s Phase 6 table for the full reasoning.
+
+**`frontendDist` points at `frontend/dist/`, not `frontend/` itself** - the
+four live files (`index.html`/`app.js`/`app.css`/`render.js`) live in that
+subdirectory; the unreferenced legacy files listed above stay directly
+under `frontend/`. This split exists because Tauri embeds *everything*
+under `frontendDist` into the built binary regardless of whether
+`index.html` ever references it - confirmed by measurement, removing the
+legacy files dropped the release binary from ~13.36MB to ~11.27MB. Keeping
+them as reference material in the repo (per the paragraph above) while not
+shipping them in the app is exactly what this directory split is for -
+don't move the live files back up to `frontend/` directly, and don't move
+the legacy files into `frontend/dist/`.
 
 ## Reference implementation (read-only)
 
@@ -128,12 +141,16 @@ deepnest-rust/
                                   #   - depends on geometry; see module list below
   src-tauri/                     # Tauri v2 shell + commands (import_dxf, run_nest) -
                                   #   see module list below
-  frontend/                      # index.html/app.js/app.css: new minimal UI (Phase 6), the
-                                  #   only files actually served/referenced. deepnest.js,
-                                  #   svgparser.js, ui/**, util/**, style.css are the original
-                                  #   Electron app's files, kept unreferenced as reference only
-                                  #   (see PORT_STATUS's Phase 6 table for why they weren't
-                                  #   adapted instead)
+  frontend/
+    dist/                         # index.html/app.js/app.css/render.js: new minimal UI, the
+                                  #   only files actually served/referenced - frontendDist
+                                  #   points here specifically, not at frontend/ itself, so the
+                                  #   legacy files below never get bundled into the built binary
+                                  #   (see the "Build/run commands" section for the measurement)
+                                  # deepnest.js, svgparser.js, ui/**, util/**, style.css (this
+                                  #   level, not dist/) are the original Electron app's files,
+                                  #   kept unreferenced as reference only (see PORT_STATUS's
+                                  #   Phase 6 table for why they weren't adapted instead)
   docs/
     PORT_STATUS.md               # the one living tracking doc — check this first
   tests/

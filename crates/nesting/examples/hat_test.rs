@@ -1,23 +1,47 @@
 //! One-off benchmark against a real third-party DXF fixture: the aperiodic
 //! "hat" monotile (github.com/christianp/aperiodic-monotile/hat-monotile.dxf,
-//! copied to `tests/fixtures/hat-monotile.dxf`), 252 copies on a single
+//! copied to `tests/fixtures/hat-monotile.dxf`), N copies on a single
 //! 500x500mm sheet, no margin/spacing. The user ran this same job on the
-//! "supernesting" online tool and got 78.57% utilisation in 60 seconds -
-//! this checks whether this project's NFP+GA pipeline can match or beat
-//! that on the same job.
+//! "supernesting" online tool at N=2/20/252 and got 0.62%/6.24%/78.57%
+//! utilisation respectively - this checks whether this project's NFP+GA
+//! pipeline can match or beat that on the same job.
 //!
-//! Usage: `cargo run --release -p nesting --example hat_test -- [seconds] [rotations] [population_size] [mutation_rate] [placement_type]`
-//! (defaults: 60s, 12 rotations, population 20, mutation 10, gravity - the
-//! hat is a 13-sided non-rectangular shape, so the rectangular-parts-
-//! prefer-90-degrees quirk documented for the other fixtures doesn't
-//! obviously apply here. A quick sweep found `rotations=6` (60-degree
-//! steps, matching the hat's triangular/kite construction) a clear
-//! standout over 3/4/5/8/10/12/16/24 - confirmed no mirroring was used in
-//! the 78.57% comparison result, so any remaining gap is a real
-//! search-quality question, not a missing reflection feature.
+//! Usage: `cargo run --release -p nesting --example hat_test -- [seconds] [rotations] [population_size] [mutation_rate] [placement_type] [part_count]`
+//! (defaults: 60s, 12 rotations, population 20, mutation 10, gravity, 252
+//! parts). The hat is a 13-sided non-rectangular shape, so the
+//! rectangular-parts-prefer-90-degrees quirk documented for the other
+//! fixtures doesn't apply here - but **`rotations=2` is the actual
+//! standout, not a wider grid**: `compare_supernesting` (a separate example)
+//! measured supernesting's own reference layouts directly and found every
+//! placed hat, across all three fixtures, uses just one of two rotations
+//! exactly 180 degrees apart (no mirroring). A wider grid (6/12/24) only
+//! helps if something downstream actually *measures* which of those angles
+//! fits best at each specific spot before committing to one - which
+//! `place_parts` didn't do for a sheet's 2nd part onward until it gained a
+//! real per-position rotation search (every configured angle scored via
+//! `try_place_part_on_sheet`'s real contact/area metric, keeping the best -
+//! previously only a sheet's very first part got any rotation comparison at
+//! all). With that search in place, `rotations=2` + `tightfit` reproduces
+//! supernesting's 0.62%/6.24%/78.57% exactly (0 unplaced) for N=2/20/252, on
+//! generation 1 - no GA evolution even needed for this particular
+//! tessellation. `GravityCorrective` does *not* reach the same figure at
+//! `rotations=2` (plateaus at 75.76% for N=252): it deliberately skips the
+//! contact-search for a sheet's 2nd part (cheap `Gravity` scoring instead,
+//! see its own doc comment), which is fine for a mixed-shape job with few
+//! parts per sheet but throws away exactly the search this tessellation
+//! depends on getting right early - `tightfit` is the one to reach for here.
 //!
-//! `placement_type` is one of `gravity`/`box`/`convexhull`/`tightfit` -
-//! `tightfit` (`PlacementType::TightFit`) was added specifically because
+//! `part_count` should match one of the real
+//! `tests/fixtures/supernesting {2,20,252}part(s) 500x500.dxf` reference
+//! layouts (see `compare_supernesting` for how their ground-truth
+//! utilisation numbers were measured directly from those files rather than
+//! assumed) - `target_utilisation_pct` looks up the matching reference
+//! figure for whichever `part_count` is requested, `0.0` (no target, just
+//! reports) for anything else.
+//!
+//! `placement_type` is one of `gravity`/`box`/`convexhull`/`tightfit`/
+//! `gravitytightfit`/`gravitycorrective` - `tightfit` (`PlacementType::TightFit`)
+//! was added specifically because
 //! `Gravity`/`Box`/`ConvexHull` all plateaued around 70-71% utilisation
 //! regardless of rotation/population/mutation tuning: they score by the
 //! aggregate bounding shape of everything placed so far, never by how
@@ -38,9 +62,19 @@ use nesting::ga::{is_better_nest, GaConfig, GeneticAlgorithm};
 use nesting::placement::{place_parts, NestPart, PlaceResult, PlacedPart, PlacementConfig, PlacementType, DEFAULT_DOMINANT_PART_AREA_THRESHOLD};
 
 const SHEET_SIZE: f64 = 500.0;
-const PART_COUNT: usize = 252;
 const CURVE_TOLERANCE: f64 = 0.1;
-const TARGET_UTILISATION_PCT: f64 = 78.57;
+
+/// Reference utilisation measured directly off supernesting's own reference
+/// layouts (see `compare_supernesting`) for whichever `part_count` this run
+/// was asked for - `0.0` (no target, just reports) for anything else.
+fn target_utilisation_pct(part_count: usize) -> f64 {
+    match part_count {
+        2 => 0.62,
+        20 => 6.24,
+        252 => 78.57,
+        _ => 0.0,
+    }
+}
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -57,9 +91,12 @@ fn main() {
         Some("convexhull") => PlacementType::ConvexHull,
         Some("tightfit") => PlacementType::TightFit,
         Some("gravitytightfit") => PlacementType::GravityTightFit,
+        Some("gravitycorrective") => PlacementType::GravityCorrective,
         Some("gravity") | None => PlacementType::Gravity,
-        Some(other) => panic!("unknown placement_type {other:?} - expected gravity/box/convexhull/tightfit/gravitytightfit"),
+        Some(other) => panic!("unknown placement_type {other:?} - expected gravity/box/convexhull/tightfit/gravitytightfit/gravitycorrective"),
     };
+    let part_count: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(252);
+    let target_utilisation_pct = target_utilisation_pct(part_count);
 
     let fixture = repo_root().join("tests/fixtures/hat-monotile.dxf");
     let drawing = Drawing::load_file(&fixture).unwrap_or_else(|e| panic!("couldn't parse {}: {e}", fixture.display()));
@@ -86,11 +123,11 @@ fn main() {
     // for why the first run of this benchmark only completed ~2.6
     // generations in 60s.
     let mut shape_ids = std::collections::HashMap::new();
-    for id in 0..PART_COUNT {
+    for id in 0..part_count {
         parts_by_id.insert(id, padded_hat.clone());
         shape_ids.insert(id, 0usize);
     }
-    let adam: Vec<usize> = (0..PART_COUNT).collect();
+    let adam: Vec<usize> = (0..part_count).collect();
 
     let sheet_raw = vec![Point::new(0.0, 0.0), Point::new(SHEET_SIZE, 0.0), Point::new(SHEET_SIZE, SHEET_SIZE), Point::new(0.0, SHEET_SIZE)];
     let sheet_points = prepare_sheet(&sheet_raw, 0.0, 0.0).expect("500x500 sheet should be usable at zero margin/spacing");
@@ -102,7 +139,7 @@ fn main() {
     let mut ga = GeneticAlgorithm::new(adam, ga_config, Vec::new(), 0);
 
     println!(
-        "running: {PART_COUNT} hats on a {SHEET_SIZE}x{SHEET_SIZE}mm sheet, placement={placement_type:?}, rotations={rotations}, budget={run_seconds}s, target={TARGET_UTILISATION_PCT}%"
+        "running: {part_count} hats on a {SHEET_SIZE}x{SHEET_SIZE}mm sheet, placement={placement_type:?}, rotations={rotations}, budget={run_seconds}s, target={target_utilisation_pct}%"
     );
 
     // Manual generation loop (mirroring `dispatch::run`'s own internals)
@@ -120,7 +157,8 @@ fn main() {
     while !should_cancel() {
         generation += 1;
         let results = dispatch::run_generation(&mut ga, &sheets, &parts_by_id, &shape_ids, &placement_config, &should_cancel, &|_, _| {}, &cache);
-        for result in results {
+        for evaluated in results {
+            let result = evaluated.result;
             if best.as_ref().is_none_or(|b| is_better_nest(&result, b)) {
                 let elapsed_s = start.elapsed().as_secs_f64();
                 println!(
@@ -141,18 +179,20 @@ fn main() {
 
     match best {
         Some(r) => {
-            let placed = PART_COUNT - r.unplaced_count;
+            let placed = part_count - r.unplaced_count;
             let sheet_area = polygon_material_area(&sheets[0]);
             let placed_area: f64 = r.placements.iter().flat_map(|s| &s.parts).map(|_| raw_area).sum();
             let utilisation_of_placed = (placed_area / sheet_area) * 100.0;
             println!(
-                "done in {elapsed:.1}s: placed {placed}/{PART_COUNT}, utilisation={utilisation_of_placed:.2}% (target {TARGET_UTILISATION_PCT}%), reported_utilisation={:.2}%",
+                "done in {elapsed:.1}s: placed {placed}/{part_count}, utilisation={utilisation_of_placed:.2}% (target {target_utilisation_pct}%), reported_utilisation={:.2}%",
                 r.utilisation
             );
-            if utilisation_of_placed >= TARGET_UTILISATION_PCT {
+            if target_utilisation_pct <= 0.0 {
+                println!("(no reference target for {part_count} parts - just reporting)");
+            } else if utilisation_of_placed >= target_utilisation_pct {
                 println!("BEAT/MATCHED the target.");
             } else {
-                println!("below target by {:.2} points.", TARGET_UTILISATION_PCT - utilisation_of_placed);
+                println!("below target by {:.2} points.", target_utilisation_pct - utilisation_of_placed);
             }
 
             write_history_json(&hat.points, SHEET_SIZE, &history);
@@ -165,7 +205,7 @@ fn main() {
     // is the same size), observing each individual part's placement via
     // `on_part_placed` as it happens - not generation-level "best so far"
     // jumps like `history` above, the literal one-part-at-a-time view.
-    let step_parts: Vec<NestPart> = (0..PART_COUNT).map(|id| NestPart { id, source_id: 0, polygon: padded_hat.clone(), rotation: 0.0 }).collect();
+    let step_parts: Vec<NestPart> = (0..part_count).map(|id| NestPart { id, source_id: 0, polygon: padded_hat.clone(), rotation: 0.0 }).collect();
     let step_cache = NfpCache::new();
     let steps: std::sync::Mutex<Vec<Vec<PlacedPart>>> = std::sync::Mutex::new(Vec::new());
     let _ = place_parts(&sheets, step_parts, &placement_config, &step_cache, &|| false, &|_sheet_idx, p: &PlacedPart| {
@@ -173,8 +213,8 @@ fn main() {
         let mut snapshot = frames.last().cloned().unwrap_or_default();
         snapshot.push(*p);
         frames.push(snapshot);
-    });
-    write_steps_json(&hat.points, SHEET_SIZE, raw_area, &steps.into_inner().expect("single-threaded call, lock never poisoned"));
+    }, &|_, _, _| {});
+    write_steps_json(&hat.points, SHEET_SIZE, raw_area, part_count, &steps.into_inner().expect("single-threaded call, lock never poisoned"));
 }
 
 /// Writes every improving arrangement (generation, elapsed time, and every
@@ -218,7 +258,7 @@ fn write_history_json(hat_points: &[Point], sheet_size: f64, history: &[(usize, 
 /// individual part placed, in order - `generation` is repurposed as a
 /// 1-based part-placement index, `elapsed_s`/`sheets_used` are placeholders
 /// (this is a single direct `place_parts` call, not a timed GA run).
-fn write_steps_json(hat_points: &[Point], sheet_size: f64, single_part_area: f64, steps: &[Vec<PlacedPart>]) {
+fn write_steps_json(hat_points: &[Point], sheet_size: f64, single_part_area: f64, part_count: usize, steps: &[Vec<PlacedPart>]) {
     let points_json: String = hat_points.iter().map(|p| format!("[{:.3},{:.3}]", p.x, p.y)).collect::<Vec<_>>().join(",");
     let sheet_area = sheet_size * sheet_size;
 
@@ -232,7 +272,7 @@ fn write_steps_json(hat_points: &[Point], sheet_size: f64, single_part_area: f64
             format!(
                 "{{\"generation\":{},\"elapsed_s\":0,\"sheets_used\":1,\"unplaced\":{},\"utilisation\":{utilisation:.2},\"parts\":[{parts_json}]}}",
                 idx + 1,
-                PART_COUNT - snapshot.len(),
+                part_count - snapshot.len(),
             )
         })
         .collect::<Vec<_>>()

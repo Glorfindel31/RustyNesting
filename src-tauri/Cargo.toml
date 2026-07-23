@@ -4,10 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [build-dependencies]
-tauri-build = "2"
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = "2"
+tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 geometry = { path = "../crates/geometry" }
 nesting = { path = "../crates/nesting" }
