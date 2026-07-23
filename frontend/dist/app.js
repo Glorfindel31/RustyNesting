@@ -82,6 +82,14 @@ function setBusy(spinnerId, busy) {
 // `kind` picks a color (see app.css's `.log-*` rules): "run" for a new
 // escalating attempt starting, "best" for one that just beat every attempt
 // before it, unset for plain informational lines.
+// Capped, not unbounded - "nest-tick" alone fires once per individual
+// placed inside a single generation (see its own listener's comment below),
+// so a long session running several multi-generation nests could otherwise
+// accumulate thousands of never-GC'd .log-line divs in a window that's
+// never reloaded. The on-disk log (see the comment below) keeps the full,
+// uncapped history regardless - this only bounds what stays live in the DOM.
+const CONSOLE_LOG_MAX_LINES = 500;
+
 function logLine(message, kind) {
   const node = el("console-log");
   const time = new Date().toLocaleTimeString();
@@ -90,6 +98,9 @@ function logLine(message, kind) {
   entry.className = kind ? `log-line log-${kind}` : "log-line";
   entry.textContent = line;
   node.appendChild(entry);
+  while (node.children.length > CONSOLE_LOG_MAX_LINES) {
+    node.removeChild(node.firstChild);
+  }
   node.scrollTop = node.scrollHeight;
   // Fire-and-forget: also append to the on-disk log
   // (<app_log_dir>/rustynesting.log) so this history survives past the
@@ -249,10 +260,16 @@ function handleToggleSettings() {
 }
 
 async function handleBrowse() {
-  const selected = await window.__TAURI__.dialog.open({
-    multiple: true,
-    filters: [{ name: "DXF", extensions: ["dxf"] }],
-  });
+  let selected;
+  try {
+    selected = await window.__TAURI__.dialog.open({
+      multiple: true,
+      filters: [{ name: "DXF", extensions: ["dxf"] }],
+    });
+  } catch (err) {
+    logLine(`file dialog failed: ${err}`, "error");
+    return;
+  }
   if (!selected) return; // user cancelled
   const paths = Array.isArray(selected) ? selected : [selected];
   await importPaths(paths);
@@ -395,8 +412,13 @@ function buildRequest() {
   importedShapes.forEach((shape) => {
     const role = document.querySelector(`[data-role="${shape._uiId}"]`).value;
     const qty = Number(document.querySelector(`[data-qty="${shape._uiId}"]`).value);
-    if (role === "sheet") {
-      for (let n = 0; n < Math.max(qty, 1); n++) sheets.push(shapeToPolygonDto(shape));
+    if (role === "sheet" && qty > 0) {
+      // Same "qty 0 means excluded" rule PART already uses below - a SHEET
+      // row previously always contributed at least one sheet regardless of
+      // its QTY field (Math.max(qty, 1)), an undocumented asymmetry that
+      // made QTY look like it did nothing for a role where a user might
+      // reasonably expect it to work the same as it does for PART.
+      for (let n = 0; n < qty; n++) sheets.push(shapeToPolygonDto(shape));
     } else if (role === "part" && qty > 0) {
       parts.push({ polygon: shapeToPolygonDto(shape), quantity: qty });
     }
@@ -429,6 +451,15 @@ async function handleRunNest() {
   }
   if (request.parts.length === 0) {
     setStatus("run-status", t("run_need_part"), true);
+    return;
+  }
+  // A blank/invalid numeric config field becomes NaN here, which
+  // JSON.stringify serializes to `null` over the Tauri IPC boundary -
+  // caught here with a field name the user can actually act on, instead of
+  // surfacing as an opaque Rust-side deserialization failure.
+  const invalidField = Object.entries(request.config).find(([, v]) => typeof v === "number" && Number.isNaN(v));
+  if (invalidField) {
+    setStatus("run-status", t("run_invalid_config_field", { field: invalidField[0] }), true);
     return;
   }
 
@@ -666,10 +697,16 @@ async function handleExport() {
   }
   const includeSheetOutline = el("export-outline").checked;
 
-  const path = await window.__TAURI__.dialog.save({
-    defaultPath: "nest.dxf",
-    filters: [{ name: "DXF", extensions: ["dxf"] }],
-  });
+  let path;
+  try {
+    path = await window.__TAURI__.dialog.save({
+      defaultPath: "nest.dxf",
+      filters: [{ name: "DXF", extensions: ["dxf"] }],
+    });
+  } catch (err) {
+    setStatus("export-status", t("export_dialog_failed", { err }), true);
+    return;
+  }
   if (!path) return; // user cancelled
 
   const request = {

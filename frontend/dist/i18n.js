@@ -145,6 +145,7 @@ export const translations = {
     rect_invalid_size: "width and height must both be greater than 0",
     run_need_sheet: "mark at least one shape as SHEET",
     run_need_part: "mark at least one shape as PART with quantity > 0",
+    run_invalid_config_field: "\"{field}\" in the settings is not a valid number - check that field and try again",
     run_status_running: "nesting...",
     run_status_stopped: "stopped early",
     run_status_done: "done",
@@ -168,6 +169,7 @@ export const translations = {
     history_option: "#{i} gen {gen}{best} - fitness {fitness}, {unplaced} unplaced",
     history_best_suffix: " (best)",
     export_invalid_spacing: "sheet spacing must be 0 or more",
+    export_dialog_failed: "couldn't open the save dialog: {err}",
     export_status_running: "exporting...",
     export_status_done: "exported",
     dominant_closes_sheet: "CLOSES SHEET",
@@ -322,6 +324,7 @@ export const translations = {
     rect_invalid_size: "chiều rộng và chiều cao phải lớn hơn 0",
     run_need_sheet: "đánh dấu ít nhất một hình là TẤM PHÔI",
     run_need_part: "đánh dấu ít nhất một hình là CHI TIẾT với số lượng > 0",
+    run_invalid_config_field: "\"{field}\" trong thiết lập không phải là số hợp lệ - kiểm tra lại trường này và thử lại",
     run_status_running: "đang xếp hình...",
     run_status_stopped: "đã dừng sớm",
     run_status_done: "hoàn tất",
@@ -345,6 +348,7 @@ export const translations = {
     history_option: "#{i} thế hệ {gen}{best} - độ thích nghi {fitness}, {unplaced} chưa xếp",
     history_best_suffix: " (tốt nhất)",
     export_invalid_spacing: "khoảng cách giữa tấm phải từ 0 trở lên",
+    export_dialog_failed: "không mở được hộp thoại lưu tệp: {err}",
     export_status_running: "đang xuất...",
     export_status_done: "đã xuất",
     dominant_closes_sheet: "ĐÓNG TẤM",
@@ -376,13 +380,20 @@ export function getLang() {
   return currentLang;
 }
 
+// A thrown value substituted into a {err} placeholder isn't always a plain
+// string - Tauri command failures are (Result<T, String> on the Rust side),
+// but a native dialog rejection or a genuine JS bug could hand back an
+// Error object instead, which template-literal coercion stringifies to the
+// useless "[object Object]" rather than its actual message.
+const stringifyVar = (v) => (v instanceof Error ? v.message : typeof v === "object" && v !== null ? String(v.message ?? v) : String(v));
+
 // Falls back to English for any key missing from the current language -
 // what makes adding a third language later safe to do incrementally
 // (a partial dictionary degrades to English instead of showing raw keys).
 export function t(key, vars) {
   let str = translations[currentLang]?.[key] ?? translations.en[key] ?? key;
   if (vars) {
-    for (const [k, v] of Object.entries(vars)) str = str.replaceAll(`{${k}}`, v);
+    for (const [k, v] of Object.entries(vars)) str = str.replaceAll(`{${k}}`, stringifyVar(v));
   }
   return str;
 }
