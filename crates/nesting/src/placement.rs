@@ -1092,6 +1092,16 @@ pub fn place_parts(
                 let mut candidate_traces: Vec<CandidateTrace> = Vec::new();
                 let mut best_trace_idx: Option<usize> = None;
                 for _ in 0..config.rotations {
+                    // Same reasoning as the 2nd+ part rotation loop further down:
+                    // each iteration is a real Clipper-backed inner-NFP lookup
+                    // (plus a contact-area scan per returned vertex on a cache
+                    // miss), so without this a Stop request could still have to
+                    // wait out up to `config.rotations` of them before the
+                    // caller sees it.
+                    if should_cancel() {
+                        cancelled_early = true;
+                        break;
+                    }
                     if let Some(nfp) = cached_inner_nfp(cache, sheet, &sheet_src, &trial_polygon, parts[i].source_id, trial_rotation, config.curve_tolerance) {
                         if !nfp.is_empty() {
                             let trial_bounds = get_polygon_bounds(&trial_polygon.points).expect("part always has points");
