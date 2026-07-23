@@ -391,8 +391,13 @@ pub fn entities_to_texts<'a>(entities: impl Iterator<Item = &'a Entity>) -> Vec<
 /// test used to build the parent/hole tree - matches the "point-in-polygon"
 /// approach `svgparser.js` used for SVG parent/hole detection).
 fn contains(container: &[Point], candidate: &[Point]) -> bool {
+    // `LayeredPolygon`'s fields are all `pub`, so a degenerate (empty-points)
+    // entry is a valid `Vec<LayeredPolygon>` for a caller to hand the public
+    // `build_polygon_tree` - an empty candidate trivially can't be "inside"
+    // anything, no need to look at `container` at all.
+    let Some(&first) = candidate.first() else { return false };
     let zero = Point::new(0.0, 0.0);
-    point_in_polygon(candidate[0], container, zero, None) == Some(true)
+    point_in_polygon(first, container, zero, None) == Some(true)
 }
 
 fn area_of(points: &[Point]) -> f64 {

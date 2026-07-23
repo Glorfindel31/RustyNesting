@@ -36,8 +36,14 @@ pub fn inner_nfp(a: &LayeredPolygon, b: &LayeredPolygon, curve_tolerance: f64) -
     // (see circular_nfp.rs's doc comment for why that's only ever a
     // conservative approximation, not exact, and out of scope for now).
     if a.children.is_empty() {
-        if let (Some(a_circle), Some(b_circle)) = (a.is_circle, b.is_circle) {
-            let b0 = b.points[0];
+        // `b.points.first()` as part of the pattern, not a raw `b.points[0]`
+        // index: `LayeredPolygon`'s fields are all `pub`, nothing stops a
+        // caller from constructing one with `is_circle: Some(_)` but empty
+        // `points` (a data-integrity inconsistency, not a type-level
+        // impossibility) - falling through to the rectangle/general fallback
+        // below (both already guard on point count) beats an unchecked
+        // index panic on that degenerate input.
+        if let (Some(a_circle), Some(b_circle), Some(&b0)) = (a.is_circle, b.is_circle, b.points.first()) {
             return fast_fit_disk(
                 Point::new(a_circle.cx, a_circle.cy),
                 a_circle.r,
