@@ -145,16 +145,16 @@ pub fn refine_consolidation(
             // its sort key once per element instead of recomputing it on
             // every comparison - this sort didn't, despite the same
             // function doing it correctly six lines up.
-            let mut candidate_parts: Vec<PlacedPart> = allplacements[source_pos].parts.clone();
-            let mut candidates_with_area: Vec<(PlacedPart, f64)> = candidate_parts
-                .into_iter()
+            let mut candidates_with_area: Vec<(PlacedPart, f64)> = allplacements[source_pos]
+                .parts
+                .iter()
                 .map(|p| {
                     let area = parts_by_id.get(&p.id).map_or(0.0, |g| polygon_area(&g.points).abs());
-                    (p, area)
+                    (*p, area)
                 })
                 .collect();
             candidates_with_area.sort_by(|(_, area_a), (_, area_b)| area_a.total_cmp(area_b));
-            candidate_parts = candidates_with_area.into_iter().map(|(p, _)| p).collect();
+            let candidate_parts: Vec<PlacedPart> = candidates_with_area.into_iter().map(|(p, _)| p).collect();
 
             let mut moved_any = false;
 

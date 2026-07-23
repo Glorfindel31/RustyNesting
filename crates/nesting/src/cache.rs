@@ -83,7 +83,7 @@ pub enum CachedNfp {
 /// generations) - with computation this expensive, letting several threads
 /// each redo it independently costs far more than any of them blocking to
 /// share one result.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct NfpCache {
     db: Mutex<HashMap<String, Arc<OnceLock<Option<CachedNfp>>>>>,
 }

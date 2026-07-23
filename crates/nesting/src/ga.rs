@@ -87,6 +87,7 @@ fn random_angles(length: usize, rotations: u32, rng: &mut impl Rng) -> Vec<f64> 
     (0..length).map(|_| (rng.gen_range(0..rotations) as f64) * step).collect()
 }
 
+#[derive(Debug)]
 pub struct GeneticAlgorithm {
     pub population: Vec<Individual>,
     config: GaConfig,

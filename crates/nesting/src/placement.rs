@@ -313,6 +313,12 @@ fn has_material_overlap(a: &LayeredPolygon, b: &LayeredPolygon) -> bool {
         }
     };
 
+    // Bare `> 0.0` against a Clipper-derived (x10^7-scaled, boolean-op'd)
+    // area, not a tolerance-guarded comparison - inherited as-is from the
+    // original JS (`hasMaterialOverlap`'s own equivalent check), not an
+    // oversight. A sub-pixel Clipper sliver could in principle read as
+    // "real" overlap; left matching upstream behavior rather than
+    // introducing a new epsilon the original never had.
     intersection.iter().any(|p| polygon_area(p).abs() > 0.0)
 }
 
@@ -946,6 +952,19 @@ fn trace_candidates(candidates: &[Candidate], accepted_idx: Option<usize>, rotat
 /// vertex), the latter reports every rotation/position it actually
 /// compared. Every non-visualization caller passes a no-op
 /// (`&|_, _, _| {}`).
+///
+/// The `>=` boundary (not `>`) in the rotation-wraparound arithmetic used
+/// throughout is a load-bearing quirk carried over from the original JS -
+/// see CLAUDE.md's "Load-bearing quirks" list.
+fn advance_rotation(current: f64, step: f64) -> f64 {
+    let r = current + step;
+    if r >= 360.0 {
+        r % 360.0
+    } else {
+        r
+    }
+}
+
 #[must_use]
 pub fn place_parts(
     sheets: &[LayeredPolygon],
@@ -1135,14 +1154,7 @@ pub fn place_parts(
                             }
                         }
                     }
-                    let new_rotation = {
-                        let r = trial_rotation + step;
-                        if r >= 360.0 {
-                            r % 360.0
-                        } else {
-                            r
-                        }
-                    };
+                    let new_rotation = advance_rotation(trial_rotation, step);
                     trial_polygon = rotate_layered_polygon(&trial_polygon, step);
                     trial_rotation = new_rotation;
                 }
@@ -1210,14 +1222,7 @@ pub fn place_parts(
                     if sheet_nfp.as_ref().is_some_and(|n| !n.is_empty()) {
                         break;
                     }
-                    let new_rotation = {
-                        let r = parts[i].rotation + step;
-                        if r >= 360.0 {
-                            r % 360.0
-                        } else {
-                            r
-                        }
-                    };
+                    let new_rotation = advance_rotation(parts[i].rotation, step);
                     let new_polygon = rotate_layered_polygon(&parts[i].polygon, step);
                     parts[i] = NestPart {
                         id: parts[i].id,
@@ -1390,14 +1395,7 @@ pub fn place_parts(
                         }
                     }
                 }
-                let new_rotation = {
-                    let r = trial_rotation + step;
-                    if r >= 360.0 {
-                        r % 360.0
-                    } else {
-                        r
-                    }
-                };
+                let new_rotation = advance_rotation(trial_rotation, step);
                 trial_polygon = rotate_layered_polygon(&trial_polygon, step);
                 trial_rotation = new_rotation;
             }
