@@ -295,7 +295,7 @@ fn default_dominant_part_area_threshold() -> f64 {
 }
 
 fn default_curve_tolerance() -> f64 {
-    0.3
+    0.1
 }
 
 impl NestConfigDto {

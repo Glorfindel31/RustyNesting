@@ -228,8 +228,8 @@ fn tessellate_bulge(p0: Point, p1: Point, bulge: f64, tolerance: f64) -> Vec<Poi
 
     let mx = (p0.x + p1.x) / 2.0;
     let my = (p0.y + p1.y) / 2.0;
-    let cx = mx + nx * (sagitta - radius);
-    let cy = my + ny * (sagitta - radius);
+    let cx = mx + nx * (radius - sagitta);
+    let cy = my + ny * (radius - sagitta);
 
     let start_angle = (p0.y - cy).atan2(p0.x - cx);
     let n = segment_count(theta, radius, tolerance);
@@ -642,6 +642,37 @@ mod tests {
         let area = polygon_area(&converted.points).abs();
         // half-disk of radius 1: area = pi/2
         assert!((area - std::f64::consts::FRAC_PI_2).abs() < 0.01, "area was {area}");
+    }
+
+    /// Regression test for a sign bug in `tessellate_bulge`'s center
+    /// calculation: a non-180-degree bulge (e.g. a quarter-circle rounded
+    /// corner, very common on real cut profiles) was computed around the
+    /// *wrong* center - the other circle of the same radius that also
+    /// happens to pass through both endpoints, curving inward instead of
+    /// outward. The bulge=1 (exact semicircle) test above didn't catch this
+    /// because that case is sign-degenerate (sagitta == radius in
+    /// magnitude, so the sign error multiplies by zero either way).
+    #[test]
+    fn quarter_circle_bulge_tessellates_around_the_correct_center() {
+        // bulge = tan(90deg / 4) = tan(22.5deg): a CCW quarter-circle arc
+        // from (1,0) to (0,1), which must be centered at the origin (not at
+        // (1,1), the wrong center the sign bug produced).
+        let bulge = (std::f64::consts::FRAC_PI_8).tan();
+        let mut poly = LwPolyline {
+            vertices: vec![
+                LwPolylineVertex { x: 1.0, y: 0.0, bulge, ..Default::default() },
+                LwPolylineVertex { x: 0.0, y: 1.0, bulge: 0.0, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        poly.set_is_closed(true);
+        let e = entity("0", EntityType::LwPolyline(poly));
+
+        let converted = entity_to_polygon(&e, 0.001).expect("quarter-circle profile should convert");
+        for p in &converted.points {
+            let dist_from_origin = (p.x * p.x + p.y * p.y).sqrt();
+            assert!((dist_from_origin - 1.0).abs() < 0.01, "point {p:?} isn't on the unit circle (dist {dist_from_origin})");
+        }
     }
 
     #[test]
